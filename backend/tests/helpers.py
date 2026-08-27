@@ -9,8 +9,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAIN_PY = os.path.join(BACKEND_DIR, 'main.py')
@@ -100,6 +102,38 @@ class FakeXDGTestCase(unittest.TestCase):
                     else b'\x7fELF\x02\x01\x01' + b'\x00' + b'\x41\x49\x02')
         return path
 
+    def install_fake_app(self, desktop_name='fakeapp',
+                         app_name='Fake App') -> tuple:
+        """Simulate an already-integrated app: managed AppImage + .desktop
+        + icon, exactly the layout install_file produces. Enough for
+        list/remove/update-source flows that never need to extract."""
+        os.makedirs(os.path.join(self.managed_dir, '.icons'), exist_ok=True)
+        os.makedirs(self.applications_dir, exist_ok=True)
+
+        appimage = os.path.join(self.managed_dir,
+                                desktop_name + '.appimage')
+        with open(appimage, 'wb') as f:
+            f.write(b'\x7fELF\x02\x01\x01\x00\x41\x49\x02padding')
+        os.chmod(appimage, 0o755)
+
+        icon = os.path.join(self.managed_dir, '.icons', desktop_name + '.png')
+        with open(icon, 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\n')
+
+        desktop = os.path.join(self.applications_dir,
+                               desktop_name + '.desktop')
+        with open(desktop, 'w') as f:
+            f.write(f'''[Desktop Entry]
+Name={app_name}
+Exec=env DESKTOPINTEGRATION=1 {appimage}
+TryExec={appimage}
+Icon={icon}
+Type=Application
+Terminal=false
+X-AppImage-Version=1.0
+''')
+        return appimage, desktop, icon
+
     # ---------------------------------------------------------- subprocess
 
     def run_cli(self, *args, check=False) -> subprocess.CompletedProcess:
@@ -136,3 +170,136 @@ def make_minimal_elf(is64: bool = True, big_endian: bool = False,
     # AppImage type-2 magic at bytes 8..10
     header[8:11] = b'\x41\x49\x02'
     return bytes(header)
+
+
+def make_elf_with_sections(sections: dict, is64: bool = True,
+                           big_endian: bool = False,
+                           e_machine: int = 0x3E) -> bytes:
+    """Hand-built ELF with a real section table for the section-reading
+    code paths (elf._read_sections / read_upd_info).
+
+    `sections` maps section name -> raw content bytes; a .shstrtab is
+    generated automatically. Layout: ELF header | section data | .shstrtab
+    | section header table (with the leading NULL entry)."""
+    endian = '>' if big_endian else '<'
+    ehsize = 64 if is64 else 52
+    shentsize = 64 if is64 else 40
+
+    # section-name string table ('\0' + name + '\0' for each section)
+    strtab = bytearray(b'\x00')
+    name_offsets = {}
+    for name in list(sections) + ['.shstrtab']:
+        name_offsets[name] = len(strtab)
+        strtab += name.encode('ascii') + b'\x00'
+    strtab = bytes(strtab)
+
+    offset = ehsize
+    entries = []                       # (sh_name, sh_offset, sh_size)
+    for name, blob in sections.items():
+        entries.append((name_offsets[name], offset, len(blob)))
+        offset += len(blob)
+    strtab_offset = offset
+    offset += len(strtab)
+    shoff = offset
+
+    # section 0 is the NULL entry, the last one is .shstrtab
+    shnum = len(sections) + 2
+    shstrndx = len(sections) + 1
+
+    header = bytearray(ehsize)
+    header[0:4] = b'\x7fELF'
+    header[4] = 2 if is64 else 1
+    header[5] = 2 if big_endian else 1
+    header[6] = 1                      # EI_VERSION
+    header[8:11] = b'\x41\x49\x02'     # AppImage type-2 magic
+    struct.pack_into(endian + 'H', header, 0x12, e_machine)
+
+    if is64:
+        struct.pack_into(endian + 'Q', header, 0x28, shoff)
+        struct.pack_into(endian + 'HHH', header, 0x3A,
+                         shentsize, shnum, shstrndx)
+    else:
+        struct.pack_into(endian + 'I', header, 0x20, shoff)
+        struct.pack_into(endian + 'HHH', header, 0x2E,
+                         shentsize, shnum, shstrndx)
+
+    def shdr(name_off: int, data_off: int, size: int) -> bytes:
+        # sh_name, sh_type=PROGBITS, sh_flags, sh_addr, sh_offset, sh_size,
+        # sh_link, sh_info, sh_addralign, sh_entsize
+        if is64:
+            return struct.pack(endian + 'IIQQQQIIQQ',
+                               name_off, 1, 0, 0, data_off, size, 0, 0, 1, 0)
+        return struct.pack(endian + 'IIIIIIIIII',
+                           name_off, 1, 0, 0, data_off, size, 0, 0, 1, 0)
+
+    table = bytearray(shentsize)       # NULL section
+    for name_off, data_off, size in entries:
+        table += shdr(name_off, data_off, size)
+    table += shdr(name_offsets['.shstrtab'], strtab_offset, len(strtab))
+
+    blob = bytes(header)
+    for name, content in sections.items():
+        blob += content
+    blob += strtab + bytes(table)
+    return blob
+
+
+# ------------------------------------------------------------ local http
+
+class _FixtureHandler(BaseHTTPRequestHandler):
+    routes = {}  # {path: (status, headers, body)} set per server instance
+
+    def _reply(self):
+        route = self.routes.get(self.path)
+        if route is None:
+            body = b'not found'
+            self.send_response(404)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(body)
+            return
+        status, headers, body = route
+        self.send_response(status)
+        for key, value in headers.items():
+            self.send_header(key, value)
+        if not any(k.lower() == 'content-length' for k in headers):
+            self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(body)
+
+    do_GET = do_HEAD = _reply
+
+    def log_message(self, format, *args):  # silence the test output
+        pass
+
+
+class FixtureHTTPServer:
+    """Static-table HTTP server on 127.0.0.1:0 for hermetic network tests
+    (update-source checks, --update downloads)."""
+
+    def __init__(self, routes: dict):
+        handler = type('RoutedHandler', (_FixtureHandler,), {'routes': routes})
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        self._thread = threading.Thread(target=self.server.serve_forever,
+                                        daemon=True)
+        self._thread.start()
+
+    @property
+    def routes(self) -> dict:
+        """The live route table (mutable: add routes after start)."""
+        return self.server.RequestHandlerClass.routes
+
+    @property
+    def base_url(self) -> str:
+        host, port = self.server.server_address[:2]
+        return f'http://{host}:{port}'
+
+    def url(self, path: str) -> str:
+        return self.base_url + path
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self._thread.join(timeout=5)

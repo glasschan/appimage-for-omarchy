@@ -21,12 +21,21 @@ import "lib/Backend.js" as Backend
 // PanelKeyCatcher, exactly like the first-party panels.
 //
 // M1b wiring: every action runs backend/main.py (see backend/CONTRACT.md)
-// through the shared Process in this file — F1 list (cache-first, the
+// through the shared Process in this file — the long --update runs on its
+// own Process pair so it can never stomp a short call in flight —
+// F1 list (cache-first, the
 // store renders instantly and refreshes in the background), F2 integrate
 // (inline picker: Quickshell ships no file dialog, so a path field plus
 // Downloads quick-picks stands in), F3 remove (two-click inline confirm,
 // keyed on desktop_id), F4 launch (detached exec of the AppImage path),
 // F5 bar badge (observer over the same Model store).
+//
+// M2 wiring: F6 check updates (--list-updates with a long watchdog; the
+// offline error document surfaces its own message), F7 one-click update
+// per row (--update --yes, 10-minute timeout for large downloads), F9
+// per-app update sources plus the F8 cadence knobs in a settings card
+// toggled by the header gear. The F8 background service itself lives in
+// Service.qml — this panel only edits what it runs on.
 Panel {
   id: root
   moduleName: "io.github.glasschan.appimage"
@@ -48,6 +57,11 @@ Panel {
   readonly property int staleAfterMs: 60000
   // Integrating means squashfs extraction + a file copy; give it room.
   readonly property int integrateTimeoutMs: 120000
+  // Update sweeps walk every configured release source over the network.
+  readonly property int checkTimeoutMs: 120000
+  // F7 downloads can be a full AppImage; the backend replaces the file in
+  // place, so the watchdog must outlast the transfer, not the UI.
+  readonly property int updateTimeoutMs: 600000
   // How long the two-click remove confirmation stays armed.
   readonly property int confirmResetMs: 4000
   // Grace before the post-launch refresh so `ps` can see the new process.
@@ -57,12 +71,21 @@ Panel {
   // signal handlers feed it back into lib/Backend.js.
   property var runCtx: null
 
+  // Dedicated Backend.run context for the long --update (null while idle):
+  // a 10-minute download must not occupy the shared short-call Process —
+  // mirror of Service.qml's fetchProc/settingsProc split.
+  property var updateCtx: null
+
   // Mirrored from the shared Model store (no property notifications in a
   // JS library, so a subscription copies state into reactive properties).
   property var items: []
   property bool busyList: false
   property bool busyIntegrate: false
   property bool busyRemove: false
+  property bool busyUpdates: false
+  // desktop_id of the in-flight --update ("" when idle) — rows compare it
+  // to dim every Update button and spin the updating one.
+  property string updatingId: ""
   property string lastError: ""
   property string statusText: ""
   property var unsubscribe: null
@@ -77,6 +100,40 @@ Panel {
 
   // desktop_id whose Remove button is armed for the second click (F3).
   property string confirmRemoveId: ""
+
+  // Settings card (F8/F9): opened by the header gear, mutually exclusive
+  // with the integrate picker. The edit* fields are working copies the
+  // card mutates; Save pushes them key by key through --set-setting and
+  // the store is re-read afterwards (reloadSettings).
+  property bool settingsOpen: false
+  property bool settingsBusy: false
+  property bool editEnabled: true
+  property int editInterval: 360
+  property int editDelay: 5
+  property var pendingSettingKeys: []
+
+  // Per-app source editor (F9): one editor at a time, keyed by desktop_id.
+  // Field values live as strings ("true"/"false" for bools) so the Save
+  // argv can pass them straight through as key=value tokens.
+  property string sourceEditId: ""
+  property string sourceEditName: ""
+  property string sourceEditManager: ""
+  property var sourceEditValues: ({})
+  property bool sourceBusy: false
+  // Focus count over the editor's dynamic text fields; PanelKeyCatcher
+  // must hand raw keys to whichever field is typing (see formEditing).
+  property int sourceFieldFocusCount: 0
+
+  // Manager choices for the source editor's dropdown, resolved through the
+  // strings table so display names stay central for i18n.
+  readonly property var managerOptions: {
+    var opts = []
+    for (var i = 0; i < Model.MANAGERS.length; i++) {
+      var mgr = Model.MANAGERS[i]
+      opts.push({ value: mgr.name, label: Model.strings[mgr.labelKey] || mgr.name })
+    }
+    return opts
+  }
 
   // Emitted by the [Integrate] button and the "i" shortcut; opens the
   // inline picker below.
@@ -120,9 +177,21 @@ Panel {
     busyList = Model.state.busy.list === true
     busyIntegrate = Model.state.busy.integrate === true
     busyRemove = Model.state.busy.remove === true
+    busyUpdates = Model.state.busy.updates === true
+    updatingId = String(Model.state.busy.update || "")
     lastError = Model.state.lastError
     statusText = Model.state.status
   }
+
+  // True while any editor inside the panel should own raw keys instead of
+  // the key catcher's shortcuts (see the keyCatcher binding below).
+  readonly property bool formEditing: pickerField.activeFocus
+    || sourceManagerDropdown.popupOpen
+    || sourceFieldFocusCount > 0
+    || (intervalField.field.contentItem
+        ? intervalField.field.contentItem.activeFocus : false)
+    || (delayField.field.contentItem
+        ? delayField.field.contentItem.activeFocus : false)
 
   // ---- lifecycle -----------------------------------------------------------
 
@@ -156,6 +225,16 @@ Panel {
   // ---- backend bridge ------------------------------------------------------
 
   function callBackend(args, options, onDone) {
+    // Single flight on the shared Process: a second call started while one
+    // is in flight would overwrite runCtx, misroute the first call's
+    // output to this callback and wedge its busy flag. Fail the newcomer
+    // synthetically instead (same result shape as Backend.handleExit's
+    // timeout report) so the caller's normal failure path runs.
+    if (runCtx && runCtx.active === true) {
+      onDone({ ok: false, exitCode: -1, stdout: "", stderr: "", json: null,
+               timedOut: false, spawnFailed: false, error: "busy" })
+      return
+    }
     var ctx = Backend.run(backendProc, backendTimer, backendCommand, args, options || {}, onDone)
     runCtx = ctx && ctx.active ? ctx : null
   }
@@ -295,9 +374,301 @@ Panel {
     })
   }
 
+  // F6: sweep every configured source. The offline error document arrives
+  // as exit 1 + {"result":"error"} and reportFailure below surfaces its
+  // own message ("Internet connection not available" and friends).
+  function checkUpdates() {
+    if (Model.state.mockMode) return
+    if (backendCommand.length === 0) {
+      Model.setError(strings.backendMissing)
+      syncFromModel()
+      return
+    }
+    // Single flight with the background service — a sweep that started in
+    // Service.qml wins and this click is a no-op.
+    if (!Model.claimUpdateCheck()) return
+    Model.clearError()
+    Model.setStatus(strings.checkingUpdates)
+    syncFromModel()
+    callBackend(["--list-updates", "--json"], { timeoutMs: checkTimeoutMs }, function(result) {
+      Model.releaseUpdateCheck()
+      if (result.ok) {
+        var parsed = Model.parseUpdatesJson(result.stdout)
+        if (parsed.ok) {
+          Model.applyUpdates(parsed.updates)
+          Model.setStatus(parsed.updates.length > 0
+            ? Model.formatCount(parsed.updates.length, strings.updatesAvailable)
+            : strings.updatesNone)
+        } else {
+          Model.setError(parsed.error)
+        }
+      } else {
+        reportFailure(result, "list-updates")
+      }
+      syncFromModel()
+    })
+  }
+
+  // F7: run --update in place. No confirm — the backend replaces the
+  // AppImage where it sits and refuses when the app is running
+  // (result "skipped-running", shown as status, not error).
+  function updateItem(item) {
+    if (!item || item.id === "") return
+    if (Model.state.busy.update !== "") return
+    if (backendCommand.length === 0) {
+      Model.setError(strings.backendMissing)
+      syncFromModel()
+      return
+    }
+    Model.clearError()
+    Model.setUpdatingId(item.id)
+    Model.setStatus(Model.formatCount(item.name, strings.updating))
+    syncFromModel()
+    // Dedicated Process/Timer pair: the transfer runs for up to ten
+    // minutes, so it must not occupy backendProc — refresh/settings calls
+    // stay possible meanwhile (callBackend's guard fails them cleanly
+    // rather than stomping this context). Two concurrent --update calls
+    // stay impossible through the setUpdatingId guard above.
+    var ctx = Backend.run(updateProc, updateTimer, backendCommand,
+        ["--update", item.id, "--yes", "--json"],
+        { timeoutMs: updateTimeoutMs }, function(result) {
+      Model.setUpdatingId("")
+      if (result.ok) {
+        var action = Model.parseActionJson(result.stdout)
+        if (action.ok) {
+          if (action.result === "updated") {
+            var version = action.app && action.app.updateVersion !== ""
+              ? action.app.updateVersion : item.updateVersion
+            // A version the backend could not resolve falls back to the
+            // action's own message — never "Updated to " with an empty %1.
+            Model.setStatus(version !== ""
+              ? Model.formatCount(version, strings.updated)
+              : action.message)
+          } else if (action.message !== "") {
+            // "up-to-date" / "skipped-running" carry the user-facing copy.
+            Model.setStatus(action.message)
+          } else {
+            Model.setStatus(action.result === "up-to-date"
+              ? strings.upToDate : strings.skippedRunning)
+          }
+          Model.clearError()
+        } else {
+          Model.setError(action.error !== "" ? action.error : strings.backendFailed)
+        }
+      } else {
+        reportFailure(result, "update")
+      }
+      syncFromModel()
+      // The AppImage (and its desktop entry's version) just changed:
+      // re-list so names, versions and manager columns stay truthful.
+      refresh()
+    })
+    updateCtx = ctx && ctx.active ? ctx : null
+  }
+
+  // ---- settings card (F8 cadence + F9 per-app sources) ----------------------
+
+  function toggleSettings() {
+    if (settingsOpen) {
+      settingsOpen = false
+      closeSourceEditor()
+      return
+    }
+    pickerOpen = false
+    settingsOpen = true
+    mirrorEditFields()
+    loadSettingsCard()
+  }
+
+  // Pour the store's settings into the card's working copies.
+  function mirrorEditFields() {
+    editEnabled = Model.state.settings.enabled
+    editInterval = Model.state.settings.intervalMinutes
+    editDelay = Model.state.settings.delayMinutes
+  }
+
+  // Re-read --settings from the backend so the card shows truth (opening
+  // the card, and the tail of saveSettings, both land here).
+  function loadSettingsCard() {
+    if (backendCommand.length === 0 || settingsBusy) return
+    settingsBusy = true
+    syncFromModel()
+    callBackend(["--settings", "--json"], null, function(result) {
+      settingsBusy = false
+      if (result.ok) {
+        var parsed = Model.parseSettingsJson(result.stdout)
+        if (parsed.ok) {
+          Model.applySettings(parsed.settings)
+        } else {
+          Model.setError(parsed.error)
+        }
+      } else {
+        reportFailure(result, "settings")
+      }
+      mirrorEditFields()
+      syncFromModel()
+    })
+  }
+
+  // Save the cadence: one --set-setting per changed key, then re-read the
+  // document so the card (and the service, via the settingsRevision bump)
+  // converges on what the backend actually stored.
+  function saveSettings() {
+    if (settingsBusy) return
+    var queue = []
+    if (editEnabled !== Model.state.settings.enabled)
+      queue.push("update_check_enabled=" + (editEnabled ? "true" : "false"))
+    if (Math.max(15, editInterval) !== Model.state.settings.intervalMinutes)
+      queue.push("update_check_interval_minutes=" + Math.max(15, editInterval))
+    if (Math.max(0, editDelay) !== Model.state.settings.delayMinutes)
+      queue.push("update_check_delay_minutes=" + Math.max(0, editDelay))
+    if (queue.length === 0) {
+      Model.setStatus(strings.settingsSaved)
+      syncFromModel()
+      return
+    }
+    settingsBusy = true
+    pendingSettingKeys = queue
+    runNextSettingSave()
+  }
+
+  function runNextSettingSave() {
+    if (!settingsBusy) return
+    if (pendingSettingKeys.length === 0) {
+      pendingSettingKeys = []
+      settingsBusy = false
+      loadSettingsCard()
+      Model.setStatus(strings.settingsSaved)
+      syncFromModel()
+      return
+    }
+    var kv = pendingSettingKeys.shift()
+    callBackend(["--set-setting", kv, "--json"], null, function(result) {
+      if (!result.ok) {
+        // Abort the chain on failure; the reload keeps the card honest
+        // about what actually stuck.
+        pendingSettingKeys = []
+        settingsBusy = false
+        reportFailure(result, "set-setting")
+        loadSettingsCard()
+        return
+      }
+      runNextSettingSave()
+    })
+  }
+
+  // F9 editor: seed the manager dropdown (empty = no source configured —
+  // the user must pick before Save) and blank field values, since
+  // --list-installed carries the manager name only, never its config.
+  function openSourceEditor(item) {
+    if (!item) return
+    sourceEditId = item.id
+    sourceEditName = item.name
+    sourceEditManager = item.manager
+    rebuildSourceEditValues()
+    // Assigned, not bound: Dropdown.selectCurrent writes value directly,
+    // which would sever a binding for every later reopen.
+    sourceManagerDropdown.value = sourceEditManager
+  }
+
+  function closeSourceEditor() {
+    sourceEditId = ""
+    sourceEditName = ""
+    sourceEditManager = ""
+    sourceEditValues = {}
+    // Loader-destroyed fields may never deliver their final
+    // activeFocusChanged(false); zero the count so the key catcher cannot
+    // stay blocked forever.
+    sourceFieldFocusCount = 0
+  }
+
+  function rebuildSourceEditValues() {
+    var mgr = Model.managersByName()[sourceEditManager]
+    var values = {}
+    if (mgr) {
+      for (var i = 0; i < mgr.fields.length; i++) {
+        values[mgr.fields[i].key] = mgr.fields[i].type === "bool" ? "false" : ""
+      }
+    }
+    // Reset before the model swap re-creates the Loader-held fields, for
+    // the same skipped-leave reason as closeSourceEditor above.
+    sourceFieldFocusCount = 0
+    sourceEditValues = values
+  }
+
+  function setSourceValue(key, value) {
+    // Storage only: mutate without reassigning so a field's text binding
+    // never re-evaluates mid-typing. rebuildSourceEditValues is the only
+    // writer that replaces the object.
+    sourceEditValues[key] = value
+  }
+
+  // Persist the edited source. argv keeps every token a single literal —
+  // ids, keys and values never meet a shell. Empty string fields are
+  // skipped; the backend validates what its manager needs and answers
+  // exit 2 with a clean {"result":"error"} document (--json) otherwise.
+  function saveSource() {
+    if (sourceBusy || sourceEditId === "" || sourceEditManager === "") return
+    var args = ["--set-update-source", sourceEditId, "--manager",
+                sourceEditManager, "--json"]
+    var mgr = Model.managersByName()[sourceEditManager]
+    if (mgr) {
+      for (var i = 0; i < mgr.fields.length; i++) {
+        var field = mgr.fields[i]
+        var value = sourceEditValues[field.key]
+        if (value === undefined) continue
+        var text = field.type === "bool"
+          ? (value === "true" ? "true" : "false")
+          : String(value).trim()
+        if (text === "") continue
+        args.push(field.key + "=" + text)
+      }
+    }
+    sourceBusy = true
+    Model.clearError()
+    syncFromModel()
+    callBackend(args, null, function(result) {
+      sourceBusy = false
+      if (result.ok) {
+        Model.setStatus(strings.sourceSaved)
+        Model.clearError()
+        closeSourceEditor()
+      } else {
+        reportFailure(result, "set-update-source")
+      }
+      syncFromModel()
+      // Manager names ride on --list-installed; refresh the rows.
+      refresh()
+    })
+  }
+
+  function unsetSource() {
+    if (sourceBusy || sourceEditId === "") return
+    sourceBusy = true
+    Model.clearError()
+    syncFromModel()
+    callBackend(["--set-update-source", sourceEditId, "--unset", "--json"], null,
+        function(result) {
+      sourceBusy = false
+      if (result.ok) {
+        Model.setStatus(strings.sourceUnsetDone)
+        Model.clearError()
+        closeSourceEditor()
+      } else {
+        reportFailure(result, "set-update-source")
+      }
+      syncFromModel()
+      refresh()
+    })
+  }
+
   // ---- integrate picker (F2 fallback: no Quickshell file dialog) -----------
 
   function openPicker() {
+    // The two inline cards would fight for width and keyboard focus; the
+    // settings gear and Integrate close each other.
+    settingsOpen = false
+    closeSourceEditor()
     pickerOpen = true
     rebuildPickerFiles()
   }
@@ -365,6 +736,32 @@ Panel {
     id: backendTimer
     repeat: false
     onTriggered: Backend.handleTimeout(root.runCtx)
+  }
+
+  // Long-op pair for --update (F7), kept separate from backendProc so a
+  // download never fights the short calls for one Process (same split as
+  // Service.qml's fetchProc/settingsProc).
+  Process {
+    id: updateProc
+    command: []
+    stdout: StdioCollector {
+      id: updateStdout
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: updateStderr
+      waitForEnd: true
+    }
+    onStarted: Backend.markStarted(root.updateCtx)
+    onExited: function(exitCode) {
+      Backend.handleExit(root.updateCtx, exitCode, updateStdout.text, updateStderr.text)
+    }
+  }
+
+  Timer {
+    id: updateTimer
+    repeat: false
+    onTriggered: Backend.handleTimeout(root.updateCtx)
   }
 
   Timer {
@@ -445,13 +842,18 @@ Panel {
         id: keyCatcher
         anchors.fill: parent
         anchors.margins: card.padding
-        // The picker's text field needs raw keys while it holds focus
-        // (same pattern as the weather panel's inline editor).
-        blocked: pickerField.activeFocus
+        // Inline editors need raw keys while they hold focus (same pattern
+        // as the weather panel's inline editor): the picker's path field,
+        // the source editor's dynamic fields (tracked by focus count —
+        // moving between them fires leave/gain out of order), the
+        // NumberFields' inner SpinBox editors, and the manager dropdown's
+        // popup (its list is not in the card's item tree).
+        blocked: root.formEditing
         onCloseRequested: root.requestClose()
         onTextKey: function(t) {
           if (t === "r" || t === "R") root.refresh()
           else if (t === "i" || t === "I") root.integrateRequested()
+          else if (t === "u" || t === "U") root.checkUpdates()
         }
 
         Column {
@@ -576,6 +978,73 @@ Panel {
                 }
 
                 onClicked: root.refresh()
+              }
+
+              // F6 as an icon-only header button (tooltip carries the
+              // caption the row buttons would show); same Button+ThemeIcon
+              // row pattern as Integrate/Refresh above.
+              Button {
+                id: checkUpdatesButton
+                text: ""
+                enabled: !root.busyUpdates
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.foreground
+                accent: Color.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                tooltipText: root.strings.checkUpdates
+                implicitWidth: checkUpdatesRow.implicitWidth
+                  + checkUpdatesButton.horizontalPadding * 2
+                  + checkUpdatesButton._reservedBorderLeft
+                  + checkUpdatesButton._reservedBorderRight
+
+                Row {
+                  id: checkUpdatesRow
+                  anchors.centerIn: parent
+                  spacing: Style.spacing.xs
+
+                  ThemeIcon {
+                    name: "cloud-download"
+                    size: Style.font.icon
+                    strokeWidth: 1.75
+                    color: checkUpdatesButton.foreground
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                onClicked: root.checkUpdates()
+              }
+
+              // Settings gear: toggles the settings card below.
+              Button {
+                id: settingsButton
+                text: ""
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.foreground
+                accent: Color.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                tooltipText: root.strings.settingsTitle
+                implicitWidth: settingsRow.implicitWidth
+                  + settingsButton.horizontalPadding * 2
+                  + settingsButton._reservedBorderLeft
+                  + settingsButton._reservedBorderRight
+
+                Row {
+                  id: settingsRow
+                  anchors.centerIn: parent
+                  spacing: Style.spacing.xs
+
+                  ThemeIcon {
+                    name: "settings"
+                    size: Style.font.icon
+                    strokeWidth: 1.75
+                    color: settingsButton.foreground
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                onClicked: root.toggleSettings()
               }
             }
           }
@@ -731,6 +1200,286 @@ Panel {
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WordWrap
                 width: parent.width
+              }
+            }
+          }
+
+          // ---- Settings card (F8 cadence + F9 sources) --------------------
+          BorderSurface {
+            id: settingsCard
+            width: parent.width
+            visible: root.settingsOpen
+            implicitHeight: visible ? settingsCol.implicitHeight + Style.spacing.sm * 2 : 0
+            color: Util.alpha(Color.accent, 0.06)
+            borderSpec: Border.flat(Util.alpha(Color.accent, 0.35), Math.max(1, Style.normalBorderWidth))
+            radius: Style.cornerRadius
+
+            Column {
+              id: settingsCol
+              width: parent.width - Style.spacing.sm * 2
+              anchors.centerIn: parent
+              spacing: Style.spacing.xs
+
+              Text {
+                text: root.strings.settingsTitle
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+
+              // ---- update-check cadence (F8) --------------------------------
+              PanelSectionHeader {
+                text: root.strings.settingsUpdateChecks
+                foreground: root.foreground
+                width: parent.width
+              }
+
+              Row {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Text {
+                  text: root.editEnabled ? root.strings.enabledLabel : root.strings.disabledLabel
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                  width: parent.width - settingsToggle.width - Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                // Caller-owned value: `checked` binds to the working copy
+                // and toggled() flips it (ToggleSwitch's own contract).
+                ToggleSwitch {
+                  id: settingsToggle
+                  checked: root.editEnabled
+                  foreground: root.foreground
+                  accent: Color.accent
+                  enabled: !root.settingsBusy
+                  anchors.verticalCenter: parent.verticalCenter
+                  onToggled: root.editEnabled = !root.editEnabled
+                }
+              }
+
+              Row {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                NumberField {
+                  id: intervalField
+                  label: root.strings.checkIntervalMinutes
+                  value: root.editInterval
+                  from: 15
+                  to: 10080
+                  enabled: !root.settingsBusy
+                  foreground: root.foreground
+                  accent: Color.accent
+                  fontFamily: root.fontFamily
+                  onModified: function(v) { root.editInterval = v }
+                }
+
+                NumberField {
+                  id: delayField
+                  label: root.strings.firstCheckDelayMinutes
+                  value: root.editDelay
+                  from: 0
+                  to: 1440
+                  enabled: !root.settingsBusy
+                  foreground: root.foreground
+                  accent: Color.accent
+                  fontFamily: root.fontFamily
+                  onModified: function(v) { root.editDelay = v }
+                }
+              }
+
+              Text {
+                text: root.strings.notificationsOnNewUpdates
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+                width: parent.width
+              }
+
+              Button {
+                id: settingsSaveButton
+                text: root.strings.settingsSave
+                enabled: !root.settingsBusy
+                foreground: root.foreground
+                accent: Color.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: root.saveSettings()
+              }
+
+              // ---- per-app update source (F9) --------------------------------
+              PanelSectionHeader {
+                text: root.strings.sourceSection
+                foreground: root.foreground
+                width: parent.width
+              }
+
+              Flickable {
+                width: parent.width
+                height: Math.min(sourceRowsCol.implicitHeight, Style.space(132))
+                contentWidth: width
+                contentHeight: sourceRowsCol.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                interactive: contentHeight > height
+
+                Column {
+                  id: sourceRowsCol
+                  width: parent.width
+                  spacing: Style.spacing.xxs
+
+                  Repeater {
+                    model: root.items
+
+                    Row {
+                      id: sourceRow
+                      required property var modelData
+                      width: sourceRowsCol.width
+                      spacing: Style.spacing.xs
+
+                      Column {
+                        spacing: Style.spacing.xxs
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - sourceEditButton.width - Style.spacing.xs
+
+                        Text {
+                          text: sourceRow.modelData.name
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: true
+                          elide: Text.ElideRight
+                          width: parent.width
+                        }
+
+                        Text {
+                          text: sourceRow.modelData.embeddedSource
+                            ? Model.formatCount(sourceRow.modelData.manager, root.strings.sourceEmbedded)
+                            : (sourceRow.modelData.manager !== ""
+                              ? sourceRow.modelData.manager
+                              : root.strings.sourceNone)
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          elide: Text.ElideRight
+                          width: parent.width
+                        }
+                      }
+
+                      PanelActionButton {
+                        id: sourceEditButton
+                        tooltipText: root.strings.sourceEditTooltip
+                        foreground: root.foreground
+                        hoverColor: Color.accent
+                        anchors.verticalCenter: parent.verticalCenter
+
+                        ThemeIcon {
+                          anchors.centerIn: parent
+                          name: "settings"
+                          size: sourceEditButton.fontSize
+                          strokeWidth: 1.75
+                          color: sourceEditButton.enabled
+                            ? (sourceEditButton._hot ? sourceEditButton.hoverColor : sourceEditButton.foreground)
+                            : Qt.darker(sourceEditButton.foreground, 2.0)
+                        }
+
+                        onClicked: root.openSourceEditor(sourceRow.modelData)
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Inline editor for the row whose gear was clicked: the app
+              // name is fixed context, the manager dropdown swaps the field
+              // set in from Model.MANAGERS.
+              BorderSurface {
+                width: parent.width
+                visible: root.sourceEditId !== ""
+                implicitHeight: visible ? sourceEditCol.implicitHeight + Style.spacing.xs * 2 : 0
+                color: Util.alpha(Color.accent, 0.06)
+                borderSpec: Border.flat(Util.alpha(Color.accent, 0.25), Math.max(1, Style.normalBorderWidth))
+                radius: Style.cornerRadius
+
+                Column {
+                  id: sourceEditCol
+                  width: parent.width - Style.spacing.xs * 2
+                  anchors.centerIn: parent
+                  spacing: Style.spacing.xs
+
+                  Text {
+                    text: root.sourceEditName
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                    elide: Text.ElideRight
+                    width: parent.width
+                  }
+
+                  Dropdown {
+                    id: sourceManagerDropdown
+                    label: root.strings.sourceManagerLabel
+                    width: parent.width
+                    value: root.sourceEditManager
+                    options: root.managerOptions
+                    foreground: root.foreground
+                    accent: Color.accent
+                    fontFamily: root.fontFamily
+                    enabled: !root.sourceBusy
+                    onChanged: function(value) {
+                      root.sourceEditManager = value
+                      root.rebuildSourceEditValues()
+                    }
+                  }
+
+                  Repeater {
+                    model: {
+                      var mgr = Model.managersByName()[root.sourceEditManager]
+                      return mgr ? mgr.fields : []
+                    }
+
+                    Loader {
+                      required property var modelData
+                      width: sourceEditCol.width
+                      sourceComponent: modelData.type === "bool"
+                        ? sourceBoolFieldComp : sourceStringFieldComp
+                      onLoaded: item.fieldKey = modelData.key
+                    }
+                  }
+
+                  Row {
+                    spacing: Style.spacing.xs
+
+                    Button {
+                      id: sourceSaveButton
+                      text: root.strings.sourceSave
+                      enabled: !root.sourceBusy && root.sourceEditManager !== ""
+                      foreground: root.foreground
+                      accent: Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      onClicked: root.saveSource()
+                    }
+
+                    Button {
+                      id: sourceUnsetButton
+                      text: root.strings.sourceUnset
+                      enabled: !root.sourceBusy
+                      foreground: root.foreground
+                      accent: Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      onClicked: root.unsetSource()
+                    }
+                  }
+                }
               }
             }
           }
@@ -902,6 +1651,15 @@ Panel {
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
                           }
+
+                          // F6: pending release, accent like the running dot.
+                          Text {
+                            visible: itemRow.modelData.updateVersion !== ""
+                            text: Model.formatCount(itemRow.modelData.updateVersion, root.strings.updateAvailable)
+                            color: Color.accent
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                          }
                         }
                       }
 
@@ -931,6 +1689,46 @@ Panel {
                           }
 
                           onClicked: root.launchItem(itemRow.modelData)
+                        }
+
+                        // F7: one-click update, shown once the app has a
+                        // source (manager) or a known pending release —
+                        // an update without a known version can still be
+                        // worth a try. Single flight: every button dims
+                        // while one download runs, and the row being
+                        // updated spins its arrow.
+                        PanelActionButton {
+                          id: updateButton
+                          visible: itemRow.modelData.manager !== ""
+                            || itemRow.modelData.updateVersion !== ""
+                          enabled: root.updatingId === ""
+                          tooltipText: root.strings.updateAction
+                          foreground: root.foreground
+                          hoverColor: Color.accent
+                          fontFamily: root.fontFamily
+                          anchors.verticalCenter: parent.verticalCenter
+
+                          ThemeIcon {
+                            id: updateIcon
+                            anchors.centerIn: parent
+                            name: "arrow-up"
+                            size: updateButton.fontSize
+                            strokeWidth: 1.75
+                            color: updateButton.enabled
+                              ? (updateButton._hot ? updateButton.hoverColor : updateButton.foreground)
+                              : Qt.darker(updateButton.foreground, 2.0)
+
+                            RotationAnimation on rotation {
+                              running: root.updatingId === itemRow.modelData.id
+                              loops: Animation.Infinite
+                              from: 0
+                              to: 360
+                              duration: 1100
+                              onRunningChanged: if (!running) updateIcon.rotation = 0
+                            }
+                          }
+
+                          onClicked: root.updateItem(itemRow.modelData)
                         }
 
                         // Two-click inline remove (F3): first click arms
@@ -976,6 +1774,58 @@ Panel {
             }
           }
         }
+      }
+    }
+  }
+
+  // Source editor field templates (F9): one Loader per MANAGERS field in
+  // the editor above, keyed by `fieldKey` into root.sourceEditValues.
+  // Bool values are "true"/"false" strings so the Save argv passes them
+  // through verbatim; the focus count tells the key catcher when a field
+  // is typing (see formEditing).
+  Component {
+    id: sourceStringFieldComp
+
+    TextField {
+      property string fieldKey: ""
+      placeholderText: Model.fieldLabel(fieldKey)
+      foreground: root.foreground
+      accent: Color.accent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      verticalPadding: Style.spacing.xxs
+      width: parent ? parent.width : 0
+      enabled: !root.sourceBusy
+      text: root.sourceEditValues[fieldKey] || ""
+      onTextChanged: root.setSourceValue(fieldKey, text)
+      onActiveFocusChanged: root.sourceFieldFocusCount += activeFocus ? 1 : -1
+    }
+  }
+
+  Component {
+    id: sourceBoolFieldComp
+
+    Row {
+      property string fieldKey: ""
+      width: parent ? parent.width : 0
+      spacing: Style.spacing.sm
+
+      Text {
+        text: Model.fieldLabel(fieldKey)
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      ToggleSwitch {
+        checked: root.sourceEditValues[fieldKey] === "true"
+        foreground: root.foreground
+        accent: Color.accent
+        enabled: !root.sourceBusy
+        anchors.verticalCenter: parent.verticalCenter
+        onToggled: root.setSourceValue(fieldKey,
+          root.sourceEditValues[fieldKey] === "true" ? "false" : "true")
       }
     }
   }

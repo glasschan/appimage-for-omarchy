@@ -73,8 +73,33 @@ class Config:
         cls.parser[f'app.{h}'] = data
         cls.write()
 
-    # update-manager sections are unused in the MVP (no update support),
-    # but the structure is kept for the P1 --update work, mirroring upstream.
+    # update-manager sections store the per-app update source chosen with
+    # --set-update-source; the `manager` key names the UpdateManager class
+    # (same on-disk layout as upstream gearlever.conf).
+
+    @classmethod
+    def get_app_update_config(cls, el) -> dict:
+        cls.refresh()
+        k = f'app.{cls.get_app_hash(el)}.update_manager'
+        if cls.parser.has_section(k):
+            return dict(cls.parser[k])
+        return {}
+
+    @classmethod
+    def set_app_update_config(cls, el, manager_name: str, data: dict):
+        cls.refresh()
+        h = cls.get_app_hash(el)
+        k = f'app.{h}.update_manager'
+        if cls.parser.has_section(k):
+            cls.parser.remove_section(k)
+        cls.parser.add_section(k)
+        cls.parser[k]['manager'] = str(manager_name)
+        for key, value in data.items():
+            if isinstance(value, bool):
+                value = 'true' if value else 'false'
+            cls.parser[k][key] = str(value)
+        logging.debug('Writing update config %s: %s', k, dict(cls.parser[k]))
+        cls.write()
 
     @classmethod
     def delete_app_update_config(cls, el):

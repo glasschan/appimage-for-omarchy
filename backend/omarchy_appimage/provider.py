@@ -410,6 +410,49 @@ class AppImageProvider():
 
         el.updating_from = None
 
+    def update_from_url(self, manager, el: AppImageListElement,
+                        keep_both=False, progress_cb=None) -> AppImageListElement:
+        """Download an update through `manager` and install it over `el`.
+
+        Ported from AppImageProvider.update_from_url with the Gio.File
+        calls replaced by plain paths and the GTK progress callback
+        replaced by an optional progress_cb(fraction). Deviations:
+          * the download lands in a temp dir from
+            extractor.new_temp_dir('appimage-update-'), which main.py's
+            finally-block removes via extractor.cleanup_temp_dirs()
+            (upstream kept it in a per-run extraction folder);
+          * `keep_both` lets the caller pick AppImageUpdateLogic.KEEP —
+            upstream's CLI path always installs with REPLACE;
+          * on success we only clear updating_from here, update_logic is
+            left set so callers can tell KEEP from REPLACE installs.
+        Raises InternalError when the download is not an AppImage."""
+        dest_dir = extractor.new_temp_dir(prefix='appimage-update-')
+        update_file_path = manager.download(dest_dir, progress_cb)
+
+        if not self.can_install_file(update_file_path):
+            raise InternalError('The downloaded file is not a valid AppImage, '
+                                'please check if the provided URL is correct')
+
+        list_element = self.create_list_element_from_file(update_file_path,
+                                                          return_new_el=True)
+
+        list_element.update_logic = (AppImageUpdateLogic.KEEP if keep_both
+                                     else AppImageUpdateLogic.REPLACE)
+        list_element.updating_from = el
+        self.install_file(list_element)
+
+        list_element.updating_from = None
+
+        # report the name/version as actually installed (the raw name is
+        # the downloaded file's basename, e.g. 'update'; cmd_integrate
+        # applies the same re-read after install_file)
+        if list_element.desktop_entry:
+            list_element.name = list_element.desktop_entry.getName()
+            list_element.version = list_element.desktop_entry.get(
+                'X-AppImage-Version')
+
+        return list_element
+
     def update_desktop_file(self, el: AppImageListElement):
         if not el.desktop_file_path:
             raise Exception('desktop_file_path not specified')

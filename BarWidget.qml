@@ -143,9 +143,14 @@ BarWidget {
     active: root.updateCount > 0
     useActiveColor: root.updateCount > 0
     horizontalMargin: 8.5
-    tooltipText: root.installedCount > 0
-      ? Model.formatCount(root.installedCount, Model.strings.barTooltipCount)
-      : Model.strings.barTooltip
+    // Tooltip mirrors the badge's urgency: once M2 update sweeps fill the
+    // store, the actionable number (pending updates) wins over the
+    // installed count.
+    tooltipText: root.updateCount > 0
+      ? Model.formatCount(root.updateCount, Model.strings.updatesAvailable)
+      : (root.installedCount > 0
+        ? Model.formatCount(root.installedCount, Model.strings.barTooltipCount)
+        : Model.strings.barTooltip)
 
     Row {
       id: barContent

@@ -18,7 +18,18 @@ DEFAULT_MANAGE_OUTSIDE = True
 # Mirror of GearLever's `move-appimage-on-integration` default.
 DEFAULT_MOVE_ON_INTEGRATION = True
 
-BACKEND_VERSION = '0.1.0'
+# Background update checks (F8, PRD decision #3): enabled, first check 5
+# minutes after the service starts, then every 6 hours.
+DEFAULT_UPDATE_CHECK_ENABLED = True
+DEFAULT_UPDATE_CHECK_INTERVAL = 360
+DEFAULT_UPDATE_CHECK_DELAY = 5
+
+# update-check scheduling bounds enforced by --set-setting (a shorter
+# interval would flirt with the PRD §2 no-polling budget; 15 minutes is
+# the floor, matching the fastest sensible manual-refresh cadence).
+MIN_UPDATE_CHECK_INTERVAL = 15
+
+BACKEND_VERSION = '0.2.0'
 
 JSON_SCHEMA_VERSION = 1
 

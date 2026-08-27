@@ -1,0 +1,1 @@
+{"schema_version": 1, "settings": {"appimages_default_folder": "~/AppImages", "manage_files_outside_default_folder": true, "move_appimage_on_integration": true, "update_check_enabled": true, "update_check_interval_minutes": 360, "update_check_delay_minutes": 5}}

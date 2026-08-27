@@ -7,9 +7,12 @@ import os
 import unittest
 
 from helpers import (FakeXDGTestCase, NVIM_SQUASHFS_OFFSET, download_fixture,
-                     make_minimal_elf)
+                     make_elf_with_sections, make_minimal_elf)
 
 from omarchy_appimage import elf
+
+NVIM_UPD_INFO = ('gh-releases-zsync|neovim|neovim|latest|'
+                 'nvim-linux-x86_64.appimage.zsync')
 
 
 class ElfSyntheticTests(unittest.TestCase):
@@ -68,6 +71,75 @@ class ElfSyntheticTests(unittest.TestCase):
         path = self.addCleanup_tmp(make_minimal_elf(e_machine=0x1234))
         self.assertEqual(elf.get_elf_arch(path), 'UNKNOWN')
 
+    def test_upd_info_extracts_string(self):
+        data = make_elf_with_sections({
+            '.upd_info': b'gh-releases-zsync|app|repo|latest|f-*.zsync\x00',
+        })
+        path = self.addCleanup_tmp(data)
+        self.assertEqual(elf.read_upd_info(path),
+                         'gh-releases-zsync|app|repo|latest|f-*.zsync')
+
+    def test_upd_info_nul_padded(self):
+        # real AppImages pad .upd_info to a fixed size with NUL bytes
+        data = make_elf_with_sections({
+            '.upd_info': b'zsync|http://example.com/f.appimage.zsync'
+                         + b'\x00' * 100,
+        })
+        path = self.addCleanup_tmp(data)
+        self.assertEqual(elf.read_upd_info(path),
+                         'zsync|http://example.com/f.appimage.zsync')
+
+    def test_upd_info_missing_section(self):
+        data = make_elf_with_sections({'.note.test': b'whatever'})
+        path = self.addCleanup_tmp(data)
+        self.assertEqual(elf.read_upd_info(path), '')
+
+    def test_upd_info_empty_section(self):
+        data = make_elf_with_sections({'.upd_info': b''})
+        path = self.addCleanup_tmp(data)
+        self.assertEqual(elf.read_upd_info(path), '')
+
+    def test_upd_info_32bit_header(self):
+        data = make_elf_with_sections(
+            {'.upd_info': b'gh-releases-zsync|o|r|latest|*.zsync\x00'},
+            is64=False)
+        path = self.addCleanup_tmp(data)
+        self.assertEqual(elf.read_upd_info(path),
+                         'gh-releases-zsync|o|r|latest|*.zsync')
+
+    def test_upd_info_big_endian(self):
+        data = make_elf_with_sections(
+            {'.upd_info': b'zsync|http://h/f.zsync\x00'}, big_endian=True)
+        path = self.addCleanup_tmp(data)
+        self.assertEqual(elf.read_upd_info(path), 'zsync|http://h/f.zsync')
+
+    def test_upd_info_not_an_elf(self):
+        path = self.addCleanup_tmp(b'MZ definitely not ELF')
+        self.assertEqual(elf.read_upd_info(path), '')
+
+    def test_upd_info_alongside_other_sections(self):
+        data = make_elf_with_sections({
+            '.note.test': b'\x00\x01\x02',
+            '.upd_info': b'gh-releases-zsync|o|r|latest|*.zsync\x00',
+            '.data': b'x' * 16,
+        })
+        path = self.addCleanup_tmp(data)
+        self.assertEqual(elf.read_upd_info(path),
+                         'gh-releases-zsync|o|r|latest|*.zsync')
+
+    def test_upd_info_truncated_section_table(self):
+        # a file cut off inside the section header table: the last entries
+        # read short, the loop stops early and e_shstrndx may point past
+        # the collected entries — must return empty, never raise IndexError
+        data = make_elf_with_sections({
+            '.note.test': b'\x00\x01\x02',
+            '.upd_info': b'gh-releases-zsync|o|r|latest|*.zsync\x00',
+        })
+        truncated = data[:len(data) - 40]   # mid-way into the last shdr
+        path = self.addCleanup_tmp(truncated)
+        self.assertEqual(elf._read_sections(path), [])
+        self.assertEqual(elf.read_upd_info(path), '')
+
     def addCleanup_tmp(self, data: bytes) -> str:
         import tempfile
         with tempfile.NamedTemporaryFile(suffix='.appimage',
@@ -92,6 +164,12 @@ class ElfFixtureTests(FakeXDGTestCase):
             self.skipTest('fixture download unavailable')
         self.assertEqual(elf.get_appimage_type(fixture), '2')
         self.assertEqual(elf.get_elf_arch(fixture), 'x86_64')
+
+    def test_upd_info_fixture(self):
+        fixture = download_fixture()
+        if fixture is None:
+            self.skipTest('fixture download unavailable')
+        self.assertEqual(elf.read_upd_info(fixture), NVIM_UPD_INFO)
 
 
 if __name__ == '__main__':

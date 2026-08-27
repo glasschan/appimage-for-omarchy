@@ -76,3 +76,112 @@ def get_elf_arch(path: str) -> str:
     if e_machine == 0xB7:          # EM_AARCH64
         return 'aarch64'
     return 'UNKNOWN'
+
+
+def _read_sections(path: str):
+    """Parse the ELF section table into [(name, sh_offset, sh_size), ...].
+
+    Returns an empty list when the file is not an ELF or has no section
+    table. Handles extended numbering (e_shnum == 0 with the real count in
+    section 0's sh_size, e_shstrndx == SHN_XINDEX with the real index in
+    section 0's sh_link) the way readelf does."""
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(64)
+            if len(header) < 64 or header[0:4] != b'\x7fELF':
+                return []
+
+            ei_class = header[4]   # 1 = 32-bit, 2 = 64-bit
+            ei_data = header[5]    # 1 = little-endian, 2 = big-endian
+            if ei_class not in (1, 2) or ei_data not in (1, 2):
+                return []
+            fmt = '<' if ei_data == 1 else '>'
+
+            if ei_class == 2:
+                e_shoff = struct.unpack_from(fmt + 'Q', header, 0x28)[0]
+                e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(
+                    fmt + 'HHH', header, 0x3A)
+                off_fmt, off_at, size_at, link_at = fmt + 'Q', 24, 32, 40
+            else:
+                e_shoff = struct.unpack_from(fmt + 'I', header, 0x20)[0]
+                e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(
+                    fmt + 'HHH', header, 0x2E)
+                off_fmt, off_at, size_at, link_at = fmt + 'I', 16, 20, 24
+
+            if e_shoff == 0 or e_shentsize == 0:
+                return []
+
+            def entry(index: int):
+                f.seek(e_shoff + index * e_shentsize)
+                raw = f.read(e_shentsize)
+                if len(raw) < e_shentsize:
+                    return None
+                sh_name = struct.unpack_from(fmt + 'I', raw, 0)[0]
+                sh_offset = struct.unpack_from(off_fmt, raw, off_at)[0]
+                sh_size = struct.unpack_from(off_fmt, raw, size_at)[0]
+                sh_link = struct.unpack_from(fmt + 'I', raw, link_at)[0]
+                return (sh_name, sh_offset, sh_size, sh_link)
+
+            first = entry(0)
+            if first is None:
+                return []
+
+            # Extended numbering escapes live in section 0.
+            if e_shnum == 0:
+                e_shnum = first[2]                 # sh_size of section 0
+            if e_shstrndx == 0xffff:               # SHN_XINDEX
+                e_shstrndx = first[3]              # sh_link of section 0
+            if e_shnum == 0 or e_shnum > 0x10000 or e_shstrndx >= e_shnum:
+                return []
+
+            entries = []
+            for i in range(e_shnum):
+                e = entry(i)
+                if e is None:
+                    break
+                entries.append(e)
+
+            # A truncated table can leave fewer entries than e_shstrndx
+            # names; bail out instead of raising IndexError below.
+            if e_shstrndx >= len(entries):
+                return []
+
+            # Resolve section names through the section-name string table.
+            _, str_off, str_size, _ = entries[e_shstrndx]
+            f.seek(str_off)
+            names = f.read(str_size)
+
+            sections = []
+            for sh_name, sh_offset, sh_size, _ in entries:
+                if sh_name >= len(names):
+                    sections.append(('', sh_offset, sh_size))
+                    continue
+                end = names.find(b'\x00', sh_name)
+                name = names[sh_name:end if end != -1 else len(names)]
+                sections.append((name.decode('utf-8', 'replace'),
+                                 sh_offset, sh_size))
+            return sections
+    except OSError:
+        return []
+
+
+def read_upd_info(path: str) -> str:
+    """Return the AppImage update-information string from the ELF
+    `.upd_info` section (e.g. 'gh-releases-zsync|owner|repo|latest|*.zsync'),
+    or '' when the section is missing or empty.
+
+    Replaces GearLever's `readelf --string-dump=.upd_info` subprocess
+    (UpdateManagerChecker.check_app_embedded_url) with a direct section
+    read; the AppImageSpec puts the update information in this section of
+    the runtime header."""
+    for name, offset, size in _read_sections(path):
+        if name != '.upd_info':
+            continue
+        try:
+            with open(path, 'rb') as f:
+                f.seek(offset)
+                data = f.read(size)
+        except OSError:
+            return ''
+        return data.split(b'\x00', 1)[0].decode('utf-8', 'replace').strip()
+    return ''
