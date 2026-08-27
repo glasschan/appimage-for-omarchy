@@ -9,6 +9,8 @@ an action needs it.
 Backend logic is derived from
 [GearLever](https://github.com/mijorus/gearlever) (GPL-3.0, mijorus), so
 this plugin is licensed under **GPL-3.0** as well — see [LICENSE](LICENSE).
+UI icons are from [tabler-icons](https://github.com/tabler/tabler-icons)
+(MIT, Paweł Kuna) — see [icons/LICENSE-TABLER.md](icons/LICENSE-TABLER.md).
 
 ## Status (MVP, F1–F5)
 
@@ -16,7 +18,7 @@ this plugin is licensed under **GPL-3.0** as well — see [LICENSE](LICENSE).
   extracted icon and a running dot. The list is cached in the shared
   store, so opening the panel renders instantly and rescans in the
   background (only when the cache is stale or empty — never blocking).
-- **Integrate (F2)** — `+ Integrate` opens an inline picker: type a path
+- **Integrate (F2)** — `Integrate` opens an inline picker: type a path
   or click an AppImage found in `~/Downloads` / `~/downloads`. The
   backend extracts the `.desktop` entry and icon, moves the file into
   `~/AppImages` and reports success, "already integrated", or the exact
@@ -27,7 +29,7 @@ this plugin is licensed under **GPL-3.0** as well — see [LICENSE](LICENSE).
 - **Launch (F4)** — click the row (or Launch) to start the AppImage
   detached, with `DESKTOPINTEGRATION=1` like the generated desktop entry.
   The running dot refreshes shortly after launch.
-- **Bar widget (F5)** — package glyph + installed count; updates live as
+- **Bar widget (F5)** — tabler package icon + installed count; updates live as
   the store changes (one backend probe at login seeds the count).
 
 Errors are never silent: a missing `python3`, a hung backend, or invalid
@@ -46,6 +48,14 @@ From this repository (once published):
 
 ```sh
 omarchy plugin add <repo-url> --enable
+```
+
+From a local checkout (runtime files only — no tests/docs/bytecode), use the
+bundled scripts:
+
+```sh
+./install.sh      # sync into ~/.config/omarchy/plugins/ and rescan
+./uninstall.sh    # disable, remove the plugin dir, hint a shell restart
 ```
 
 For development, validate and load straight from a checkout:
@@ -82,7 +92,9 @@ stderr); `--json` requires `--yes` for integrate/remove.
 manifest.json     Omarchy plugin manifest (bar-widget + panel)
 BarWidget.qml     Bar entry: icon + count badge, summons the panel
 Panel.qml         Main panel (list, picker, actions, states, Escape via PanelKeyCatcher)
+ThemeIcon.qml     Theme-colored tabler icon (runtime currentColor tint)
 lib/Model.js      Shared state store (items cache, counts, busy flags, JSON mapping)
 lib/Backend.js    Process wrapper for the backend CLI (watchdog, tolerant JSON parse)
+icons/            Bundled tabler SVGs (MIT) + LICENSE-TABLER.md
 backend/          Python stdlib CLI (derived from GearLever)
 ```

@@ -90,9 +90,25 @@ def atomic_write(path: str, data: bytes):
         raise
 
 
-def is_app_running(file_path: str) -> bool:
+def is_app_running(file_path: str,
+                   mounts_path: str = None) -> bool:
     """True when the executable at `file_path` is currently running
-    (ported from GearLever's AppImageProvider.is_app_running)."""
+    (ported from GearLever's AppImageProvider.is_app_running).
+
+    Two signals are OR-ed, because a type-2 AppImage started through its
+    FUSE runtime executes from /tmp/.mount_* so its `ps` exe never equals
+    the AppImage path:
+      1. a `ps -eo exe` entry equals `file_path` (direct execution);
+      2. `file_path` is the mount source of an active FUSE mount
+         (see is_fuse_mounted).
+
+    `mounts_path` overrides the /proc/mounts location (tests)."""
+    return (_running_by_ps(file_path)
+            or is_fuse_mounted(file_path, mounts_path))
+
+
+def _running_by_ps(file_path: str) -> bool:
+    """The original GearLever detection: exact match in `ps -eo exe`."""
     if not file_path:
         return False
 
@@ -104,6 +120,62 @@ def is_app_running(file_path: str) -> bool:
 
     for line in result.stdout.decode(errors='replace').split('\n'):
         if line.strip() == file_path:
+            return True
+
+    return False
+
+
+PROC_MOUNTS_PATH = '/proc/mounts'
+
+
+def _unescape_mounts_field(field: str) -> str:
+    """Decode the octal escapes used by /proc/mounts (mounts(5): space is
+    \\040, tab \\011, newline \\012, backslash \\134, ...)."""
+    def repl(match):
+        return chr(int(match.group(1), 8))
+    return re.sub(r'\\([0-7]{3})', repl, field)
+
+
+def parse_proc_mounts(path: str = None) -> list:
+    """Parse a mounts(5) style file into (source, target, fstype) tuples.
+
+    A missing or unreadable file yields an empty list (best-effort, like
+    the `ps` lookup)."""
+    if path is None:
+        path = PROC_MOUNTS_PATH
+
+    entries = []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                entries.append((_unescape_mounts_field(fields[0]),
+                                _unescape_mounts_field(fields[1]),
+                                fields[2]))
+    except OSError as e:
+        logging.debug('could not read %s: %s', path, e)
+    return entries
+
+
+def is_fuse_mounted(file_path: str, mounts_path: str = None) -> bool:
+    """True when `file_path` is the source of an active FUSE mount.
+
+    While a type-2 AppImage runs, its runtime FUSE-mounts the image at
+    /tmp/.mount_XXXXXX with the AppImage path as the mount source and
+    `fuse.AppImage` as the filesystem type, e.g.
+
+        /home/user/AppImages/foo.appimage /tmp/.mount_fooXXXX fuse.AppImage rw,... 0 0
+
+    The fuse.* fstype filter keeps unrelated mounts whose source happens
+    to be a regular file (loop devices, bind mounts) from matching.
+    `mounts_path` overrides the /proc/mounts location (tests)."""
+    if not file_path:
+        return False
+
+    for source, _target, fstype in parse_proc_mounts(mounts_path):
+        if source == file_path and fstype.startswith('fuse.'):
             return True
 
     return False

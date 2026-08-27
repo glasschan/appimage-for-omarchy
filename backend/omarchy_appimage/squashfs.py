@@ -156,7 +156,19 @@ class SquashfsReader:
     # ------------------------------------------------------------------ io
 
     def close(self):
-        self._f.close()
+        # idempotent: __exit__, explicit close() and __del__ may all run
+        if not self._f.closed:
+            self._f.close()
+
+    def __del__(self):
+        # safety net so a caller that forgets close() can never leak the
+        # file descriptor (silences ResourceWarning at garbage collection)
+        f = getattr(self, '_f', None)
+        if f is not None and not f.closed:
+            try:
+                f.close()
+            except Exception:
+                pass
 
     def __enter__(self):
         return self

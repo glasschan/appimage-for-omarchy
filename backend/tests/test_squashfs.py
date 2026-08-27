@@ -23,6 +23,8 @@ class SquashfsReaderTests(FakeXDGTestCase):
         super().setUp()
         self.fixture = _fixture_or_skip(self)
         self.reader = SquashfsReader(self.fixture, NVIM_SQUASHFS_OFFSET)
+        # never leave the fixture file handle open (ResourceWarning)
+        self.addCleanup(self.reader.close)
 
     def test_superblock(self):
         self.assertEqual(self.reader.s_major, 4)

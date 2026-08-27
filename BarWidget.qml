@@ -6,8 +6,8 @@ import qs.Ui
 import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
 
-// Bar entry for the AppImage plugin: a package glyph plus the installed
-// count, and an urgent-colored label once updates are pending.
+// Bar entry for the AppImage plugin: a tabler package icon plus the
+// installed count, and an urgent tint once updates are pending.
 //
 // This plugin declares both "bar-widget" and "panel" kinds, so the panel
 // is owned by the shell's panel loader (summon path) rather than hosted
@@ -19,9 +19,9 @@ BarWidget {
   id: root
   moduleName: "io.github.glasschan.appimage"
 
-  // Nerd Font package glyph, the same one the Omarchy menu uses for
-  // "Package" entries — no custom font or image asset needed.
-  readonly property string iconGlyph: "󰣇"
+  // Tabler icon name for the bar mark (icons/package.svg via ThemeIcon);
+  // the icon follows the bar's foreground/urgent colors, so no theme
+  // knowledge lives here.
 
   // Mirrored from the shared Model store; Model has no property-change
   // notifications (it is a plain JS library), so a subscription copies
@@ -130,7 +130,14 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.installedCount > 0 ? root.iconGlyph + " " + root.installedCount : root.iconGlyph
+    // The tabler package icon and the count render in barContent below, so
+    // the built-in text label is off; the width follows that row with the
+    // same margins WidgetButton would give a label, and hasVisualContent
+    // stays true now that `text` is empty.
+    text: ""
+    labelVisible: false
+    hasVisualContent: true
+    implicitWidth: Math.max(12, barContent.implicitWidth + button.scaledHorizontalMargin * 2)
     // WidgetButton paints `active` in bar.urgent, which is exactly the
     // "updates pending" badge treatment the PRD asks for.
     active: root.updateCount > 0
@@ -139,6 +146,30 @@ BarWidget {
     tooltipText: root.installedCount > 0
       ? Model.formatCount(root.installedCount, Model.strings.barTooltipCount)
       : Model.strings.barTooltip
+
+    Row {
+      id: barContent
+      anchors.centerIn: parent
+      spacing: Style.spacing.xs
+
+      ThemeIcon {
+        name: "package"
+        size: Style.bar.iconCanvas
+        strokeWidth: 1.75
+        color: button.active && button.useActiveColor ? button.activeColor : button.foreground
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      Text {
+        visible: root.installedCount > 0
+        text: root.installedCount
+        color: button.active && button.useActiveColor ? button.activeColor : button.foreground
+        font.family: root.bar && root.bar.fontFamily ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.body
+        renderType: Text.NativeRendering
+        anchors.verticalCenter: parent.verticalCenter
+      }
+    }
 
     onPressed: function(buttonCode) {
       root.togglePanel()

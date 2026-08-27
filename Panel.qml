@@ -78,7 +78,7 @@ Panel {
   // desktop_id whose Remove button is armed for the second click (F3).
   property string confirmRemoveId: ""
 
-  // Emitted by the [+ Integrate] button and the "i" shortcut; opens the
+  // Emitted by the [Integrate] button and the "i" shortcut; opens the
   // inline picker below.
   signal integrateRequested()
 
@@ -493,13 +493,46 @@ Panel {
 
               Item { width: 1; height: 1; anchors.verticalCenter: parent.verticalCenter }
 
+              // The shell Button has no image slot (its iconText is a
+              // Nerd Font glyph), so the row below supplies the tabler
+              // icon + caption while Button keeps owning every state
+              // visual (hover, focus, fills); the width override mirrors
+              // Button's own label-based sizing math over that row.
               Button {
-                text: root.pickerOpen ? root.strings.pickerCancel : root.strings.integrate
+                id: integrateButton
+                text: ""
                 anchors.verticalCenter: parent.verticalCenter
                 foreground: root.foreground
                 accent: Color.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
+                implicitWidth: integrateRow.implicitWidth
+                  + integrateButton.horizontalPadding * 2
+                  + integrateButton._reservedBorderLeft
+                  + integrateButton._reservedBorderRight
+
+                Row {
+                  id: integrateRow
+                  anchors.centerIn: parent
+                  spacing: Style.spacing.xs
+
+                  ThemeIcon {
+                    name: "plus"
+                    size: Style.font.icon
+                    strokeWidth: 1.75
+                    color: integrateButton.foreground
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  Text {
+                    text: root.pickerOpen ? root.strings.pickerCancel : root.strings.integrate
+                    color: integrateButton.foreground
+                    font.family: integrateButton.fontFamily
+                    font.pixelSize: integrateButton.fontSize
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
                 onClicked: {
                   if (root.pickerOpen) root.closePicker()
                   else root.integrateRequested()
@@ -507,13 +540,41 @@ Panel {
               }
 
               Button {
-                text: root.strings.refresh
+                id: refreshButton
+                text: ""
                 enabled: !root.busyList
                 anchors.verticalCenter: parent.verticalCenter
                 foreground: root.foreground
                 accent: Color.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
+                implicitWidth: refreshRow.implicitWidth
+                  + refreshButton.horizontalPadding * 2
+                  + refreshButton._reservedBorderLeft
+                  + refreshButton._reservedBorderRight
+
+                Row {
+                  id: refreshRow
+                  anchors.centerIn: parent
+                  spacing: Style.spacing.xs
+
+                  ThemeIcon {
+                    name: "refresh"
+                    size: Style.font.icon
+                    strokeWidth: 1.75
+                    color: refreshButton.foreground
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  Text {
+                    text: root.strings.refresh
+                    color: refreshButton.foreground
+                    font.family: refreshButton.fontFamily
+                    font.pixelSize: refreshButton.fontSize
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
                 onClicked: root.refresh()
               }
             }
@@ -689,11 +750,11 @@ Panel {
               width: parent.width
               spacing: Style.spacing.sm
 
-              Text {
-                text: "󰣇"
+              ThemeIcon {
+                name: "package"
+                size: Style.font.displayLarge * 1.5
+                strokeWidth: 1.5
                 color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.displayLarge
                 anchors.horizontalCenter: parent.horizontalCenter
               }
 
@@ -773,7 +834,7 @@ Panel {
 
                       // Extracted icon when it exists (try png → svg →
                       // xpm next to the AppImage under .icons/, CONTRACT.md
-                      // filesystem layout), package glyph otherwise.
+                      // filesystem layout), tabler package icon otherwise.
                       Image {
                         id: appIcon
                         property int iconIndex: 0
@@ -800,13 +861,12 @@ Panel {
                         }
                       }
 
-                      Text {
+                      ThemeIcon {
                         visible: !appIcon.visible || appIcon.status === Image.Error
                         anchors.verticalCenter: parent.verticalCenter
-                        text: "󰣇"
+                        name: "package"
+                        size: Style.font.body * 1.7
                         color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.body * 1.3
                       }
 
                       Column {
@@ -850,13 +910,26 @@ Panel {
                         spacing: Style.spacing.xxs
                         anchors.verticalCenter: parent.verticalCenter
 
-                        Button {
-                          text: root.strings.launch
-                          anchors.verticalCenter: parent.verticalCenter
+                        // Launch (F4) as an icon-only action with a tooltip:
+                        // the row card itself launches too, so the caption
+                        // was dead weight next to the trash button.
+                        PanelActionButton {
+                          id: launchButton
+                          tooltipText: root.strings.launch
                           foreground: root.foreground
-                          accent: Color.accent
-                          fontFamily: root.fontFamily
-                          fontSize: Style.font.caption
+                          hoverColor: Color.accent
+                          anchors.verticalCenter: parent.verticalCenter
+
+                          ThemeIcon {
+                            anchors.centerIn: parent
+                            name: "player-play"
+                            size: launchButton.fontSize
+                            strokeWidth: 1.75
+                            color: launchButton.enabled
+                              ? (launchButton._hot ? launchButton.hoverColor : launchButton.foreground)
+                              : Qt.darker(launchButton.foreground, 2.0)
+                          }
+
                           onClicked: root.launchItem(itemRow.modelData)
                         }
 
@@ -875,13 +948,24 @@ Panel {
                         }
 
                         PanelActionButton {
+                          id: removeButton
                           visible: root.confirmRemoveId !== itemRow.modelData.id
-                          iconText: "󰅙"
                           tooltipText: root.strings.removeTooltip
                           foreground: root.foreground
                           hoverColor: root.urgent
                           fontFamily: root.fontFamily
                           anchors.verticalCenter: parent.verticalCenter
+
+                          ThemeIcon {
+                            anchors.centerIn: parent
+                            name: "trash"
+                            size: removeButton.fontSize
+                            strokeWidth: 1.75
+                            color: removeButton.enabled
+                              ? (removeButton._hot ? removeButton.hoverColor : removeButton.foreground)
+                              : Qt.darker(removeButton.foreground, 2.0)
+                          }
+
                           onClicked: root.requestRemove(itemRow.modelData)
                         }
                       }

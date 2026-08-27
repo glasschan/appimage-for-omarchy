@@ -101,7 +101,7 @@ No arguments prints usage and exits **2**.
 | `download_size` | null | Reserved for P1 update support |
 | `manager` | null | Update manager name — always null in the MVP |
 | `embedded_source` | false | Reserved for P1 update support |
-| `running` | boolean | True when the AppImage executable is currently running |
+| `running` | boolean | True when the AppImage is currently running (detected via `ps -eo exe` **or** as the mount source of a `fuse.*` mount in `/proc/mounts`, which is how FUSE-launched type-2 AppImages show up) |
 
 Real example output (captured from an actual run):
 
