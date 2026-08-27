@@ -1,5 +1,6 @@
-// Harness: feeds real backend/main.py output (captured in /tmp/appimage-e2e)
-// through the exact QML-side JS parse logic (lib/Model.js + lib/Backend.js).
+// Harness: feeds real backend/main.py output (captured in tests-js/captures/
+// during an e2e run) through the exact QML-side JS parse logic
+// (lib/Model.js + lib/Backend.js).
 // Run: node tests-js/parse-harness.mjs
 import { readFileSync } from "node:fs"
 import vm from "node:vm"
@@ -22,7 +23,7 @@ const check = (name, cond, detail) => {
   if (cond) console.log("PASS " + name)
   else { failures++; console.log("FAIL " + name + (detail ? " — " + detail : "")) }
 }
-const cap = (f) => readFileSync("/tmp/appimage-e2e/captures/" + f, "utf8")
+const cap = (f) => readFileSync(new URL("./captures/" + f, import.meta.url), "utf8")
 
 // ---- F1: --list-installed --json ------------------------------------------
 const list = Model.parseListJson(cap("list.json"))

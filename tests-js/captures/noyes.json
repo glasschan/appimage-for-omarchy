@@ -1,0 +1,1 @@
+{"schema_version": 1, "result": "error", "error": "--json mode requires --yes (no interactive prompts)"}
