@@ -1,0 +1,129 @@
+# utils.py — small helpers shared by the backend (Python stdlib only).
+#
+# Derived from GearLever (c) mijorus, GPL-3.0.
+# extract_terminal_arguments, remove_special_chars and get_file_hash are
+# ported from src/lib/utils.py; Gio/Gtk/dbus helpers are dropped and the
+# subprocess helpers always use argument lists (never `sh -c`).
+
+import hashlib
+import logging
+import os
+import re
+import shlex
+import subprocess
+import tempfile
+
+
+def get_file_hash(file_path: str, alg: str = 'md5') -> str:
+    h = hashlib.new(alg)
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def remove_special_chars(filename: str, replacement: str = '') -> str:
+    """Removes special characters from a filename (GearLever, utils.py)."""
+    pattern = r'[^\w\._]+'
+    return re.sub(pattern, replacement, filename)
+
+
+def extract_terminal_arguments(command: str) -> dict:
+    """Extract env variables, executable and arguments from a command
+    string (GearLever, utils.py). Handles quoted paths and flags."""
+    tokens = shlex.split(command)
+
+    result = {
+        'env_vars': [],
+        'executable': '',
+        'arguments': []
+    }
+
+    for token in tokens:
+        if token == 'env':
+            continue
+        elif '=' in token and not token.startswith('/') and not token.startswith('-'):
+            result['env_vars'].append(token)
+        elif not result['executable'] and not token.startswith('-'):
+            result['executable'] = token
+        else:
+            result['arguments'].append(token)
+
+    return result
+
+
+def run_command(command: list, cwd: str = None, check: bool = True,
+                timeout: float = 120) -> subprocess.CompletedProcess:
+    """Run a command with argument lists only (no shell), stdout/stderr
+    captured; raises CalledProcessError on failure when check=True."""
+    logging.debug('Running %s', command)
+    result = subprocess.run(command, cwd=cwd, check=False,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=timeout)
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, command,
+            output=result.stdout, stderr=result.stderr)
+    return result
+
+
+def atomic_write(path: str, data: bytes):
+    """Write `data` to `path` atomically (temp file + os.replace), so a
+    crash can never leave a truncated .desktop file behind."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix='.tmp-', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp creates 0600; desktop files must stay world-readable
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def is_app_running(file_path: str) -> bool:
+    """True when the executable at `file_path` is currently running
+    (ported from GearLever's AppImageProvider.is_app_running)."""
+    if not file_path:
+        return False
+
+    try:
+        result = run_command(['ps', '-eo', 'exe'], check=True)
+    except Exception as e:
+        logging.warning('ps lookup failed: %s', e)
+        return False
+
+    for line in result.stdout.decode(errors='replace').split('\n'):
+        if line.strip() == file_path:
+            return True
+
+    return False
+
+
+def gnu_naturalsize(value: int, precision: int = 1) -> str:
+    """Format a byte count like GNU `ls -lh` (GearLever, utils.py)."""
+    if value < 0:
+        return f"-{gnu_naturalsize(abs(value), precision)}"
+
+    suffixes = ('B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB')
+    base = 1024.0
+
+    if value < base:
+        return f"{value}B"
+
+    import math
+    i = int(math.floor(math.log(value, base)))
+    if i >= len(suffixes):
+        i = len(suffixes) - 1
+
+    v = value / math.pow(base, i)
+    return f"{v:.{precision}f} {suffixes[i]}"

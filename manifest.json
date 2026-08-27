@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.glasschan.appimage",
+  "name": "AppImage for Omarchy",
+  "version": "0.1.0",
+  "author": "glasschan",
+  "license": "GPL-3.0",
+  "description": "Manage AppImages from the Omarchy bar: integrate, list, launch, and remove.",
+  "kinds": [
+    "bar-widget",
+    "panel"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "AppImage",
+    "description": "Integrate, list, launch, and remove AppImages.",
+    "category": "Apps",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
