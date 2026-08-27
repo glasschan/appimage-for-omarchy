@@ -1,3 +1,6 @@
+# --- Local-only planning docs (kept out of the repo) ---------------------
+PRD.md
+
 # --- Python: bytecode, tool caches, virtualenvs, packaging -------------
 __pycache__/
 *.py[cod]
