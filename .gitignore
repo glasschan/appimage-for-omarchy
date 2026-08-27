@@ -1,6 +1,32 @@
-# Python
+# --- Python: bytecode, tool caches, virtualenvs, packaging -------------
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
 
-# Local experiments / scratch
+# --- AppImage: local test files, partial downloads, manual extraction --
 *.AppImage
+*.AppImage.part
+squashfs-root/
+
+# --- QML engine caches --------------------------------------------------
+*.qmlc
+*.jsc
+
+# --- Node (tests-js harness) --------------------------------------------
+node_modules/
+
+# --- Editors & OS --------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.directory
