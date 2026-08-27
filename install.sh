@@ -86,6 +86,7 @@ if command -v omarchy >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
 fi
 if [[ "$enabled" == "true" ]]; then
   echo "Plugin is enabled; files hot-reload (rescan already requested)."
+  echo "If this update added new entry points (new files like Service.qml), run: omarchy restart shell"
 else
   echo "Plugin is not enabled yet. Enable it with:"
   echo "  omarchy plugin enable $PLUGIN_ID"

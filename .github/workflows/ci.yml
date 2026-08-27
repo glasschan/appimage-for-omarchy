@@ -2,8 +2,8 @@
 #
 # Lean by design (PRD §2): three quick jobs on stock runners — no Omarchy,
 # no Quickshell. They cover exactly what the project itself accepts:
-#   backend          — 68 stdlib-only unittests (Python 3.14, matches the
-#                      dev machine; ResourceWarnings are errors)
+#   backend          — the stdlib-only unittest suite (Python 3.14,
+#                      matches the dev machine; ResourceWarnings are errors)
 #   frontend-js      — lib/*.js parser harness on Node
 #   plugin-manifest  — manifest/repo hygiene + the PRD §2 < 1MB size budget
 name: CI
