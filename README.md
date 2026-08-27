@@ -1,5 +1,7 @@
 # AppImage for Omarchy
 
+[![CI](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml/badge.svg)](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml)
+
 Manage AppImages from the Omarchy bar: integrate new ones into your app
 menu, see what is installed (and running), launch them, and remove them —
 all in a native Quickshell panel. No daemon, no extra runtime: the panel
@@ -98,3 +100,8 @@ lib/Backend.js    Process wrapper for the backend CLI (watchdog, tolerant JSON p
 icons/            Bundled tabler SVGs (MIT) + LICENSE-TABLER.md
 backend/          Python stdlib CLI (derived from GearLever)
 ```
+
+## Releases / versioning
+
+The version lives in `manifest.json`. To cut a release: bump that
+version, commit, tag `vX.Y.Z`, then `gh release create vX.Y.Z`.
