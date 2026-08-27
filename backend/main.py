@@ -11,6 +11,10 @@ import logging
 import os
 import sys
 
+# Keep the installed plugin directory clean: never drop __pycache__/
+# next to the sources when the shell spawns us.
+sys.dont_write_bytecode = True
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from omarchy_appimage import extractor          # noqa: E402
