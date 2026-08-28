@@ -6,7 +6,7 @@ import qs.Ui
 import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
 
-// Bar entry for the AppImage plugin: a tabler package icon plus the
+// Bar entry for the AppImage plugin: a tabler cube-unfolded icon plus the
 // installed count, and an urgent tint once updates are pending.
 //
 // This plugin declares both "bar-widget" and "panel" kinds, so the panel
@@ -19,7 +19,7 @@ BarWidget {
   id: root
   moduleName: "io.github.glasschan.appimage"
 
-  // Tabler icon name for the bar mark (icons/package.svg via ThemeIcon);
+  // Tabler icon name for the bar mark (icons/cube-unfolded.svg via ThemeIcon);
   // the icon follows the bar's foreground/urgent colors, so no theme
   // knowledge lives here.
 
@@ -130,7 +130,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // The tabler package icon and the count render in barContent below, so
+    // The tabler cube-unfolded icon and the count render in barContent below, so
     // the built-in text label is off; the width follows that row with the
     // same margins WidgetButton would give a label, and hasVisualContent
     // stays true now that `text` is empty.
@@ -158,7 +158,7 @@ BarWidget {
       spacing: Style.spacing.xs
 
       ThemeIcon {
-        name: "package"
+        name: "cube-unfolded"
         size: Style.bar.iconCanvas
         strokeWidth: 1.75
         color: button.active && button.useActiveColor ? button.activeColor : button.foreground

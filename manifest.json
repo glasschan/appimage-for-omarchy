@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.glasschan.appimage",
   "name": "AppImage for Omarchy",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "glasschan",
   "license": "GPL-3.0",
   "description": "Manage AppImages from the Omarchy bar: integrate, list, launch, update, and remove — with scheduled background update checks.",

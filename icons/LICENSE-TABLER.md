@@ -10,7 +10,7 @@ the files.
 Source: https://github.com/tabler/tabler-icons
 Path in the upstream repository: `icons/outline/<name>.svg`
 
-Bundled icons: `package`, `plus`, `refresh`, `player-play`, `trash`.
+Bundled icons: `cube-unfolded`, `plus`, `refresh`, `player-play`, `trash`, `arrow-up`, `cloud-download`, `settings`, `pin`.
 
 ---
 

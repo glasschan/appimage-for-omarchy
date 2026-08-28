@@ -31,7 +31,7 @@ UI icons are from [tabler-icons](https://github.com/tabler/tabler-icons)
 - **Launch (F4)** — click the row (or Launch) to start the AppImage
   detached, with `DESKTOPINTEGRATION=1` like the generated desktop entry.
   The running dot refreshes shortly after launch.
-- **Bar widget (F5)** — tabler package icon + installed count; updates live as
+- **Bar widget (F5)** — tabler cube-unfolded icon + installed count; updates live as
   the store changes (one backend probe at login seeds the count). When
   updates are pending the badge turns urgent and counts them, and the
   tooltip switches to the pending-updates count.
@@ -51,8 +51,8 @@ UI icons are from [tabler-icons](https://github.com/tabler/tabler-icons)
   updates get one desktop notification per release — signatures are
   deduped in `updates-state.json`, and updating an app re-arms the
   notification for the next release.
-- **Custom update sources (F9)** — per-app source editor in the settings
-  card or `--set-update-source` on the CLI: Static URL, GitHub, GitLab,
+- **Custom update sources (F9)** — per-app source editor on each app row
+  or `--set-update-source` on the CLI: Static URL, GitHub, GitLab,
   Codeberg, or Forgejo. A custom source wins over the embedded
   `.upd_info`.
 
@@ -161,7 +161,7 @@ Service.qml       Background update checker (scheduled --fetch-updates sweeps)
 ThemeIcon.qml     Theme-colored tabler icon (runtime currentColor tint)
 lib/Model.js      Shared state store (items cache, counts, busy flags, JSON mapping)
 lib/Backend.js    Process wrapper for the backend CLI (watchdog, tolerant JSON parse)
-icons/            Bundled tabler SVGs (package, plus, refresh, trash, player-play, settings, arrow-up, cloud-download; MIT) + LICENSE-TABLER.md
+icons/            Bundled tabler SVGs (cube-unfolded, plus, refresh, trash, player-play, settings, arrow-up, cloud-download, pin; MIT) + LICENSE-TABLER.md
 backend/          Python stdlib CLI (derived from GearLever)
 ```
 

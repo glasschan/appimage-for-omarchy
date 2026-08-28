@@ -31,11 +31,11 @@ import "lib/Backend.js" as Backend
 // F5 bar badge (observer over the same Model store).
 //
 // M2 wiring: F6 check updates (--list-updates with a long watchdog; the
-// offline error document surfaces its own message), F7 one-click update
-// per row (--update --yes, 10-minute timeout for large downloads), F9
-// per-app update sources plus the F8 cadence knobs in a settings card
-// toggled by the header gear. The F8 background service itself lives in
-// Service.qml — this panel only edits what it runs on.
+  // offline error document surfaces its own message), F7 one-click update
+  // per row (--update --yes, 10-minute timeout for large downloads), F9
+  // per-row update-source editors plus the F8 cadence knobs in a settings
+  // card toggled by the header gear. The F8 background service itself
+  // lives in Service.qml — this panel only edits what it runs on.
 Panel {
   id: root
   moduleName: "io.github.glasschan.appimage"
@@ -101,11 +101,14 @@ Panel {
   // desktop_id whose Remove button is armed for the second click (F3).
   property string confirmRemoveId: ""
 
-  // Settings card (F8/F9): opened by the header gear, mutually exclusive
+  // Settings card (F8): opened by the header gear, mutually exclusive
   // with the integrate picker. The edit* fields are working copies the
   // card mutates; Save pushes them key by key through --set-setting and
   // the store is re-read afterwards (reloadSettings).
   property bool settingsOpen: false
+  // Session-only window mode: pinned turns the full-screen overlay into a
+  // compact floating window sized to the card (never persisted).
+  property bool pinned: false
   property bool settingsBusy: false
   property bool editEnabled: true
   property int editInterval: 360
@@ -123,6 +126,10 @@ Panel {
   // Focus count over the editor's dynamic text fields; PanelKeyCatcher
   // must hand raw keys to whichever field is typing (see formEditing).
   property int sourceFieldFocusCount: 0
+  // Mirrors the per-row manager Dropdown's popupOpen so formEditing can
+  // keep blocking the key catcher while the popup (outside this item
+  // tree) owns keys — see onPopupOpenChanged on the dropdown.
+  property bool sourceDropdownOpen: false
 
   // Manager choices for the source editor's dropdown, resolved through the
   // strings table so display names stay central for i18n.
@@ -144,6 +151,8 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property color urgent: Color.urgent
   readonly property string fontFamily: Style.font.family
+  readonly property real controlHeight: Style.font.icon
+    + Style.spacing.controlPaddingY * 2 + Style.normalBorderWidth * 2
 
   // argv for the backend CLI. Priority: an explicit setting handed to
   // Model.configureBackend(), then python3 + <pluginDir>/backend/main.py
@@ -186,8 +195,8 @@ Panel {
   // True while any editor inside the panel should own raw keys instead of
   // the key catcher's shortcuts (see the keyCatcher binding below).
   readonly property bool formEditing: pickerField.activeFocus
-    || sourceManagerDropdown.popupOpen
     || sourceFieldFocusCount > 0
+    || root.sourceDropdownOpen
     || (intervalField.field.contentItem
         ? intervalField.field.contentItem.activeFocus : false)
     || (delayField.field.contentItem
@@ -466,7 +475,7 @@ Panel {
     updateCtx = ctx && ctx.active ? ctx : null
   }
 
-  // ---- settings card (F8 cadence + F9 per-app sources) ----------------------
+  // ---- settings card (F8 cadence) -------------------------------------------
 
   function toggleSettings() {
     if (settingsOpen) {
@@ -562,13 +571,20 @@ Panel {
   // --list-installed carries the manager name only, never its config.
   function openSourceEditor(item) {
     if (!item) return
-    sourceEditId = item.id
+    // Name/manager first: the per-row editor's Dropdown `value` binding
+    // derives from root.sourceEditManager, and its visible binding from
+    // sourceEditId — so managers and values must be live before the row's
+    // editor becomes visible, and sourceEditId lands last.
     sourceEditName = item.name
     sourceEditManager = item.manager
     rebuildSourceEditValues()
-    // Assigned, not bound: Dropdown.selectCurrent writes value directly,
-    // which would sever a binding for every later reopen.
-    sourceManagerDropdown.value = sourceEditManager
+    sourceEditId = item.id
+    // Coarse reveal: the editor may sit below the fold of a long list.
+    Qt.callLater(function() {
+      if (root.sourceEditId !== "" && listFlick) {
+        listFlick.contentY = Math.max(0, listFlick.contentHeight - listFlick.height)
+      }
+    })
   }
 
   function closeSourceEditor() {
@@ -794,26 +810,38 @@ Panel {
     id: window
     visible: root.opened
     anchors {
-      top: true
-      bottom: true
-      left: true
-      right: true
+      top: !root.pinned
+      bottom: !root.pinned
+      left: !root.pinned
+      right: !root.pinned
     }
+    // Pinned: drop the screen anchors and size the layer surface to the
+    // card plus a margin; unpinned the anchors win and the implicit sizes
+    // below are inert (ProxyWindowBase consumes implicit size on
+    // layer-shell windows — `width`/`height` are deprecated there).
+    implicitWidth: root.pinned ? card.width + Style.gapsOut * 2 : 0
+    implicitHeight: root.pinned ? card.height + Style.gapsOut * 2 : 0
     color: "transparent"
     exclusionMode: ExclusionMode.Ignore
 
     WlrLayershell.namespace: "io.github.glasschan.appimage"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+    // Exclusive while the overlay is open so Escape/`r`/`i`/`u` always work;
+    // pinned keeps OnDemand so the browser keeps typing until clicked.
+    WlrLayershell.keyboardFocus: root.opened
+      ? (root.pinned ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.Exclusive)
+      : WlrKeyboardFocus.None
 
     // Theme-derived scrim over the desktop behind the card.
     Rectangle {
       anchors.fill: parent
+      visible: !root.pinned
       color: Util.alpha(Color.background, 0.45)
     }
 
     MouseArea {
       anchors.fill: parent
+      visible: !root.pinned
       acceptedButtons: Qt.AllButtons
       onClicked: root.requestClose()
     }
@@ -821,10 +849,16 @@ Panel {
     BorderSurface {
       id: card
       anchors.centerIn: parent
-      width: Math.min(Style.space(440), window.width - Style.gapsOut * 2)
+      // Pinned the window sizes to the card, so the cap must fall back to
+      // the screen; unpinned the window fills the screen and sizes as before.
+      width: Math.min(Style.space(440), root.pinned
+        ? (window.screen ? window.screen.width : 1920) - Style.gapsOut * 2
+        : window.width - Style.gapsOut * 2)
       height: Math.min(
         contentCol.implicitHeight + card.contentTopInset + card.contentBottomInset,
-        window.height - Style.gapsOut * 2)
+        root.pinned
+          ? (window.screen ? window.screen.height : 1080) - Style.gapsOut * 2
+          : window.height - Style.gapsOut * 2)
       color: Color.popups.background
       borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
       radius: Style.cornerRadius
@@ -846,8 +880,9 @@ Panel {
         // as the weather panel's inline editor): the picker's path field,
         // the source editor's dynamic fields (tracked by focus count —
         // moving between them fires leave/gain out of order), the
-        // NumberFields' inner SpinBox editors, and the manager dropdown's
-        // popup (its list is not in the card's item tree).
+        // NumberFields' inner SpinBox editors, and the per-row manager
+        // dropdown's popup — root.sourceDropdownOpen mirrors its popupOpen
+        // because the popup list is not in this panel's item tree.
         blocked: root.formEditing
         onCloseRequested: root.requestClose()
         onTextKey: function(t) {
@@ -908,6 +943,7 @@ Panel {
                 accent: Color.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
+                implicitHeight: root.controlHeight
                 implicitWidth: integrateRow.implicitWidth
                   + integrateButton.horizontalPadding * 2
                   + integrateButton._reservedBorderLeft
@@ -950,6 +986,7 @@ Panel {
                 accent: Color.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
+                implicitHeight: root.controlHeight
                 implicitWidth: refreshRow.implicitWidth
                   + refreshButton.horizontalPadding * 2
                   + refreshButton._reservedBorderLeft
@@ -992,6 +1029,7 @@ Panel {
                 accent: Color.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
+                implicitHeight: root.controlHeight
                 tooltipText: root.strings.checkUpdates
                 implicitWidth: checkUpdatesRow.implicitWidth
                   + checkUpdatesButton.horizontalPadding * 2
@@ -1015,6 +1053,40 @@ Panel {
                 onClicked: root.checkUpdates()
               }
 
+              // Pin toggle: flips the overlay into a compact floating
+              // window (session-only) so other apps stay clickable.
+              Button {
+                id: pinButton
+                text: ""
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.foreground
+                accent: Color.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                implicitHeight: root.controlHeight
+                tooltipText: root.pinned ? root.strings.pinTooltipUnpin : root.strings.pinTooltip
+                implicitWidth: pinRow.implicitWidth
+                  + pinButton.horizontalPadding * 2
+                  + pinButton._reservedBorderLeft
+                  + pinButton._reservedBorderRight
+
+                Row {
+                  id: pinRow
+                  anchors.centerIn: parent
+                  spacing: Style.spacing.xs
+
+                  ThemeIcon {
+                    name: "pin"
+                    size: Style.font.icon
+                    strokeWidth: 1.75
+                    color: pinButton.foreground
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                onClicked: root.pinned = !root.pinned
+              }
+
               // Settings gear: toggles the settings card below.
               Button {
                 id: settingsButton
@@ -1024,6 +1096,7 @@ Panel {
                 accent: Color.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
+                implicitHeight: root.controlHeight
                 tooltipText: root.strings.settingsTitle
                 implicitWidth: settingsRow.implicitWidth
                   + settingsButton.horizontalPadding * 2
@@ -1088,6 +1161,7 @@ Panel {
                 accent: Color.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.caption
+                implicitHeight: root.controlHeight
                 onClicked: {
                   Model.clearError()
                   Model.clearStatus()
@@ -1147,6 +1221,7 @@ Panel {
                   accent: Color.accent
                   fontFamily: root.fontFamily
                   fontSize: Style.font.bodySmall
+                  implicitHeight: root.controlHeight
                   onClicked: root.integratePath(root.pickerPath)
                 }
               }
@@ -1204,7 +1279,7 @@ Panel {
             }
           }
 
-          // ---- Settings card (F8 cadence + F9 sources) --------------------
+          // ---- Settings card (F8 cadence only — per-app sources are on each row) -----
           BorderSurface {
             id: settingsCard
             width: parent.width
@@ -1310,176 +1385,8 @@ Panel {
                 accent: Color.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.caption
+                implicitHeight: root.controlHeight
                 onClicked: root.saveSettings()
-              }
-
-              // ---- per-app update source (F9) --------------------------------
-              PanelSectionHeader {
-                text: root.strings.sourceSection
-                foreground: root.foreground
-                width: parent.width
-              }
-
-              Flickable {
-                width: parent.width
-                height: Math.min(sourceRowsCol.implicitHeight, Style.space(132))
-                contentWidth: width
-                contentHeight: sourceRowsCol.implicitHeight
-                clip: true
-                boundsBehavior: Flickable.StopAtBounds
-                interactive: contentHeight > height
-
-                Column {
-                  id: sourceRowsCol
-                  width: parent.width
-                  spacing: Style.spacing.xxs
-
-                  Repeater {
-                    model: root.items
-
-                    Row {
-                      id: sourceRow
-                      required property var modelData
-                      width: sourceRowsCol.width
-                      spacing: Style.spacing.xs
-
-                      Column {
-                        spacing: Style.spacing.xxs
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: parent.width - sourceEditButton.width - Style.spacing.xs
-
-                        Text {
-                          text: sourceRow.modelData.name
-                          color: root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.bodySmall
-                          font.bold: true
-                          elide: Text.ElideRight
-                          width: parent.width
-                        }
-
-                        Text {
-                          text: sourceRow.modelData.embeddedSource
-                            ? Model.formatCount(sourceRow.modelData.manager, root.strings.sourceEmbedded)
-                            : (sourceRow.modelData.manager !== ""
-                              ? sourceRow.modelData.manager
-                              : root.strings.sourceNone)
-                          color: root.dim
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
-                          elide: Text.ElideRight
-                          width: parent.width
-                        }
-                      }
-
-                      PanelActionButton {
-                        id: sourceEditButton
-                        tooltipText: root.strings.sourceEditTooltip
-                        foreground: root.foreground
-                        hoverColor: Color.accent
-                        anchors.verticalCenter: parent.verticalCenter
-
-                        ThemeIcon {
-                          anchors.centerIn: parent
-                          name: "settings"
-                          size: sourceEditButton.fontSize
-                          strokeWidth: 1.75
-                          color: sourceEditButton.enabled
-                            ? (sourceEditButton._hot ? sourceEditButton.hoverColor : sourceEditButton.foreground)
-                            : Qt.darker(sourceEditButton.foreground, 2.0)
-                        }
-
-                        onClicked: root.openSourceEditor(sourceRow.modelData)
-                      }
-                    }
-                  }
-                }
-              }
-
-              // Inline editor for the row whose gear was clicked: the app
-              // name is fixed context, the manager dropdown swaps the field
-              // set in from Model.MANAGERS.
-              BorderSurface {
-                width: parent.width
-                visible: root.sourceEditId !== ""
-                implicitHeight: visible ? sourceEditCol.implicitHeight + Style.spacing.xs * 2 : 0
-                color: Util.alpha(Color.accent, 0.06)
-                borderSpec: Border.flat(Util.alpha(Color.accent, 0.25), Math.max(1, Style.normalBorderWidth))
-                radius: Style.cornerRadius
-
-                Column {
-                  id: sourceEditCol
-                  width: parent.width - Style.spacing.xs * 2
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  Text {
-                    text: root.sourceEditName
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: true
-                    elide: Text.ElideRight
-                    width: parent.width
-                  }
-
-                  Dropdown {
-                    id: sourceManagerDropdown
-                    label: root.strings.sourceManagerLabel
-                    width: parent.width
-                    value: root.sourceEditManager
-                    options: root.managerOptions
-                    foreground: root.foreground
-                    accent: Color.accent
-                    fontFamily: root.fontFamily
-                    enabled: !root.sourceBusy
-                    onChanged: function(value) {
-                      root.sourceEditManager = value
-                      root.rebuildSourceEditValues()
-                    }
-                  }
-
-                  Repeater {
-                    model: {
-                      var mgr = Model.managersByName()[root.sourceEditManager]
-                      return mgr ? mgr.fields : []
-                    }
-
-                    Loader {
-                      required property var modelData
-                      width: sourceEditCol.width
-                      sourceComponent: modelData.type === "bool"
-                        ? sourceBoolFieldComp : sourceStringFieldComp
-                      onLoaded: item.fieldKey = modelData.key
-                    }
-                  }
-
-                  Row {
-                    spacing: Style.spacing.xs
-
-                    Button {
-                      id: sourceSaveButton
-                      text: root.strings.sourceSave
-                      enabled: !root.sourceBusy && root.sourceEditManager !== ""
-                      foreground: root.foreground
-                      accent: Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      onClicked: root.saveSource()
-                    }
-
-                    Button {
-                      id: sourceUnsetButton
-                      text: root.strings.sourceUnset
-                      enabled: !root.sourceBusy
-                      foreground: root.foreground
-                      accent: Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      onClicked: root.unsetSource()
-                    }
-                  }
-                }
               }
             }
           }
@@ -1500,7 +1407,7 @@ Panel {
               spacing: Style.spacing.sm
 
               ThemeIcon {
-                name: "package"
+                name: "cube-unfolded"
                 size: Style.font.displayLarge * 1.5
                 strokeWidth: 1.5
                 color: root.dim
@@ -1555,216 +1462,354 @@ Panel {
                 Repeater {
                   model: root.items
 
-                  BorderSurface {
-                    id: itemRow
+                  Column {
+                    id: rowOuter
                     required property var modelData
                     width: listCol.width
-                    implicitHeight: rowContent.implicitHeight + Style.spacing.sm * 2
-                    radius: Style.cornerRadius
-                    color: Style.normalFillFor(root.foreground, Color.accent, root.urgent)
-                    borderSpec: Border.none()
+                    spacing: Style.spacing.xs
 
-                    // Clicking anywhere on the card (outside the action
-                    // buttons, which stack above) launches the app (F4).
-                    MouseArea {
-                      anchors.fill: parent
-                      acceptedButtons: Qt.LeftButton
-                      onClicked: root.launchItem(itemRow.modelData)
-                    }
+                      BorderSurface {
+                        id: itemRow
+                        width: listCol.width
+                        implicitHeight: rowContent.implicitHeight + Style.spacing.sm * 2
+                        radius: Style.cornerRadius
+                        color: Style.normalFillFor(root.foreground, Color.accent, root.urgent)
+                        borderSpec: Border.none()
 
-                    Row {
-                      id: rowContent
-                      anchors.left: parent.left
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      anchors.leftMargin: Style.spacing.sm
-                      anchors.rightMargin: Style.spacing.sm
-                      spacing: Style.spacing.sm
+                        // Clicking anywhere on the card (outside the action
+                        // buttons, which stack above) launches the app (F4).
+                        MouseArea {
+                          anchors.fill: parent
+                          acceptedButtons: Qt.LeftButton
+                          onClicked: root.launchItem(rowOuter.modelData)
+                        }
 
-                      // Extracted icon when it exists (try png → svg →
-                      // xpm next to the AppImage under .icons/, CONTRACT.md
-                      // filesystem layout), tabler package icon otherwise.
-                      Image {
-                        id: appIcon
-                        property int iconIndex: 0
-                        readonly property var iconCandidates: {
-                          var list = []
-                          var base = itemRow.modelData.iconBase
-                          if (base) {
-                            var exts = [".png", ".svg", ".xpm"]
-                            for (var i = 0; i < exts.length; i++) {
-                              list.push(Util.fileUrl(base + exts[i]))
+                        Row {
+                          id: rowContent
+                          anchors.left: parent.left
+                          anchors.right: parent.right
+                          anchors.verticalCenter: parent.verticalCenter
+                          anchors.leftMargin: Style.spacing.sm
+                          anchors.rightMargin: Style.spacing.sm
+                          spacing: Style.spacing.sm
+
+                          // Extracted icon when it exists (try png → svg →
+                          // xpm next to the AppImage under .icons/, CONTRACT.md
+                          // filesystem layout), tabler cube-unfolded icon otherwise.
+                          Image {
+                            id: appIcon
+                            property int iconIndex: 0
+                            readonly property var iconCandidates: {
+                              var list = []
+                              var base = rowOuter.modelData.iconBase
+                              if (base) {
+                                var exts = [".png", ".svg", ".xpm"]
+                                for (var i = 0; i < exts.length; i++) {
+                                  list.push(Util.fileUrl(base + exts[i]))
+                                }
+                              }
+                              return list
+                            }
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: iconIndex < iconCandidates.length
+                            source: visible ? iconCandidates[iconIndex] : ""
+                            width: Style.font.body * 1.7
+                            height: width
+                            fillMode: Image.PreserveAspectFit
+                            asynchronous: true
+                            onStatusChanged: function(status) {
+                              if (status === Image.Error) iconIndex++
                             }
                           }
-                          return list
-                        }
-                        anchors.verticalCenter: parent.verticalCenter
-                        visible: iconIndex < iconCandidates.length
-                        source: visible ? iconCandidates[iconIndex] : ""
-                        width: Style.font.body * 1.7
-                        height: width
-                        fillMode: Image.PreserveAspectFit
-                        asynchronous: true
-                        onStatusChanged: function(status) {
-                          if (status === Image.Error) iconIndex++
+
+                          ThemeIcon {
+                            visible: !appIcon.visible || appIcon.status === Image.Error
+                            anchors.verticalCenter: parent.verticalCenter
+                            name: "cube-unfolded"
+                            size: Style.font.body * 1.7
+                            color: root.dim
+                          }
+
+                          Column {
+                            spacing: Style.spacing.xxs
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: parent.width - actionsRow.width - Style.space(34) - Style.spacing.sm * 2
+
+                            Text {
+                              text: rowOuter.modelData.name
+                              color: root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.body
+                              font.bold: true
+                              elide: Text.ElideRight
+                              width: parent.width
+                            }
+
+                            Row {
+                              spacing: Style.spacing.xxs
+
+                              Text {
+                                visible: rowOuter.modelData.version !== ""
+                                text: rowOuter.modelData.version
+                                color: root.dim
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                              }
+
+                              Text {
+                                visible: rowOuter.modelData.running
+                                text: "● " + root.strings.runningLabel
+                                color: Color.accent
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                              }
+
+                              // F6: pending release, accent like the running dot.
+                              Text {
+                                visible: rowOuter.modelData.updateVersion !== ""
+                                text: Model.formatCount(rowOuter.modelData.updateVersion, root.strings.updateAvailable)
+                                color: Color.accent
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                              }
+                            }
+
+                            // F9: configured update source under the row's meta.
+                            Text {
+                              visible: rowOuter.modelData.manager !== ""
+                              text: rowOuter.modelData.embeddedSource
+                                ? Model.formatCount(rowOuter.modelData.manager, root.strings.sourceEmbedded)
+                                : rowOuter.modelData.manager
+                              color: root.dim
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                              elide: Text.ElideRight
+                              width: parent.width
+                            }
+                          }
+
+                          Row {
+                            id: actionsRow
+                            spacing: Style.spacing.xxs
+                            anchors.verticalCenter: parent.verticalCenter
+
+                            // Launch (F4) as an icon-only action with a tooltip:
+                            // the row card itself launches too, so the caption
+                            // was dead weight next to the trash button.
+                            PanelActionButton {
+                              id: launchButton
+                              tooltipText: root.strings.launch
+                              foreground: root.foreground
+                              hoverColor: Color.accent
+                              anchors.verticalCenter: parent.verticalCenter
+
+                              ThemeIcon {
+                                anchors.centerIn: parent
+                                name: "player-play"
+                                size: launchButton.fontSize
+                                strokeWidth: 1.75
+                                color: launchButton.enabled
+                                  ? (launchButton._hot ? launchButton.hoverColor : launchButton.foreground)
+                                  : Qt.darker(launchButton.foreground, 2.0)
+                              }
+
+                              onClicked: root.launchItem(rowOuter.modelData)
+                            }
+
+                            // F7: one-click update, shown once the app has a
+                            // source (manager) or a known pending release —
+                            // an update without a known version can still be
+                            // worth a try. Single flight: every button dims
+                            // while one download runs, and the row being
+                            // updated spins its arrow.
+                            PanelActionButton {
+                              id: updateButton
+                              visible: rowOuter.modelData.manager !== ""
+                                || rowOuter.modelData.updateVersion !== ""
+                              enabled: root.updatingId === ""
+                              tooltipText: root.strings.updateAction
+                              foreground: root.foreground
+                              hoverColor: Color.accent
+                              fontFamily: root.fontFamily
+                              anchors.verticalCenter: parent.verticalCenter
+
+                              ThemeIcon {
+                                id: updateIcon
+                                anchors.centerIn: parent
+                                name: "arrow-up"
+                                size: updateButton.fontSize
+                                strokeWidth: 1.75
+                                color: updateButton.enabled
+                                  ? (updateButton._hot ? updateButton.hoverColor : updateButton.foreground)
+                                  : Qt.darker(updateButton.foreground, 2.0)
+
+                                RotationAnimation on rotation {
+                                  running: root.updatingId === rowOuter.modelData.id
+                                  loops: Animation.Infinite
+                                  from: 0
+                                  to: 360
+                                  duration: 1100
+                                  onRunningChanged: if (!running) updateIcon.rotation = 0
+                                }
+                              }
+
+                              onClicked: root.updateItem(rowOuter.modelData)
+                            }
+
+                            // F9: open this row's inline source editor.
+                            PanelActionButton {
+                              id: sourceRowButton
+                              tooltipText: root.strings.sourceEditTooltip
+                              foreground: root.foreground
+                              hoverColor: Color.accent
+                              anchors.verticalCenter: parent.verticalCenter
+
+                              ThemeIcon {
+                                anchors.centerIn: parent
+                                name: "settings"
+                                size: sourceRowButton.fontSize
+                                strokeWidth: 1.75
+                                color: sourceRowButton.enabled
+                                  ? (sourceRowButton._hot ? sourceRowButton.hoverColor : sourceRowButton.foreground)
+                                  : Qt.darker(sourceRowButton.foreground, 2.0)
+                              }
+
+                              onClicked: root.openSourceEditor(rowOuter.modelData)
+                            }
+
+                            // Two-click inline remove (F3): first click arms
+                            // "Remove?" on this row only, second click runs it.
+                            Button {
+                              visible: root.confirmRemoveId === rowOuter.modelData.id
+                              text: root.strings.removeConfirm
+                              anchors.verticalCenter: parent.verticalCenter
+                              foreground: root.urgent
+                              accent: root.urgent
+                              fontFamily: root.fontFamily
+                              fontSize: Style.font.caption
+                              implicitHeight: root.controlHeight
+                              enabled: !root.busyRemove
+                              onClicked: root.requestRemove(rowOuter.modelData)
+                            }
+
+                            PanelActionButton {
+                              id: removeButton
+                              visible: root.confirmRemoveId !== rowOuter.modelData.id
+                              tooltipText: root.strings.removeTooltip
+                              foreground: root.foreground
+                              hoverColor: root.urgent
+                              fontFamily: root.fontFamily
+                              anchors.verticalCenter: parent.verticalCenter
+
+                              ThemeIcon {
+                                anchors.centerIn: parent
+                                name: "trash"
+                                size: removeButton.fontSize
+                                strokeWidth: 1.75
+                                color: removeButton.enabled
+                                  ? (removeButton._hot ? removeButton.hoverColor : removeButton.foreground)
+                                  : Qt.darker(removeButton.foreground, 2.0)
+                              }
+
+                              onClicked: root.requestRemove(rowOuter.modelData)
+                            }
+                          }
                         }
                       }
 
-                      ThemeIcon {
-                        visible: !appIcon.visible || appIcon.status === Image.Error
-                        anchors.verticalCenter: parent.verticalCenter
-                        name: "package"
-                        size: Style.font.body * 1.7
-                        color: root.dim
-                      }
+                    // Inline F9 editor under the row whose gear was
+                    // clicked: the app name fixes context, the manager
+                    // dropdown swaps the field set from Model.MANAGERS.
+                    BorderSurface {
+                      width: listCol.width
+                      visible: root.sourceEditId === rowOuter.modelData.id
+                      implicitHeight: visible ? sourceEditCol.implicitHeight + Style.spacing.xs * 2 : 0
+                      color: Util.alpha(Color.accent, 0.06)
+                      borderSpec: Border.flat(Util.alpha(Color.accent, 0.25), Math.max(1, Style.normalBorderWidth))
+                      radius: Style.cornerRadius
 
                       Column {
-                        spacing: Style.spacing.xxs
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: parent.width - actionsRow.width - Style.space(34) - Style.spacing.sm * 2
+                        id: sourceEditCol
+                        width: parent.width - Style.spacing.xs * 2
+                        anchors.centerIn: parent
+                        spacing: Style.spacing.xs
 
                         Text {
-                          text: itemRow.modelData.name
+                          text: root.sourceEditName
                           color: root.foreground
                           font.family: root.fontFamily
-                          font.pixelSize: Style.font.body
+                          font.pixelSize: Style.font.bodySmall
                           font.bold: true
                           elide: Text.ElideRight
                           width: parent.width
                         }
 
+                        Dropdown {
+                          id: sourceManagerDropdown
+                          label: root.strings.sourceManagerLabel
+                          width: parent.width
+                          options: root.managerOptions
+                          foreground: root.foreground
+                          accent: Color.accent
+                          fontFamily: root.fontFamily
+                          enabled: !root.sourceBusy
+                          onPopupOpenChanged: root.sourceDropdownOpen = sourceManagerDropdown.popupOpen
+                          onChanged: function(value) {
+                            root.sourceEditManager = value
+                            root.rebuildSourceEditValues()
+                          }
+
+                          // selectCurrent() writes `value` directly, which
+                          // would sever a plain value: binding on the
+                          // persisted delegate; a one-way Binding survives.
+                          Binding {
+                            target: sourceManagerDropdown
+                            property: "value"
+                            value: root.sourceEditManager
+                          }
+                        }
+
+                        Repeater {
+                          model: {
+                            var mgr = Model.managersByName()[root.sourceEditManager]
+                            return mgr ? mgr.fields : []
+                          }
+
+                          Loader {
+                            required property var modelData
+                            width: sourceEditCol.width
+                            sourceComponent: modelData.type === "bool"
+                              ? sourceBoolFieldComp : sourceStringFieldComp
+                            onLoaded: item.fieldKey = modelData.key
+                          }
+                        }
+
                         Row {
-                          spacing: Style.spacing.xxs
+                          spacing: Style.spacing.xs
 
-                          Text {
-                            visible: itemRow.modelData.version !== ""
-                            text: itemRow.modelData.version
-                            color: root.dim
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.caption
+                          Button {
+                            id: sourceSaveButton
+                            text: root.strings.sourceSave
+                            enabled: !root.sourceBusy && root.sourceEditManager !== ""
+                            foreground: root.foreground
+                            accent: Color.accent
+                            fontFamily: root.fontFamily
+                            fontSize: Style.font.caption
+                            implicitHeight: root.controlHeight
+                            onClicked: root.saveSource()
                           }
 
-                          Text {
-                            visible: itemRow.modelData.running
-                            text: "● " + root.strings.runningLabel
-                            color: Color.accent
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.caption
+                          Button {
+                            id: sourceUnsetButton
+                            text: root.strings.sourceUnset
+                            enabled: !root.sourceBusy
+                            foreground: root.foreground
+                            accent: Color.accent
+                            fontFamily: root.fontFamily
+                            fontSize: Style.font.caption
+                            implicitHeight: root.controlHeight
+                            onClicked: root.unsetSource()
                           }
-
-                          // F6: pending release, accent like the running dot.
-                          Text {
-                            visible: itemRow.modelData.updateVersion !== ""
-                            text: Model.formatCount(itemRow.modelData.updateVersion, root.strings.updateAvailable)
-                            color: Color.accent
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.caption
-                          }
-                        }
-                      }
-
-                      Row {
-                        id: actionsRow
-                        spacing: Style.spacing.xxs
-                        anchors.verticalCenter: parent.verticalCenter
-
-                        // Launch (F4) as an icon-only action with a tooltip:
-                        // the row card itself launches too, so the caption
-                        // was dead weight next to the trash button.
-                        PanelActionButton {
-                          id: launchButton
-                          tooltipText: root.strings.launch
-                          foreground: root.foreground
-                          hoverColor: Color.accent
-                          anchors.verticalCenter: parent.verticalCenter
-
-                          ThemeIcon {
-                            anchors.centerIn: parent
-                            name: "player-play"
-                            size: launchButton.fontSize
-                            strokeWidth: 1.75
-                            color: launchButton.enabled
-                              ? (launchButton._hot ? launchButton.hoverColor : launchButton.foreground)
-                              : Qt.darker(launchButton.foreground, 2.0)
-                          }
-
-                          onClicked: root.launchItem(itemRow.modelData)
-                        }
-
-                        // F7: one-click update, shown once the app has a
-                        // source (manager) or a known pending release —
-                        // an update without a known version can still be
-                        // worth a try. Single flight: every button dims
-                        // while one download runs, and the row being
-                        // updated spins its arrow.
-                        PanelActionButton {
-                          id: updateButton
-                          visible: itemRow.modelData.manager !== ""
-                            || itemRow.modelData.updateVersion !== ""
-                          enabled: root.updatingId === ""
-                          tooltipText: root.strings.updateAction
-                          foreground: root.foreground
-                          hoverColor: Color.accent
-                          fontFamily: root.fontFamily
-                          anchors.verticalCenter: parent.verticalCenter
-
-                          ThemeIcon {
-                            id: updateIcon
-                            anchors.centerIn: parent
-                            name: "arrow-up"
-                            size: updateButton.fontSize
-                            strokeWidth: 1.75
-                            color: updateButton.enabled
-                              ? (updateButton._hot ? updateButton.hoverColor : updateButton.foreground)
-                              : Qt.darker(updateButton.foreground, 2.0)
-
-                            RotationAnimation on rotation {
-                              running: root.updatingId === itemRow.modelData.id
-                              loops: Animation.Infinite
-                              from: 0
-                              to: 360
-                              duration: 1100
-                              onRunningChanged: if (!running) updateIcon.rotation = 0
-                            }
-                          }
-
-                          onClicked: root.updateItem(itemRow.modelData)
-                        }
-
-                        // Two-click inline remove (F3): first click arms
-                        // "Remove?" on this row only, second click runs it.
-                        Button {
-                          visible: root.confirmRemoveId === itemRow.modelData.id
-                          text: root.strings.removeConfirm
-                          anchors.verticalCenter: parent.verticalCenter
-                          foreground: root.urgent
-                          accent: root.urgent
-                          fontFamily: root.fontFamily
-                          fontSize: Style.font.caption
-                          enabled: !root.busyRemove
-                          onClicked: root.requestRemove(itemRow.modelData)
-                        }
-
-                        PanelActionButton {
-                          id: removeButton
-                          visible: root.confirmRemoveId !== itemRow.modelData.id
-                          tooltipText: root.strings.removeTooltip
-                          foreground: root.foreground
-                          hoverColor: root.urgent
-                          fontFamily: root.fontFamily
-                          anchors.verticalCenter: parent.verticalCenter
-
-                          ThemeIcon {
-                            anchors.centerIn: parent
-                            name: "trash"
-                            size: removeButton.fontSize
-                            strokeWidth: 1.75
-                            color: removeButton.enabled
-                              ? (removeButton._hot ? removeButton.hoverColor : removeButton.foreground)
-                              : Qt.darker(removeButton.foreground, 2.0)
-                          }
-
-                          onClicked: root.requestRemove(itemRow.modelData)
                         }
                       }
                     }
@@ -1798,7 +1843,7 @@ Panel {
       enabled: !root.sourceBusy
       text: root.sourceEditValues[fieldKey] || ""
       onTextChanged: root.setSourceValue(fieldKey, text)
-      onActiveFocusChanged: root.sourceFieldFocusCount += activeFocus ? 1 : -1
+      onActiveFocusChanged: root.sourceFieldFocusCount = activeFocus ? root.sourceFieldFocusCount + 1 : Math.max(0, root.sourceFieldFocusCount - 1)
     }
   }
 
