@@ -21,12 +21,31 @@ def read_header(path: str, length: int = 64) -> bytes:
 
 def get_appimage_type(path: str) -> str:
     """Return '1', '2' or '0' (not an AppImage), like GearLever's
-    AppImageProvider.get_appimage_type()."""
+    AppImageProvider.get_appimage_type().
+
+    The AI\\x01 / AI\\x02 magic bytes are optional in the AppImageSpec and
+    many modern builds omit them; when they don't match, a magicless
+    type-2 image is still detected by verifying that an ELF file has a
+    squashfs image (hsqs / sqsh) at the section-header-table offset.
+    Type 1 (ISO-based, rare) stays magic-only."""
     magic = read_header(path, 11)[8:11]
     if magic == APPIMAGE_TYPE1_MAGIC:
         return '1'
     if magic == APPIMAGE_TYPE2_MAGIC:
         return '2'
+
+    # Magicless type-2 fallback: the runtime payload sits right after the
+    # ELF section header table. Ordinary ELF binaries have something else
+    # there and fail the squashfs check.
+    try:
+        if read_header(path, 4) == b'\x7fELF':
+            offset = get_squashfs_offset(path)
+            with open(path, 'rb') as f:
+                f.seek(offset)
+                if f.read(4) in (b'hsqs', b'sqsh'):
+                    return '2'
+    except (OSError, ValueError, struct.error):
+        pass
     return '0'
 
 

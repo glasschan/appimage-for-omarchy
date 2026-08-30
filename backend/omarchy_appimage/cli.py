@@ -50,6 +50,8 @@ Commands:
   --set-update-source ...  Set a custom update source:
                            <target> --manager <name> [key=value ...]
                            (--unset removes it again)
+  --get-update-source ...  Show the configured update source of <target>
+                           (--json carries the manager and its config)
   --list-update-managers   List the available update managers and the
                            config keys each one accepts
   --fetch-updates          One-shot background update check; sends a
@@ -604,6 +606,50 @@ def cmd_set_update_source(args: list) -> int:
     return EXIT_OK
 
 
+def cmd_get_update_source(args: list) -> int:
+    json_output = '--json' in args
+
+    positional = _remove_flag_value(args, ['--json'])
+    positional = [a for a in positional if not a.startswith('--')]
+    if not positional:
+        raise UsageError('missing argument: --get-update-source <target>')
+    if len(positional) > 1:
+        raise UsageError(f'unexpected argument: {positional[1]!r}')
+
+    el = _resolve_target(positional[0])
+
+    # The raw section contents: `manager` names the UpdateManager class,
+    # everything else is the stored key=value config (bools already
+    # normalized to "true"/"false" strings by set_app_update_config).
+    cfg = Config.get_app_update_config(el)
+    if not cfg:
+        if json_output:
+            _print_json({
+                'schema_version': constants.JSON_SCHEMA_VERSION,
+                'result': 'no-source',
+                'app': _make_app_json(el),
+            })
+        else:
+            print(f'No update source configured for {el.file_path}')
+        return EXIT_OK
+
+    manager = cfg.get('manager', '')
+    config = {key: value for key, value in cfg.items() if key != 'manager'}
+    if json_output:
+        _print_json({
+            'schema_version': constants.JSON_SCHEMA_VERSION,
+            'result': 'ok',
+            'manager': manager,
+            'config': config,
+            'app': _make_app_json(el),
+        })
+    else:
+        pairs = ', '.join(f'{key}={value}' for key, value in sorted(config.items()))
+        print(f'Update source for {el.file_path}: {manager}'
+              + (f' ({pairs})' if pairs else ''))
+    return EXIT_OK
+
+
 def cmd_list_update_managers(args: list) -> int:
     json_output = '--json' in args
     managers = UpdateManagerChecker.manager_metadata()
@@ -656,7 +702,7 @@ def cmd_fetch_updates(args: list) -> int:
         try:
             result = run_command(
                 ['notify-send', '-a', constants.APP_NAME,
-                 '--expire-time=600000', 'AppImage updates available', body],
+                 '--expire-time=5000', 'AppImage updates available', body],
                 check=False)
             notified = result.returncode == 0
         except Exception as e:
@@ -783,6 +829,7 @@ COMMANDS = {
     'list-updates': cmd_list_updates,
     'update': cmd_update,
     'set-update-source': cmd_set_update_source,
+    'get-update-source': cmd_get_update_source,
     'list-update-managers': cmd_list_update_managers,
     'fetch-updates': cmd_fetch_updates,
     'settings': cmd_settings,

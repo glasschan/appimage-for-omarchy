@@ -357,6 +357,44 @@ class SetUpdateSourceCliTests(FakeXDGTestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(json.loads(result.stdout)['result'], 'error')
 
+    def test_get_update_source_roundtrip(self):
+        result = self.run_cli('--set-update-source', 'fakeapp',
+                              '--manager', 'GithubUpdater',
+                              'repo=owner/repo',
+                              'repo_filename=Foo-*.appimage',
+                              'allow_prereleases=yes', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        result = self.run_cli('--get-update-source', 'fakeapp', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['schema_version'], 1)
+        self.assertEqual(payload['result'], 'ok')
+        self.assertEqual(payload['manager'], 'GithubUpdater')
+        # the exact key=value pairs round-trip; bools come back as the
+        # on-disk "true"/"false" strings set_app_update_config stores
+        self.assertEqual(payload['config'], {
+            'repo': 'owner/repo',
+            'repo_filename': 'Foo-*.appimage',
+            'allow_prereleases': 'true'})
+        self.assertEqual(payload['app']['name'], 'Fake App')
+
+    def test_get_update_source_no_source_exit_0(self):
+        result = self.run_cli('--get-update-source', 'fakeapp', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['schema_version'], 1)
+        self.assertEqual(payload['result'], 'no-source')
+        self.assertNotIn('manager', payload)
+        self.assertNotIn('config', payload)
+
+    def test_get_update_source_unknown_target_exit_1(self):
+        result = self.run_cli('--get-update-source', 'ghost', '--json')
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['result'], 'error')
+        self.assertIn('ghost', payload['error'])
+
 
 class InProcessUpdateCliTests(InProcessCliMixin, FakeXDGTestCase):
     """--list-updates / --fetch-updates / --update flows that need patched
@@ -452,7 +490,7 @@ class InProcessUpdateCliTests(InProcessCliMixin, FakeXDGTestCase):
         self.assertEqual(sent.call_count, 1)
         argv = sent.call_args.args[0]
         self.assertEqual(argv[0], 'notify-send')
-        self.assertIn('--expire-time=600000', argv)
+        self.assertIn('--expire-time=5000', argv)
         self.assertEqual(argv[-2], 'AppImage updates available')
 
         # the state now remembers the signature...

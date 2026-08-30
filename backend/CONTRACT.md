@@ -152,6 +152,29 @@ Real example output (set):
 {"schema_version": 1, "result": "set", "app": {"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "StaticFileUpdater", "embedded_source": false, "running": false}, "manager": "StaticFileUpdater", "config": {"url": "https://example.com/nvim.appimage"}}
 ```
 
+### `--get-update-source <target> [--json]`
+
+Reads back the per-app custom update source stored by `--set-update-source`
+(`--list-installed` deliberately carries only the resolved manager name,
+never the raw config — the panel's source editor pre-fills from this verb).
+`<target>` resolves like `--remove` (unknown id → exit 1 error document).
+Both result shapes exit 0:
+
+Real example output (a source is configured, exit 0):
+
+```json
+{"schema_version": 1, "result": "ok", "manager": "StaticFileUpdater", "config": {"url": "https://example.com/nvim.appimage"}, "app": <app>}
+```
+
+No source configured (exit 0, the editor keeps its blank fields):
+
+```json
+{"schema_version": 1, "result": "no-source", "app": <app>}
+```
+
+Boolean config values come back normalized as `"true"`/`"false"` strings
+(the on-disk layout `--set-update-source` stores).
+
 ### `--list-update-managers [--json]`
 
 The available update managers and the config keys each accepts.
@@ -181,7 +204,7 @@ Behaviour:
    sent, best-effort:
 
    ```sh
-   notify-send -a 'AppImage for Omarchy' --expire-time=600000 \
+   notify-send -a 'AppImage for Omarchy' --expire-time=5000 \
        'AppImage updates available' '<N> update(s) available — click the AppImage icon in the bar.'
    ```
 

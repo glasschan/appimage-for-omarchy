@@ -3,6 +3,7 @@
 # Derived from GearLever (c) mijorus, GPL-3.0. Test suite written for
 # this plugin; integration behaviour verified against GearLever upstream.
 
+import json
 import os
 import unittest
 
@@ -31,6 +32,57 @@ class ElfSyntheticTests(unittest.TestCase):
         header[8:11] = b'\x00\x00\x00'
         path = self.addCleanup_tmp(bytes(header))
         self.assertEqual(elf.get_appimage_type(path), '0')
+
+    def test_type2_magicless_detection(self):
+        # The AppImageSpec makes the AI\x02 magic optional; a magicless
+        # build is detected through the squashfs payload sitting at the
+        # section-header-table offset (e_shoff + e_shentsize*e_shnum).
+        header = bytearray(make_minimal_elf(e_shoff=0x40, e_shentsize=64,
+                                            e_shnum=1))
+        header[8:11] = b'\x00\x00\x00'
+        data = bytes(header) + bytes(64) + b'hsqs'  # one shdr slot, then squashfs
+        path = self.addCleanup_tmp(data)
+        self.assertEqual(elf.get_squashfs_offset(path), 0x40 + 64)
+        self.assertEqual(elf.get_appimage_type(path), '2')
+
+    def test_type2_magicless_big_endian_squashfs(self):
+        header = bytearray(make_minimal_elf(e_shoff=0x40, e_shentsize=64,
+                                            e_shnum=1))
+        header[8:11] = b'\x00\x00\x00'
+        data = bytes(header) + bytes(64) + b'sqsh'
+        path = self.addCleanup_tmp(data)
+        self.assertEqual(elf.get_appimage_type(path), '2')
+
+    def test_magicless_passes_can_install_file(self):
+        # the gate behind cli --integrate (provider.can_install_file)
+        from omarchy_appimage.provider import AppImageProvider
+        header = bytearray(make_minimal_elf(e_shoff=0x40, e_shentsize=64,
+                                            e_shnum=1))
+        header[8:11] = b'\x00\x00\x00'
+        path = self.addCleanup_tmp(bytes(header) + bytes(64) + b'hsqs')
+        self.assertTrue(AppImageProvider().can_install_file(path))
+
+    def test_plain_elf_without_squashfs_is_0(self):
+        # a random ELF with no magic: something other than a squashfs
+        # image lives at the offset, so it is still not an AppImage
+        header = bytearray(make_minimal_elf(e_shoff=0x40, e_shentsize=64,
+                                            e_shnum=1))
+        header[8:11] = b'\x00\x00\x00'
+        data = bytes(header) + bytes(64) + b'\xde\xad\xbe\xef'
+        path = self.addCleanup_tmp(data)
+        self.assertEqual(elf.get_appimage_type(path), '0')
+
+    def test_truncated_elf_is_0(self):
+        # ELF magic but cut off inside the header: the probe must
+        # degrade to '0', never raise
+        path = self.addCleanup_tmp(b'\x7fELF\x02\x01\x01')
+        self.assertEqual(elf.get_appimage_type(path), '0')
+
+    def test_garbage_is_0(self):
+        for blob in (b'', b'hsqs', b'MZ garbage'):
+            with self.subTest(blob=blob):
+                path = self.addCleanup_tmp(blob)
+                self.assertEqual(elf.get_appimage_type(path), '0')
 
     def test_offset_64le(self):
         header = make_minimal_elf(is64=True, e_shoff=0x1234,
@@ -170,6 +222,29 @@ class ElfFixtureTests(FakeXDGTestCase):
         if fixture is None:
             self.skipTest('fixture download unavailable')
         self.assertEqual(elf.read_upd_info(fixture), NVIM_UPD_INFO)
+
+    def test_integrate_magicless_fixture(self):
+        # a real type-2 AppImage with the optional AI\x02 magic zeroed
+        # out: must still be detected and integrate end-to-end
+        fixture = download_fixture()
+        if fixture is None:
+            self.skipTest('fixture download unavailable')
+        magicless = os.path.join(self.sandbox, 'magicless.appimage')
+        with open(fixture, 'rb') as f:
+            data = bytearray(f.read())
+        data[8:11] = b'\x00\x00\x00'
+        with open(magicless, 'wb') as f:
+            f.write(data)
+        os.chmod(magicless, 0o755)
+
+        self.assertEqual(elf.get_appimage_type(magicless), '2')
+
+        result = self.run_cli('--integrate', magicless, '--yes', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['result'], 'integrated')
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.managed_dir, 'neovim.appimage')))
 
 
 if __name__ == '__main__':
