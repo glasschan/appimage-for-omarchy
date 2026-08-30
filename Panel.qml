@@ -66,6 +66,9 @@ Panel {
   readonly property int confirmResetMs: 4000
   // Grace before the post-launch refresh so `ps` can see the new process.
   readonly property int launchSettleMs: 1500
+  // Status notices fade on their own after this long (matching the
+  // backend's desktop-notification expire time); errors never auto-hide.
+  readonly property int statusTimeoutMs: 5000
 
   // Current Backend.run context (null while idle); the Process and Timer
   // signal handlers feed it back into lib/Backend.js.
@@ -567,10 +570,18 @@ Panel {
   }
 
   // F9 editor: seed the manager dropdown (empty = no source configured —
-  // the user must pick before Save) and blank field values, since
-  // --list-installed carries the manager name only, never its config.
+  // the user must pick before Save) and blank field values, then pre-fill
+  // the stored source asynchronously via --get-update-source (--list-installed
+  // carries the manager name only, never its config). Clicking the same
+  // row's gear again toggles the editor closed — the unsaved working values
+  // die with it (closeSourceEditor drops them); a different row's gear
+  // keeps the switch-over behaviour below.
   function openSourceEditor(item) {
     if (!item) return
+    if (root.sourceEditId === item.id) {
+      closeSourceEditor()
+      return
+    }
     // Name/manager first: the per-row editor's Dropdown `value` binding
     // derives from root.sourceEditManager, and its visible binding from
     // sourceEditId — so managers and values must be live before the row's
@@ -584,6 +595,33 @@ Panel {
       if (root.sourceEditId !== "" && listFlick) {
         listFlick.contentY = Math.max(0, listFlick.contentHeight - listFlick.height)
       }
+    })
+    // Async pre-fill: the editor rendered blank instantly; fill it from the
+    // stored config once the backend answers. Bail out when the user closed
+    // the editor or switched rows while the call was in flight (a stale
+    // answer must never touch the current editor's state) or when the call
+    // failed; "no-source" and unparseable answers keep the blanks.
+    callBackend(["--get-update-source", item.id, "--json"], null,
+        function(result) {
+      if (root.sourceEditId !== item.id || !result.ok) return
+      var doc = Backend.parseJson(result.stdout)
+      if (!doc || doc.result !== "ok") return
+      // Same ordering as the instant path above: manager live before the
+      // values rebuild so the dropdown never binds a half-set state.
+      if (doc.manager) root.sourceEditManager = doc.manager
+      root.rebuildSourceEditValues()
+      var config = doc.config || {}
+      for (var key in config) {
+        // Plain key writes only — the map object is never swapped under a
+        // live field binding (see setSourceValue).
+        root.sourceEditValues[key] = String(config[key])
+      }
+      // Key writes carry no change signal by design, so the fields would
+      // keep showing the blanks the rebuild just published; republish the
+      // filled map as one replacement to make every binding re-read.
+      var filled = {}
+      for (var k in root.sourceEditValues) filled[k] = root.sourceEditValues[k]
+      root.sourceEditValues = filled
     })
   }
 
@@ -614,8 +652,9 @@ Panel {
 
   function setSourceValue(key, value) {
     // Storage only: mutate without reassigning so a field's text binding
-    // never re-evaluates mid-typing. rebuildSourceEditValues is the only
-    // writer that replaces the object.
+    // never re-evaluates mid-typing. rebuildSourceEditValues and the async
+    // pre-fill in openSourceEditor are the only writers that replace the
+    // object (both outside a typing session).
     sourceEditValues[key] = value
   }
 
@@ -794,6 +833,34 @@ Panel {
     onTriggered: root.refresh()
   }
 
+  // Periodic re-list while the panel is open and idle: a row's "● running"
+  // flag otherwise goes stale forever if the app is closed outside this panel
+  // (explicit Refresh / reopen / post-launch settle are the only other
+  // refresh paths). The running binding auto-pauses while any backend
+  // operation is in flight and resumes after; refresh()'s own busy guard
+  // makes a racing trigger a no-op anyway.
+  Timer {
+    id: runningPollTimer
+    interval: 10000
+    repeat: true
+    running: root.opened && !root.busyList && !root.busyIntegrate && !root.busyRemove
+      && !root.busyUpdates && root.updatingId === "" && !root.settingsBusy && !root.sourceBusy
+    onTriggered: root.refresh()
+  }
+
+  // Status notices only: clears the accent banner after statusTimeoutMs.
+  // Errors bypass this timer entirely (see onStatusTextChanged below) and
+  // stay until the Dismiss button.
+  Timer {
+    id: statusTimer
+    interval: root.statusTimeoutMs
+    repeat: false
+    onTriggered: {
+      Model.clearStatus()
+      root.syncFromModel()
+    }
+  }
+
   IpcHandler {
     target: root.moduleName
 
@@ -932,9 +999,10 @@ Panel {
 
               // The shell Button has no image slot (its iconText is a
               // Nerd Font glyph), so the row below supplies the tabler
-              // icon + caption while Button keeps owning every state
-              // visual (hover, focus, fills); the width override mirrors
-              // Button's own label-based sizing math over that row.
+              // icon while Button keeps owning every state visual (hover,
+              // focus, fills); the width override mirrors Button's own
+              // label-based sizing math over that row. The caption lives
+              // in the tooltip, like the icon-only buttons to the right.
               Button {
                 id: integrateButton
                 text: ""
@@ -944,6 +1012,7 @@ Panel {
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
                 implicitHeight: root.controlHeight
+                tooltipText: root.pickerOpen ? root.strings.pickerCancel : root.strings.integrate
                 implicitWidth: integrateRow.implicitWidth
                   + integrateButton.horizontalPadding * 2
                   + integrateButton._reservedBorderLeft
@@ -959,14 +1028,6 @@ Panel {
                     size: Style.font.icon
                     strokeWidth: 1.75
                     color: integrateButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-
-                  Text {
-                    text: root.pickerOpen ? root.strings.pickerCancel : root.strings.integrate
-                    color: integrateButton.foreground
-                    font.family: integrateButton.fontFamily
-                    font.pixelSize: integrateButton.fontSize
                     anchors.verticalCenter: parent.verticalCenter
                   }
                 }
@@ -987,6 +1048,7 @@ Panel {
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
                 implicitHeight: root.controlHeight
+                tooltipText: root.strings.refresh
                 implicitWidth: refreshRow.implicitWidth
                   + refreshButton.horizontalPadding * 2
                   + refreshButton._reservedBorderLeft
@@ -1002,14 +1064,6 @@ Panel {
                     size: Style.font.icon
                     strokeWidth: 1.75
                     color: refreshButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-
-                  Text {
-                    text: root.strings.refresh
-                    color: refreshButton.foreground
-                    font.family: refreshButton.fontFamily
-                    font.pixelSize: refreshButton.fontSize
                     anchors.verticalCenter: parent.verticalCenter
                   }
                 }
@@ -1205,7 +1259,7 @@ Panel {
                   accent: Color.accent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
-                  verticalPadding: Style.spacing.xxs
+                  implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
                   enabled: !root.busyIntegrate
                   width: parent.width - pickerGoButton.width - Style.spacing.xs
                   onTextChanged: root.pickerPath = text
@@ -1284,14 +1338,14 @@ Panel {
             id: settingsCard
             width: parent.width
             visible: root.settingsOpen
-            implicitHeight: visible ? settingsCol.implicitHeight + Style.spacing.sm * 2 : 0
+            implicitHeight: visible ? settingsCol.implicitHeight + Style.spacing.xl * 2 : 0
             color: Util.alpha(Color.accent, 0.06)
             borderSpec: Border.flat(Util.alpha(Color.accent, 0.35), Math.max(1, Style.normalBorderWidth))
             radius: Style.cornerRadius
 
             Column {
               id: settingsCol
-              width: parent.width - Style.spacing.sm * 2
+              width: parent.width - Style.spacing.xl * 2
               anchors.centerIn: parent
               spacing: Style.spacing.xs
 
@@ -1616,16 +1670,14 @@ Panel {
                               onClicked: root.launchItem(rowOuter.modelData)
                             }
 
-                            // F7: one-click update, shown once the app has a
-                            // source (manager) or a known pending release —
-                            // an update without a known version can still be
-                            // worth a try. Single flight: every button dims
+                            // F7: one-click update, shown only once a
+                            // pending release is known for the row.
+                            // Single flight: every button dims
                             // while one download runs, and the row being
-                            // updated spins its arrow.
+                            // updated loops its arrow upward.
                             PanelActionButton {
                               id: updateButton
-                              visible: rowOuter.modelData.manager !== ""
-                                || rowOuter.modelData.updateVersion !== ""
+                              visible: rowOuter.modelData.updateVersion !== ""
                               enabled: root.updatingId === ""
                               tooltipText: root.strings.updateAction
                               foreground: root.foreground
@@ -1643,13 +1695,73 @@ Panel {
                                   ? (updateButton._hot ? updateButton.hoverColor : updateButton.foreground)
                                   : Qt.darker(updateButton.foreground, 2.0)
 
-                                RotationAnimation on rotation {
+                                // Slide+fade loop: the arrow floats out the
+                                // top, reappears below and slides back into
+                                // place — "moving up" without a spin (which
+                                // reads as "loading" rather than direction).
+                                // The icon is anchored, so the shift rides a
+                                // Translate transform instead of y.
+                                transform: Translate {
+                                  id: updateIconShift
+                                  y: 0
+                                }
+
+                                SequentialAnimation {
                                   running: root.updatingId === rowOuter.modelData.id
                                   loops: Animation.Infinite
-                                  from: 0
-                                  to: 360
-                                  duration: 1100
-                                  onRunningChanged: if (!running) updateIcon.rotation = 0
+
+                                  ParallelAnimation {
+                                    NumberAnimation {
+                                      target: updateIconShift
+                                      property: "y"
+                                      from: 0
+                                      to: -updateIcon.height * 0.6
+                                      duration: 220
+                                      easing.type: Easing.InQuad
+                                    }
+                                    NumberAnimation {
+                                      target: updateIcon
+                                      property: "opacity"
+                                      from: 1
+                                      to: 0
+                                      duration: 220
+                                      easing.type: Easing.InQuad
+                                    }
+                                  }
+
+                                  PropertyAction {
+                                    target: updateIconShift
+                                    property: "y"
+                                    value: updateIcon.height * 0.6
+                                  }
+
+                                  ParallelAnimation {
+                                    NumberAnimation {
+                                      target: updateIconShift
+                                      property: "y"
+                                      from: updateIcon.height * 0.6
+                                      to: 0
+                                      duration: 220
+                                      easing.type: Easing.OutQuad
+                                    }
+                                    NumberAnimation {
+                                      target: updateIcon
+                                      property: "opacity"
+                                      from: 0
+                                      to: 1
+                                      duration: 220
+                                      easing.type: Easing.OutQuad
+                                    }
+                                  }
+
+                                  PauseAnimation { duration: 120 }
+
+                                  // The update can finish mid-loop: park the
+                                  // icon back at rest when the loop stops.
+                                  onRunningChanged: if (!running) {
+                                    updateIconShift.y = 0
+                                    updateIcon.opacity = 1
+                                  }
                                 }
                               }
 
@@ -1723,14 +1835,14 @@ Panel {
                     BorderSurface {
                       width: listCol.width
                       visible: root.sourceEditId === rowOuter.modelData.id
-                      implicitHeight: visible ? sourceEditCol.implicitHeight + Style.spacing.xs * 2 : 0
+                      implicitHeight: visible ? sourceEditCol.implicitHeight + Style.spacing.xl * 2 : 0
                       color: Util.alpha(Color.accent, 0.06)
                       borderSpec: Border.flat(Util.alpha(Color.accent, 0.25), Math.max(1, Style.normalBorderWidth))
                       radius: Style.cornerRadius
 
                       Column {
                         id: sourceEditCol
-                        width: parent.width - Style.spacing.xs * 2
+                        width: parent.width - Style.spacing.xl * 2
                         anchors.centerIn: parent
                         spacing: Style.spacing.xs
 
@@ -1838,7 +1950,7 @@ Panel {
       accent: Color.accent
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
-      verticalPadding: Style.spacing.xxs
+      implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
       width: parent ? parent.width : 0
       enabled: !root.sourceBusy
       text: root.sourceEditValues[fieldKey] || ""
@@ -1900,4 +2012,13 @@ Panel {
   }
 
   onIntegrateRequested: openPicker()
+
+  // JS-library state carries no property notifications, so statusText is
+  // mirrored by syncFromModel — this observer is the panel's one hook on
+  // it. A fresh status (with no error showing) arms the auto-hide window;
+  // the status emptying again or an error taking over the banner stops it.
+  onStatusTextChanged: {
+    if (root.statusText !== "" && root.lastError === "") statusTimer.restart()
+    else statusTimer.stop()
+  }
 }
