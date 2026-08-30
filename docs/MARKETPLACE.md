@@ -31,10 +31,11 @@ https://github.com/HANCORE-linux/omarchy-plugin-marketplace/issues/new?template=
   ```text
   Requires python3 only (backend is Python standard-library, no pip deps);
   README documents `omarchy pkg add python` as fallback. Install via
-  ./install.sh (copies runtime files into
-  ~/.config/omarchy/plugins/io.github.glasschan.appimage only, refuses to
-  write outside $HOME); remove via ./uninstall.sh (disables plugin, deletes
-  only its own plugin dir). Run `omarchy restart shell` once after install.
+  ./install.sh (stops the shell, swaps runtime files into
+  ~/.config/omarchy/plugins/io.github.glasschan.appimage only — refuses to
+  write outside $HOME — and restarts the shell; no in-place hot-reload,
+  which can segfault quickshell 0.3.1); remove via ./uninstall.sh
+  (disables plugin, deletes only its own plugin dir).
   License: GPL-3.0 (derivative of GearLever, also GPL-3.0); LICENSE at root,
   GPL headers in all backend sources, Tabler icon license in
   icons/LICENSE-TABLER.md. Install, remove, click handling, Escape-to-close,
@@ -86,10 +87,12 @@ against the current default-branch commit:
 
 ## Pre-submit checklist
 
-1. [ ] `preview.png` exists at the repo root and is committed (currently absent locally).
+1. [ ] `preview.png` exists at the repo root and is committed (2190×1050 cover
+       rendered from `design/cover.html`; `panel.png` extracted from a
+       screenshot pair via the oma-swiss-preview diff pipeline).
 2. [ ] Commit and push all local work to `main` — a `.github/workflows/ci.yml`
        edit is sitting uncommitted; validation scans the pushed commit only.
-3. [ ] Tag `v0.2.0` on the release commit and push the tag (origin currently
-       has only `v0.1.0`); manifest `version` is already `0.2.0`.
+3. [ ] Tag `v0.4.0` on the release commit and push the tag (origin currently
+       has up to `v0.2.0`); manifest `version` is already `0.4.0`.
 4. [ ] Green CI on the pushed commit (backend, frontend-js, plugin-manifest).
 5. [ ] Open the issue via the prefilled URL above and tick the five checkboxes.

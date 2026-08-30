@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.glasschan.appimage",
   "name": "AppImage for Omarchy",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "glasschan",
   "license": "GPL-3.0",
-  "description": "Manage AppImages from the Omarchy bar: integrate, list, launch, update, and remove — with scheduled background update checks.",
+  "description": "Every AppImage, one panel: integrate downloads with a click (desktop entry + icon extracted), launch, update in place, or remove — with per-app GitHub release sources (pre-filled editors), background update checks that notify you, a pinnable compact window and a live bar badge. Python stdlib only, no daemon — derived from GearLever (GPL-3.0).",
   "kinds": [
     "bar-widget",
     "panel",
