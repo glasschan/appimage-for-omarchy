@@ -1,0 +1,145 @@
+# Release flow for "AppImage for Omarchy".
+#
+# tag v<version> → verify manifest parity → test → package → publish.
+# Pushing a v* tag re-runs the CI quality gates, packages the runtime
+# file set (exactly what install.sh copies) into a zip, and publishes it
+# as a GitHub Release with auto-generated changelog notes.
+# workflow_dispatch runs the same flow as a dry run: the zip is uploaded
+# as a workflow artifact and nothing is published.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Test, package & publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the changelog can diff tag-to-tag.
+          fetch-depth: 0
+
+      - name: Resolve plugin version
+        id: version
+        run: echo "version=$(jq -r .version manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Version guard (manifest must match the tag)
+        if: github.event_name == 'push'
+        run: |
+          manifest_version="$(jq -r .version manifest.json)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          echo "manifest version: $manifest_version"
+          echo "tag version:      $tag_version"
+          if [[ "$manifest_version" != "$tag_version" ]]; then
+            echo "::error::manifest.json version ($manifest_version) does not match tag $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Unit tests (ResourceWarnings as errors)
+        run: python3 -W error::ResourceWarning -m unittest discover -s backend/tests -v
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: lib/*.js parse harness
+        run: node tests-js/parse-harness.mjs
+
+      - name: Package the runtime file set
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          plugin_id="$(jq -r .id manifest.json)"
+          rm -rf staging dist
+          mkdir -p "staging/$plugin_id" dist
+
+          # Same copy set as install.sh: manifest, root QML, lib/, icons/,
+          # backend/main.py, backend/omarchy_appimage/ (source only),
+          # README, LICENSE. No tests, PRD, docs, or preview.png.
+          cp -a -- manifest.json README.md LICENSE ./*.qml "staging/$plugin_id/"
+          mkdir -p "staging/$plugin_id/lib" \
+                   "staging/$plugin_id/icons" \
+                   "staging/$plugin_id/backend/omarchy_appimage"
+          cp -a -- lib/. "staging/$plugin_id/lib/"
+          cp -a -- icons/. "staging/$plugin_id/icons/"
+          cp -a -- backend/main.py "staging/$plugin_id/backend/"
+          cp -a -- backend/omarchy_appimage/*.py "staging/$plugin_id/backend/omarchy_appimage/"
+
+          # Defense in depth: strip bytecode, like install.sh does.
+          # (unittest above may have produced fresh __pycache__ dirs.)
+          find "staging/$plugin_id" -type d -name '__pycache__' -prune -exec rm -rf -- {} +
+          find "staging/$plugin_id" -type f -name '*.pyc' -delete
+
+          zip_name="dist/$plugin_id-$VERSION.zip"
+          (cd staging && zip -r -q "../$zip_name" "$plugin_id")
+
+          echo "--- zip contents ---"
+          unzip -l "$zip_name"
+
+          size="$(stat -c%s "$zip_name")"
+          budget=$((1024 * 1024))
+          echo "zip size: $size bytes ($((size / 1024)) KiB), budget: $budget bytes"
+          if (( size >= budget )); then
+            echo "SIZE BUDGET EXCEEDED (PRD §2: plugin body < 1MB)"
+            exit 1
+          fi
+
+      - name: Generate changelog notes
+        run: |
+          set -euo pipefail
+
+          # On a tag push the current tag is checked out; walk one tag back.
+          # On workflow_dispatch (a branch), fall back to the newest tag.
+          if git rev-parse -q --verify "refs/tags/${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            prev="$(git describe --abbrev=0 --tags "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          else
+            prev="$(git describe --abbrev=0 --tags 2>/dev/null || true)"
+          fi
+
+          {
+            echo "## Changes"
+            echo
+            if [[ -n "$prev" ]]; then
+              echo "Commits since \`$prev\`:"
+              echo
+              git log --oneline "$prev..HEAD"
+            else
+              echo "Commits since the first release:"
+              echo
+              git log --oneline
+            fi
+          } > changelog.md
+
+          echo "--- changelog ---"
+          cat changelog.md
+
+      - name: Publish GitHub Release (tag push)
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/io.github.glasschan.appimage-$VERSION.zip" \
+            --title "AppImage for Omarchy $VERSION" \
+            --notes-file changelog.md
+
+      - name: Upload zip as workflow artifact (dry run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: io.github.glasschan.appimage-${{ steps.version.outputs.version }}
+          path: dist/*.zip
+          if-no-files-found: error
