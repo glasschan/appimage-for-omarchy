@@ -32,12 +32,37 @@ manifest_id="$(jq -r '.id // empty' "$SRC_DIR/manifest.json" 2>/dev/null ||
 # --- Sync runtime files only. -----------------------------------------------
 # Runtime set: manifest, root QML, lib/, icons/, backend/main.py,
 # backend/omarchy_appimage/ (source only), README, LICENSE.
-mkdir -p -- "$DEST"
+#
+# quickshell watches the plugin dir and hot-reloads on every file event, but
+# this plugin must NEVER be hot-reloaded in place: per quickshell issue #972
+# (open; unfixed in the 0.3.1 on this machine), when a backend Process exits
+# during a plugin hot-reload, IpcHandler::onPostReload segfaults on a
+# dynamic_cast of a stale object — and this panel runs short-lived backend
+# processes (including a 10s running-state poll), so ANY watcher-triggered
+# reload risks crashing the shell. The deploy rule is therefore: swap while
+# the shell is stopped (see below); the fresh instance then loads the new
+# files from disk — no in-place reload, no rescan.
+#
+# Primary protection: the shell is stopped around the swap, so a watcher can
+# never see it. Defensive leftovers: BOTH swap-side directories (staging and
+# the moved-aside old tree) stay dot-prefixed anyway. The shell's watcher
+# ignores dot-entries (the dotted staging dir produced zero watcher events),
+# while a visible duplicate plugin dir (full manifest + tree, duplicate
+# manifest id) fired dozens of "Local plugin changed, reloading" events and
+# made quickshell 0.3.1 segfault (Signal 11) during hot-reload incubation.
+mkdir -p -- "$PLUGINS_DIR"
 
-# Empty the destination directory first so a previous full-repo copy
-# (PRD.md, tests, ...) is cleanly overwritten. The directory itself is kept
-# (same inode) to stay friendly to the shell's file watcher.
-find "$DEST" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+STAGING="$PLUGINS_DIR/.${PLUGIN_ID}.staging.$$"
+OLD_DIR="$PLUGINS_DIR/.${PLUGIN_ID}.old.$$"
+cleanup_staging() {
+  if [[ -n "${STAGING:-}" && -d "${STAGING:-}" ]]; then
+    rm -rf -- "$STAGING"
+  fi
+}
+trap cleanup_staging EXIT
+
+rm -rf -- "$STAGING"
+mkdir -p -- "$STAGING"
 
 if command -v rsync >/dev/null 2>&1; then
   rsync -a \
@@ -52,28 +77,79 @@ if command -v rsync >/dev/null 2>&1; then
     --include='/backend/omarchy_appimage/' \
     --include='/backend/omarchy_appimage/*.py' \
     --exclude='*' \
-    "$SRC_DIR/" "$DEST/"
+    "$SRC_DIR/" "$STAGING/"
 else
   # No rsync: plain cp with the same include set.
   cp -a -- "$SRC_DIR/manifest.json" "$SRC_DIR"/*.qml \
-    "$SRC_DIR/README.md" "$SRC_DIR/LICENSE" "$DEST/"
-  mkdir -p -- "$DEST/lib" "$DEST/icons" "$DEST/backend/omarchy_appimage"
-  cp -a -- "$SRC_DIR/lib/." "$DEST/lib/"
-  cp -a -- "$SRC_DIR/icons/." "$DEST/icons/"
-  cp -a -- "$SRC_DIR/backend/main.py" "$DEST/backend/"
-  cp -a -- "$SRC_DIR/backend/omarchy_appimage/." "$DEST/backend/omarchy_appimage/"
+    "$SRC_DIR/README.md" "$SRC_DIR/LICENSE" "$STAGING/"
+  mkdir -p -- "$STAGING/lib" "$STAGING/icons" "$STAGING/backend/omarchy_appimage"
+  cp -a -- "$SRC_DIR/lib/." "$STAGING/lib/"
+  cp -a -- "$SRC_DIR/icons/." "$STAGING/icons/"
+  cp -a -- "$SRC_DIR/backend/main.py" "$STAGING/backend/"
+  cp -a -- "$SRC_DIR/backend/omarchy_appimage/." "$STAGING/backend/omarchy_appimage/"
 fi
 
-# Defense in depth: strip bytecode and OS cruft from the installed copy.
-find "$DEST" -type d -name '__pycache__' -prune -exec rm -rf -- {} +
-find "$DEST" -type f \( -name '*.pyc' -o -name '.DS_*' \) -delete
+# Defense in depth: strip bytecode and OS cruft from the staged copy.
+find "$STAGING" -type d -name '__pycache__' -prune -exec rm -rf -- {} +
+find "$STAGING" -type f \( -name '*.pyc' -o -name '.DS_*' \) -delete
 
-# --- Validate and tell the shell about the new files. ----------------------
+# --- Stop the shell so the swap can never trigger a reload. ------------------
+# Per quickshell issue #972 (see note above) ANY in-place reload of this
+# plugin can segfault quickshell 0.3.1, so deploy while the shell is down.
+# `omarchy restart shell` is not enough (it restarts immediately), so stop
+# quickshell ourselves and wait for it to fully exit before swapping.
+QS_PAT='quickshell -n -p /usr/share/omarchy/shell'
+if pgrep -f "$QS_PAT" >/dev/null 2>&1; then
+  echo "Stopping the Omarchy shell for a no-hot-reload swap (quickshell #972)..."
+  pkill -f "$QS_PAT" || true
+  for _ in $(seq 1 30); do
+    pgrep -f "$QS_PAT" >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  if pgrep -f "$QS_PAT" >/dev/null 2>&1; then
+    fail "quickshell did not exit within ~3s; nothing was swapped (staging cleaned up)"
+  fi
+fi
+
+# --- Swap the finished tree into place. --------------------------------------
+# If any rename fails, fail loudly without destroying the old copy.
+# OLD_DIR is dot-prefixed + pid-tagged so the watcher never sees it (see note
+# above); do not make it visible again.
+rm -rf -- "$OLD_DIR"
+if [[ -e "$DEST" ]]; then
+  if ! mv -- "$DEST" "$OLD_DIR"; then
+    fail "could not move the current installation aside"
+  fi
+  if ! mv -- "$STAGING" "$DEST"; then
+    if ! mv -- "$OLD_DIR" "$DEST"; then
+      fail "restore failed; previous installation left at $OLD_DIR"
+    fi
+    fail "could not move staged files into place; previous installation restored"
+  fi
+  rm -rf -- "$OLD_DIR"
+else
+  if ! mv -- "$STAGING" "$DEST"; then
+    fail "could not move staged files into place"
+  fi
+fi
+
+# --- Validate the final DEST (post-swap), then bring the shell back up. -----
+# `omarchy plugin validate` is pure file/schema checking and works while the
+# shell is down; `omarchy plugin list` talks to the shell over IPC, so it is
+# only usable after the restart below.
 if command -v omarchy >/dev/null 2>&1; then
   omarchy plugin validate "$DEST" || fail "installed copy failed validation"
-fi
-if command -v omarchy-shell >/dev/null 2>&1; then
-  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  # The shell was stopped for the swap; bring it back (best-effort). The
+  # fresh instance loads the new files from disk, so there is deliberately
+  # no rescanPlugins call — any in-place reload of this plugin must never be
+  # triggered, since it can segfault quickshell 0.3.1 (issue #972).
+  if ! omarchy restart shell; then
+    echo "install.sh: WARNING: 'omarchy restart shell' failed; the shell is still down." >&2
+    echo "install.sh: start it manually with: omarchy restart shell" >&2
+  fi
+else
+  echo "NOTE: 'omarchy' CLI not found; the shell is still stopped. Start it with:"
+  echo "  omarchy restart shell"
 fi
 
 echo "Installed runtime files to: $DEST"
@@ -85,11 +161,12 @@ if command -v omarchy >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
     echo unknown)"
 fi
 if [[ "$enabled" == "true" ]]; then
-  echo "Plugin is enabled; files hot-reload (rescan already requested)."
-  echo "If this update added new entry points (new files like Service.qml), run: omarchy restart shell"
+  echo "Plugin is enabled; the shell was stopped for the swap and restarted, so it"
+  echo "loaded the new files cleanly — no in-place hot-reload, which can segfault"
+  echo "quickshell 0.3.1 (https://github.com/quickshell-mirror/quickshell/issues/972)."
 else
   echo "Plugin is not enabled yet. Enable it with:"
   echo "  omarchy plugin enable $PLUGIN_ID"
-  echo "Saving files under ~/.config/omarchy/plugins/ hot-reloads; if needed:"
-  echo "  omarchy-shell shell rescanPlugins"
+  echo "Note: deploys stop and restart the shell instead of hot-reloading, because"
+  echo "ANY in-place reload can segfault quickshell 0.3.1 (issue #972)."
 fi
