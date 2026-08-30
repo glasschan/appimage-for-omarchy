@@ -1,5 +1,7 @@
 # AppImage for Omarchy
 
+![AppImage for Omarchy — panel preview](preview.png)
+
 [![CI](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml/badge.svg)](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml)
 
 Manage AppImages from the Omarchy bar: integrate new ones into your app

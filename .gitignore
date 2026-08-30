@@ -33,3 +33,8 @@ node_modules/
 .DS_Store
 Thumbs.db
 .directory
+
+# Local-only dev files (not shipped to users; keep off the remote)
+design/
+panel.png
+docs/MARKETPLACE.md
