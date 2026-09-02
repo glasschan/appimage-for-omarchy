@@ -98,7 +98,8 @@ for i, line in enumerate(read_lines(extractor), 1):
 # Rule 5: every raw subprocess.run elsewhere carries timeout= (utils.py owns
 # the bounded runner and is exempt). squashfs.py's zstd probe is the case
 # this pins: an unbounded wait must never hang the backend. `from subprocess
-# import` is flagged too — a bare `run(...)` alias must not escape the scan.
+# import` and aliased imports are flagged too — a bare `run(...)` alias must not
+# escape the scan.
 for path in sorted(PKG.glob('*.py')):
     if path.name == 'utils.py':
         continue
@@ -107,6 +108,10 @@ for path in sorted(PKG.glob('*.py')):
         if re.search(r'\bfrom\s+subprocess\s+import\b', line):
             err('bounded-subprocess', path, i + 1,
                 'from subprocess import ... — call subprocess.run (with '
+                'timeout=) or use utils.run_command')
+        if re.search(r'\bimport\s+subprocess\s+as\b', line):
+            err('bounded-subprocess', path, i + 1,
+                'aliased subprocess import — call subprocess.run (with '
                 'timeout=) or use utils.run_command')
         if not re.search(r'\bsubprocess\.run\s*\(', line):
             continue
