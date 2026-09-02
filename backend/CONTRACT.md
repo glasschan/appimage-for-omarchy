@@ -281,10 +281,12 @@ Real example output:
   asset digest, or advertised-size equality (GitLab HEAD content-length,
   Gitea asset size) depending on what the source exposes. A verification
   failure raises an error and the partial artifact is removed.
-- **Atomic install** — the AppImage and its icon are copied into a temp
-  file next to their destination (O_EXCL|O_NOFOLLOW), fsync'd, then
-  `os.replace()`d into place; a planted symlink at the destination is
-  replaced, never written through.
+- **Atomic install** — the AppImage and its icon are written through an
+  exclusive mkstemp descriptor next to their destination, fchmod'd,
+  fsync'd, then `os.replace()`d into place; a planted symlink or FIFO at
+  the destination is replaced, never written through. The source is
+  realpath-resolved and opened no-follow (a symlinked AppImage still
+  integrates; non-regular sources are refused).
 - **Containment-bound uninstall** — paths from the (mutable) desktop
   entry are only removed when bound to the app: equal to the path
   recorded at install time in `apps.ini`, or inside the managed-folder
