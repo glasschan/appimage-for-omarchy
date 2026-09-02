@@ -69,12 +69,24 @@ class AtomicInstallTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.lstat(sentinel).st_mode), 0o644)
         self.assertTrue(stat.S_ISREG(os.lstat(dest).st_mode))
 
-    def test_symlink_source_is_refused(self):
-        evil_src = os.path.join(self.dir, 'link-to-src')
-        os.symlink(self.src, evil_src)
+    def test_symlink_source_is_resolved(self):
+        # the source is the user's own chosen file: a symlink there is
+        # followed (realpath), not refused with ELOOP
+        linked_src = os.path.join(self.dir, 'link-to-src')
+        os.symlink(self.src, linked_src)
         dest = os.path.join(self.dir, 'dest.appimage')
-        with self.assertRaises(OSError):    # ELOOP from O_NOFOLLOW
-            _atomic_install(evil_src, dest, 0o755)
+        _atomic_install(linked_src, dest, 0o755)
+        with open(dest, 'rb') as f:
+            self.assertEqual(f.read(), b'\x7fELF\x02\x01\x01\x00\x41\x49\x02'
+                             + b'payload')
+
+    def test_non_regular_source_is_refused(self):
+        # after resolution the source must still be a regular file
+        fifo_src = os.path.join(self.dir, 'planted-fifo')
+        os.mkfifo(fifo_src)
+        dest = os.path.join(self.dir, 'dest.appimage')
+        with self.assertRaises(InternalError):
+            _atomic_install(fifo_src, dest, 0o755)
         self.assertFalse(os.path.exists(dest))
 
     def test_directory_destination_is_refused(self):

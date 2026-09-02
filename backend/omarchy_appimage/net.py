@@ -51,6 +51,12 @@ _CHUNK = 64 * 1024
 # Nothing in production ever sets either: with the seam off, BOTH
 # relaxations are inactive (https-only egress, public addresses only).
 _TEST_ALLOW_LOCAL = bool(os.environ.get('OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP'))
+if _TEST_ALLOW_LOCAL:
+    # loud so an accidentally exported variable never silences the guard
+    logging.warning(
+        '%s is set: the https-only and public-address transport guards '
+        'are DISABLED in this process (test seam — unset it outside the '
+        'test suite)', 'OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP')
 
 # Small, fast endpoints used only to answer "is there a network at all"
 # (mirrors GearLever's lib/utils.check_internet).

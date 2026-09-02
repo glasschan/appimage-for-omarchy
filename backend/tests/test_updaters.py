@@ -17,7 +17,7 @@ from unittest import mock
 from helpers import (FakeXDGTestCase, FixtureHTTPServer,
                      make_elf_with_sections)
 
-from omarchy_appimage import net
+from omarchy_appimage import net, updaters
 from omarchy_appimage.ini_config import Config
 from omarchy_appimage.provider import AppImageListElement, InstalledStatus
 from omarchy_appimage.updaters import (CodebergUpdater, ForgejoUpdater,
@@ -259,6 +259,46 @@ class StaticFileUpdaterTests(UpdaterTestCase):
                 manager.download(dest_dir)
         self.assertFalse(os.path.exists(dest))
 
+    def test_download_zsync_without_sha1_falls_back_to_advertised_size(self):
+        # a zsync control file without a SHA-1 line still verifies:
+        # advertised-size equality is enforced instead
+        body = b'zsync-no-sha1-body'
+        header = 'zsync: 0.6.2\nFilename: f.appimage\n\n[x]'
+        server = self.serve({
+            '/f.appimage.zsync': (200, {}, header.encode()),
+            '/f.appimage': (200, {}, body),
+        })
+        el = self.make_el()
+        manager = StaticFileUpdater(el=el, embedded='zsync|'
+                                    + server.url('/f.appimage.zsync'))
+
+        dest_dir = os.path.join(self.sandbox, 'dl-zsync-nosha1')
+        os.makedirs(dest_dir)
+        dest = os.path.join(dest_dir, 'update.appimage')
+        with mock.patch.object(net, 'head_headers',
+                               return_value={'content-length': '9999'}):
+            with self.assertRaises(UpdateError):
+                manager.download(dest_dir)
+        self.assertFalse(os.path.exists(dest))
+
+        # a matching advertised size passes (HEAD lies here, so the
+        # mismatch above is the binding; this asserts the fallback does
+        # not reject a consistent download)
+        with mock.patch.object(net, 'head_headers',
+                               return_value={'content-length':
+                                             str(len(body))}):
+            dest = manager.download(dest_dir)
+        self.assertTrue(os.path.exists(dest))
+
+    def test_garbage_content_length_header_is_ignored(self):
+        # a garbage Content-Length must not crash the size check
+        self.assertEqual(updaters._header_content_length(
+            {'content-length': 'not-a-number'}), 0)
+        self.assertEqual(updaters._header_content_length(
+            {'content-length': None}), 0)
+        self.assertEqual(updaters._header_content_length(
+            {'content-length': '123'}), 123)
+
 
 # ----------------------------------------------------------- GithubUpdater
 
@@ -479,6 +519,21 @@ class GithubUpdaterTests(UpdaterTestCase):
             {'digest': digest, 'size': len(body)}, body)
 
         dest_dir = os.path.join(self.sandbox, 'gh-digest-ok')
+        os.makedirs(dest_dir)
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            dest = manager.download(dest_dir)
+        self.assertTrue(os.path.exists(dest))
+
+    def test_download_null_digest_is_skipped(self):
+        # GitHub's API can return a null digest: it must be ignored like
+        # the availability check does, not crash the download
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02asset-bytes'
+        manager, _el, patches = self._download_github(
+            {'digest': None, 'size': len(body)}, body)
+
+        dest_dir = os.path.join(self.sandbox, 'gh-digest-null')
         os.makedirs(dest_dir)
         with contextlib.ExitStack() as stack:
             for p in patches:

@@ -43,6 +43,11 @@ MAX_ICON_BYTES = 8 * 1024 * 1024
 MAX_EXTRACT_FILES = 20_000
 MAX_EXTRACT_BYTES = 512 * 1024 * 1024
 
+# Listing output bound: a 20k-entry listing with long paths can outgrow
+# run_command's default 10 MiB cap, and a truncated listing must never
+# be the reason a pre-extraction quota check silently passes.
+_LISTING_OUTPUT_BYTES = 64 * 1024 * 1024
+
 # The desktop entry's Icon value is untrusted: name-based icon candidates
 # are only built for this strict shape (no separators, no traversal).
 _ICON_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
@@ -266,39 +271,58 @@ def _enforce_quotas(files: int, total_bytes: int):
 
 def _sanitize_extracted(root: str):
     """Post-extraction backstop: unlink symlinks whose target escapes
-    `root` and enforce the aggregate quotas while walking (an image that
-    busts either gets its tree removed and is rejected)."""
+    `root` (file *and* directory symlinks — os.walk reports the latter
+    in dirnames, which it never iterates itself) and enforce the
+    aggregate quotas while walking (an image that busts either gets its
+    tree removed and is rejected)."""
+    def _bust(reason: str):
+        shutil.rmtree(root, ignore_errors=True)
+        raise SquashfsError('extraction quota exceeded ' + reason)
+
     files = 0
     total_bytes = 0
-    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+
+    def _count():
+        nonlocal files
+        files += 1
+        if files > MAX_EXTRACT_FILES:
+            _bust(f'(more than {MAX_EXTRACT_FILES} files)')
+
+    def _is_escaping_link(path: str) -> bool:
+        if not os.path.islink(path):
+            return False
+        real = os.path.realpath(path)
+        if real == root or real.startswith(root + os.sep):
+            return False
+        logging.warning('removing symlink escaping %s: %s', root, path)
+        try:
+            os.unlink(path)
+        except OSError as e:
+            logging.warning('could not unlink %s: %s', path, e)
+        return True
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        kept_dirs = []
+        for name in dirnames:
+            path = os.path.join(dirpath, name)
+            _count()
+            if not _is_escaping_link(path):
+                kept_dirs.append(name)
+        # walk descends into dirnames: prune the unlinked escapes
+        dirnames[:] = kept_dirs
         for name in filenames:
             path = os.path.join(dirpath, name)
-            files += 1
-            if files > MAX_EXTRACT_FILES:
-                shutil.rmtree(root, ignore_errors=True)
-                raise SquashfsError('extraction quota exceeded '
-                                    f'(more than {MAX_EXTRACT_FILES} files)')
+            _count()
             try:
                 st = os.lstat(path)
             except OSError:
                 continue
             if stat.S_ISLNK(st.st_mode):
-                real = os.path.realpath(path)
-                if real != root \
-                        and not real.startswith(root + os.sep):
-                    logging.warning('removing symlink escaping %s: %s',
-                                    root, path)
-                    try:
-                        os.unlink(path)
-                    except OSError as e:
-                        logging.warning('could not unlink %s: %s', path, e)
+                _is_escaping_link(path)
             elif stat.S_ISREG(st.st_mode):
                 total_bytes += st.st_size
                 if total_bytes > MAX_EXTRACT_BYTES:
-                    shutil.rmtree(root, ignore_errors=True)
-                    raise SquashfsError('extraction quota exceeded '
-                                        f'(more than {MAX_EXTRACT_BYTES} '
-                                        'bytes)')
+                    _bust(f'(more than {MAX_EXTRACT_BYTES} bytes)')
 
 
 def _open_source(appimage_path: str) -> tuple:
@@ -317,7 +341,8 @@ def _open_source(appimage_path: str) -> tuple:
             offset = elf.get_squashfs_offset(appimage_path)
             # fail closed: quota-check the listing before extracting
             listing = run_command(['unsquashfs', '-ls', '-o', str(offset),
-                                   appimage_path], timeout=120)
+                                   appimage_path], timeout=120,
+                                  max_output_bytes=_LISTING_OUTPUT_BYTES)
             files, total_bytes = _listing_totals(
                 listing.stdout.decode('utf-8', errors='replace'), 2)
             _enforce_quotas(files, total_bytes)
@@ -341,7 +366,8 @@ def _open_source(appimage_path: str) -> tuple:
             with open(appimage_path, 'rb') as f:
                 f.seek(offset)
                 listing = run_command(['bsdtar', '-tvf', '-'], stdin=f,
-                                      timeout=120)
+                                      timeout=120,
+                                      max_output_bytes=_LISTING_OUTPUT_BYTES)
             files, total_bytes = _listing_totals(
                 listing.stdout.decode('utf-8', errors='replace'), 4)
             _enforce_quotas(files, total_bytes)
@@ -442,7 +468,18 @@ def _find_icon(source, icon_name: str) -> Optional[bytes]:
     for path in candidates:
         if not source.exists(path):
             continue
-        data = source.read(path)
+        # name-based candidates may themselves be in-root symlinks (a
+        # common layout: /icon.png -> usr/share/icons/app.png);
+        # _DirSource.read never reads *through* a final symlink, so
+        # resolve the chain first (containment enforced inside
+        # resolve_symlink/read)
+        read_path = path
+        if source.is_symlink(path):
+            target = source.resolve_symlink(path)
+            if not target:
+                continue
+            read_path = target
+        data = source.read(read_path)
         if data and image_format(data) in ('image/png', 'image/svg+xml'):
             return data
 

@@ -49,6 +49,15 @@ def _unlink_quietly(path: str):
         pass
 
 
+def _header_content_length(headers: dict) -> int:
+    """Content-Length as int, 0 when absent or garbage (some servers
+    send values int() would choke on; no size known -> no size check)."""
+    try:
+        return int(headers.get('content-length') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def config_bool(config: dict, key: str, default: bool = False) -> bool:
     value = config.get(key)
     if value is None:
@@ -131,7 +140,7 @@ class UpdateManager():
         """Enforce size equality when a HEAD of `url` reported a length
         (sources whose API exposes no digest: static URLs, GitLab)."""
         headers = net.head_headers(url)
-        remote = int(headers.get('content-length') or 0)
+        remote = _header_content_length(headers)
         if remote > 0:
             self._verify_size(path, remote, url)
 
@@ -234,7 +243,7 @@ class StaticFileUpdater(UpdateManager):
                 return None
 
         headers = net.head_headers(dwnl_url) if dwnl_url else {}
-        remote_size = int(headers.get('content-length') or 0)
+        remote_size = _header_content_length(headers)
         if remote_size <= 0:
             return False
 
@@ -255,9 +264,11 @@ class StaticFileUpdater(UpdateManager):
             net.download_to_file(url, dest, progress_cb)
             if expected_sha1:
                 self._verify_sha1(dest, expected_sha1)
-            elif not e_url:
-                # plain configured URL: enforce the advertised size when
-                # the server reported one (no zsync SHA-1 to check here)
+            else:
+                # no SHA-1 binding (plain configured URL, or a zsync
+                # control file without a SHA-1 line): fall back to
+                # enforcing the advertised size when the server
+                # reported one
                 self._verify_advertised_size(url, dest)
         except BaseException:
             _unlink_quietly(dest)
@@ -438,9 +449,10 @@ class GithubUpdater(UpdateManager):
 
             # verification ladder (strongest binding first): the release
             # asset's sha256 digest, the embedded zsync's SHA-1, then the
-            # advertised size
+            # advertised size; digest can be null in the API response
+            # (guarded like the availability check does)
             digest = asset.get('digest', '')
-            if digest.startswith('sha256:'):
+            if digest and digest.startswith('sha256:'):
                 self._verify_sha256(dest, digest[len('sha256:'):])
 
             if target_asset['zsync']:
@@ -514,7 +526,7 @@ class GitlabUpdater(UpdateManager):
         asset = self.fetch_target_asset()
         if asset:
             headers = net.head_headers(asset['direct_asset_url'])
-            remote_size = int(headers.get('content-length') or 0)
+            remote_size = _header_content_length(headers)
             if remote_size > 0:
                 self.download_size = remote_size
                 return remote_size != self._local_size()

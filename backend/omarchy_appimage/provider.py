@@ -49,11 +49,15 @@ class InternalError(Exception):
 def _atomic_install(src: str, dest: str, mode: int):
     """Descriptor-safe install of `src` at `dest` (marketplace review).
 
-    The bytes land in a fresh temp file next to `dest` (created with
-    O_EXCL|O_NOFOLLOW), are chmod'd + fsync'd, then os.replace()'d over
-    the final name — rename never follows a symlink at `dest`, so a
-    planted symlink gets replaced instead of written through, and a crash
-    can never leave a truncated AppImage behind."""
+    The bytes land in a fresh temp file next to `dest` (created
+    exclusively by mkstemp and written straight through its descriptor,
+    so no window ever exists where a planted name could swap the inode),
+    are chmod'd + fsync'd, then os.replace()'d over the final name —
+    rename never follows a symlink at `dest`, so a planted symlink gets
+    replaced instead of written through, and a crash can never leave a
+    truncated AppImage behind. The source is the user's own chosen file:
+    its final component is resolved with realpath first (following a
+    symlink there is correct), then opened O_NOFOLLOW."""
     try:
         if stat.S_ISDIR(os.lstat(dest).st_mode):
             raise InternalError(f'refusing to install over a directory: '
@@ -62,22 +66,15 @@ def _atomic_install(src: str, dest: str, mode: int):
         pass
 
     dest_dir = os.path.dirname(dest) or '.'
-    # reserve a unique name, then reopen it with the exact safe flags
-    # (mkstemp cannot pass O_NOFOLLOW): between the unlink and the open
-    # nothing but us knows the name, and O_EXCL|O_NOFOLLOW still fail
-    # cleanly if anything plants a symlink there
-    reserve_fd, tmp_path = tempfile.mkstemp(prefix='.gearlever-tmp-',
-                                            dir=dest_dir)
-    os.close(reserve_fd)
-    os.unlink(tmp_path)
+    fd, tmp_path = tempfile.mkstemp(prefix='.gearlever-tmp-', dir=dest_dir)
 
-    fd = None
     src_fd = None
     try:
-        fd = os.open(tmp_path,
-                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                     0o600)
-        src_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK keeps a planted FIFO from blocking the open — the
+        # regular-file check below rejects it right after (regular
+        # files ignore the flag)
+        src_fd = os.open(os.path.realpath(src),
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         if not stat.S_ISREG(os.fstat(src_fd).st_mode):
             raise InternalError(f'source is not a regular file: {src}')
         with os.fdopen(fd, 'wb') as out, os.fdopen(src_fd, 'rb') as f:

@@ -99,6 +99,23 @@ class FindIconTests(unittest.TestCase):
         self.assertEqual(data, PNG)
         self.assertIn('/share/icons/app.png', source.probed)
 
+    def test_dirsource_follows_inroot_symlinked_root_icon(self):
+        # a root-level icon that is a symlink inside the image (the
+        # common /icon.png -> usr/share/icons/app.png layout) must be
+        # found on the _DirSource path too — _VfsSource follows it, and
+        # reads never go *through* a final symlink, so the candidate is
+        # resolved first (containment enforced inside resolve_symlink)
+        root = tempfile.mkdtemp(prefix='iconlink-')
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        os.makedirs(os.path.join(root, 'usr', 'share', 'icons'))
+        with open(os.path.join(root, 'usr', 'share', 'icons', 'app.png'),
+                  'wb') as f:
+            f.write(PNG)
+        os.symlink('usr/share/icons/app.png', os.path.join(root, 'icon.png'))
+
+        source = extractor._DirSource(root)
+        self.assertEqual(extractor._find_icon(source, 'icon'), PNG)
+
 
 class DirSourceTests(unittest.TestCase):
     def setUp(self):
@@ -183,6 +200,31 @@ class SanitizeExtractedTests(unittest.TestCase):
 
         self.assertTrue(os.path.islink(os.path.join(self.root,
                                                     'linked.png')))
+
+    def test_escaping_dir_symlink_is_unlinked(self):
+        # os.walk reports directory symlinks in dirnames; they must not
+        # survive sanitization (walk would otherwise descend out of root)
+        os.makedirs(os.path.join(self.root, 'sub'))
+        with open(os.path.join(self.root, 'sub', 'ok.png'), 'wb') as f:
+            f.write(PNG)
+        os.symlink('/etc', os.path.join(self.root, 'sub', 'evil-dir'))
+
+        extractor._sanitize_extracted(self.root)
+
+        self.assertFalse(os.path.lexists(os.path.join(self.root, 'sub',
+                                                      'evil-dir')))
+        self.assertTrue(os.path.exists(os.path.join(self.root, 'sub',
+                                                    'ok.png')))
+
+    def test_directory_entries_count_toward_quota(self):
+        # directories count as entries too: enough of them bust the
+        # file-count quota even without any regular file
+        for i in range(4):
+            os.makedirs(os.path.join(self.root, f'd{i}'))
+        with mock.patch.object(extractor, 'MAX_EXTRACT_FILES', 2):
+            with self.assertRaisesRegex(SquashfsError, 'quota'):
+                extractor._sanitize_extracted(self.root)
+        self.assertFalse(os.path.exists(self.root))
 
     def test_file_count_quota_backstop(self):
         for i in range(5):
