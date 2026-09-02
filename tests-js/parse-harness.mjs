@@ -344,10 +344,13 @@ const onDone = (r) => doneResults.push(r)
   Backend.feedStream(ctx, "stdout", "aaaaaaaaaa") // exactly 10
   check("feedStream under cap no kill", ctx.stdoutLen === 10
     && ctx.overflow === false && proc.killCount === 0, JSON.stringify(ctx))
-  // the chunk that pushes past the cap flips overflow and kills once
+  // the chunk that pushes past the cap flips overflow, stops the
+  // watchdog (so the timer can never fire handleTimeout and misattribute
+  // the failure as "timeout") and kills the child exactly once
   Backend.feedStream(ctx, "stdout", "bbbb")
-  check("feedStream past cap kills once", ctx.overflow === true
-    && proc.killCount === 1 && proc.running === false, JSON.stringify(ctx))
+  check("feedStream past cap kills once + stops watchdog", ctx.overflow === true
+    && proc.killCount === 1 && proc.running === false && fakeTimer.stopped === true,
+    JSON.stringify(ctx))
   // later chunks never double-kill
   Backend.feedStream(ctx, "stderr", "err!!")
   check("feedStream overflow once only", proc.killCount === 1 && ctx.stderrLen === 5,
@@ -357,8 +360,9 @@ const onDone = (r) => doneResults.push(r)
   try { Backend.feedStream(null, "stdout", "ignored") } catch (e) { threw = true }
   check("feedStream null ctx no-op", threw === false)
 
-  // handleExit maps overflow to the error shape, exactly once
-  // (no markStarted on this ctx -> spawnFailed reports true)
+  // with the watchdog already stopped, the real process exit reaches
+  // handleExit, which attributes the failure to the overflow — not a
+  // timeout — exactly once
   Backend.handleExit(ctx, 0, "truncated-garbage", "stderr-leftover")
   Backend.handleExit(ctx, 0, "truncated-garbage", "stderr-leftover") // late exit ignored
   const r = doneResults[0]
@@ -368,7 +372,6 @@ const onDone = (r) => doneResults.push(r)
   check("handleExit overflow clamp + once", r.stdout === "truncated-garbage"
     && r.stderr === "stderr-leftover" && doneResults.length === 1,
     JSON.stringify(doneResults))
-  check("handleExit overflow stops watchdog", fakeTimer.stopped === true)
 }
 
 console.log(failures === 0 ? "\nALL PASS" : "\n" + failures + " FAILURES")

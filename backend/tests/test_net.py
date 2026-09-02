@@ -324,10 +324,14 @@ class DeadlineTests(FakeXDGTestCase):
                                     'request'), 0)
 
     def test_fetch_text_slow_drip_hits_deadline(self):
+        # max_bytes is deliberately far above anything the trickle can
+        # deliver within the deadline: this isolates the absolute-deadline
+        # abort from the byte-cap abort
         url = self._serve(_TrickleHandler)
         start = time.monotonic()
         with self.assertRaises(net.NetworkError):
-            net.fetch_text(url, timeout=1)
+            net.fetch_text(url, timeout=1,
+                           max_bytes=64 * 1024 * 1024)
         self.assertLess(time.monotonic() - start, 5)
 
     def test_fetch_text_stall_aborts(self):

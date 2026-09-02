@@ -289,7 +289,9 @@ Real example output:
   metadata requests get one absolute budget (20 s), downloads get a
   per-read stall guard (30 s) plus an absolute deadline of 1 h, so a
   slow-drip server cannot keep a request or a multi-GiB transfer alive
-  indefinitely.
+  indefinitely. Known residual: the response-header phase is bounded
+  only by the per-operation socket timeout (an http.client structural
+  limit); the absolute budget covers the body phase.
 - **Mandatory digest verification (fail closed)** — an artifact is only
   installed after verifying it against a publisher-attested
   *cryptographic* digest; advertised-size equality alone never

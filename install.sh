@@ -102,30 +102,17 @@ if command -v omarchy >/dev/null 2>&1; then
     fail "staged copy failed validation; nothing was swapped (old installation intact, shell not stopped)"
 fi
 
-# --- Stop the shell so the swap can never trigger a reload. ------------------
-# Per quickshell issue #972 (see note above) ANY in-place reload of this
-# plugin can segfault quickshell 0.3.1, so deploy while the shell is down.
-# `omarchy restart shell` is not enough (it restarts immediately), so stop
-# quickshell ourselves and wait for it to fully exit before swapping.
-QS_PAT='quickshell -n -p /usr/share/omarchy/shell'
-if pgrep -f "$QS_PAT" >/dev/null 2>&1; then
-  echo "Stopping the Omarchy shell for a no-hot-reload swap (quickshell #972)..."
-  pkill -f "$QS_PAT" || true
-  for _ in $(seq 1 30); do
-    pgrep -f "$QS_PAT" >/dev/null 2>&1 || break
-    sleep 0.1
-  done
-  if pgrep -f "$QS_PAT" >/dev/null 2>&1; then
-    fail "quickshell did not exit within ~3s; nothing was swapped (staging cleaned up)"
-  fi
-fi
-
-# --- Failure paths after the swap: keep a bootable tree installed. -----------
-# The previous installation is retained in OLD_DIR until validation AND
-# restart handling have fully succeeded, so a failed post-swap validation
-# or restart rolls back to the known-good tree and brings the shell back
-# up. Fresh installs (no prior DEST) have nothing to roll back to.
+# --- Failure paths: keep a bootable tree installed and the shell up. ---------
+# shell_up_attempt is also the INT/TERM handler for the stop-swap window
+# below, so a Ctrl-C there still brings the shell back. The re-entry guard
+# keeps a second Ctrl-C (e.g. during 'omarchy restart shell' itself) from
+# stacking restart attempts.
+_SHELL_UP_STARTED=0
 shell_up_attempt() {
+  if [[ "$_SHELL_UP_STARTED" == 1 ]]; then
+    return 0
+  fi
+  _SHELL_UP_STARTED=1
   if command -v omarchy >/dev/null 2>&1; then
     if ! omarchy restart shell; then
       echo "install.sh: WARNING: 'omarchy restart shell' failed; the shell is still down." >&2
@@ -153,6 +140,27 @@ restore_old_and_die() {
   exit 1
 }
 
+# --- Stop the shell so the swap can never trigger a reload. ------------------
+# Per quickshell issue #972 (see note above) ANY in-place reload of this
+# plugin can segfault quickshell 0.3.1, so deploy while the shell is down.
+# `omarchy restart shell` is not enough (it restarts immediately), so stop
+# quickshell ourselves and wait for it to fully exit before swapping.
+# Until the swap is done, INT/TERM attempt the restart before dying so the
+# shell is never left down by an interrupt.
+trap 'shell_up_attempt; exit 130' INT TERM
+QS_PAT='quickshell -n -p /usr/share/omarchy/shell'
+if pgrep -f "$QS_PAT" >/dev/null 2>&1; then
+  echo "Stopping the Omarchy shell for a no-hot-reload swap (quickshell #972)..."
+  pkill -f "$QS_PAT" || true
+  for _ in $(seq 1 30); do
+    pgrep -f "$QS_PAT" >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  if pgrep -f "$QS_PAT" >/dev/null 2>&1; then
+    fail "quickshell did not exit within ~3s; nothing was swapped (staging cleaned up)"
+  fi
+fi
+
 # --- Swap the finished tree into place. --------------------------------------
 # If any rename fails, fail loudly: the old copy is restored where
 # possible and the shell is never left down without a restart attempt.
@@ -178,6 +186,9 @@ else
     fail "could not move staged files into place"
   fi
 fi
+# Swap complete: the post-swap validation/restart block below owns its own
+# failure handling (restore_old_and_die), so the interrupt trap steps aside.
+trap - INT TERM
 
 # --- Validate the live DEST post-swap, then bring the shell back up. --------
 # `omarchy plugin validate` is pure file/schema checking and works while
