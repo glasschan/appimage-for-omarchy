@@ -52,18 +52,18 @@ def read_lines(path):
     return path.read_text(encoding='utf-8').splitlines()
 
 
-# Rule 1: os.environ only in constants.py. Environment variables must never
-# gate a trust boundary (round-2 finding #1: the ALLOW_LOCAL kill switch).
-# Matches any `.environ` access, so an aliased `import os as x` cannot
-# evade the scan.
+# Rule 1: os.environ / os.getenv only in constants.py. Environment
+# variables must never gate a trust boundary (round-2 finding #1: the
+# ALLOW_LOCAL kill switch). Matches any `.environ` access AND os.getenv,
+# so an aliased import or the idiomatic getenv cannot evade the scan.
 for path in sorted(PKG.glob('*.py')):
     if path.name == 'constants.py':
         continue
     for i, line in enumerate(read_lines(path), 1):
-        if re.search(r'\benviron(?:b)?\b', line):
+        if re.search(r'\benviron(?:b)?\b|\bgetenv\s*\(', line):
             err('env-boundary', path, i,
-                'os.environ outside constants.py — env must never gate a '
-                'trust boundary')
+                'os.environ/os.getenv outside constants.py — env must '
+                'never gate a trust boundary')
 
 # Rule 2: no direct urllib egress outside net.py. All requests must flow
 # through the hardened opener (redirect/SSRF/deadline enforcement).
@@ -82,7 +82,7 @@ for path in sorted(PKG.glob('*.py')):
 # _atomic_install may write payloads (fd write-through + fsync).
 provider = PKG / 'provider.py'
 for i, line in enumerate(read_lines(provider), 1):
-    if re.search(r'\bshutil\.copy(?:file|2)?\s*\(', line):
+    if re.search(r'\bshutil\.copy(?:file|2|tree)?\s*\(', line):
         err('atomic-install', provider, i,
             'non-atomic shutil copy in provider.py — use _atomic_install')
 
@@ -97,24 +97,76 @@ for i, line in enumerate(read_lines(extractor), 1):
 
 # Rule 5: every raw subprocess.run elsewhere carries timeout= (utils.py owns
 # the bounded runner and is exempt). squashfs.py's zstd probe is the case
-# this pins: an unbounded wait must never hang the backend.
+# this pins: an unbounded wait must never hang the backend. `from subprocess
+# import` is flagged too — a bare `run(...)` alias must not escape the scan.
 for path in sorted(PKG.glob('*.py')):
     if path.name == 'utils.py':
         continue
     lines = read_lines(path)
     for i, line in enumerate(lines):
+        if re.search(r'\bfrom\s+subprocess\s+import\b', line):
+            err('bounded-subprocess', path, i + 1,
+                'from subprocess import ... — call subprocess.run (with '
+                'timeout=) or use utils.run_command')
         if not re.search(r'\bsubprocess\.run\s*\(', line):
             continue
-        window = '\n'.join(lines[i:i + 5])  # call line + following 4
+        window = '\n'.join(lines[i:i + 7])  # call line + following 6
         if not re.search(r'\btimeout\s*=', window):
             err('bounded-subprocess', path, i + 1,
-                'subprocess.run without timeout= within 5 lines')
+                'subprocess.run without timeout= within 6 lines')
 
 # Rule 6: QML collector wiring (round-2 finding #3). Every StdioCollector
 # block must keep its onRead: producer-side bound — brace-aware scan, enough
-# for these flat blocks.
+# for these flat blocks. Comments (// and /* */) and string literals are
+# stripped first so braces or onRead: inside them cannot fool the scan;
+# newlines are preserved so reported line numbers stay the original ones.
+def strip_comments_and_strings(text):
+    out = []
+    i, n = 0, len(text)
+    state = 'code'
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ''
+        if state == 'code':
+            if c == '/' and nxt == '/':
+                state, i = 'line', i + 2
+            elif c == '/' and nxt == '*':
+                state, i = 'block', i + 2
+                out.append('  ')
+            elif c in '"\'`':
+                state, i = {'"': 'dq', "'": 'sq', '`': 'bt'}[c], i + 1
+                out.append(' ')
+            else:
+                out.append(c)
+                i += 1
+        elif state == 'line':
+            if c == '\n':
+                state = 'code'
+            out.append('\n' if c == '\n' else ' ')
+            i += 1
+        elif state == 'block':
+            if c == '*' and nxt == '/':
+                state, i = 'code', i + 2
+                out.append('  ')
+            else:
+                out.append('\n' if c == '\n' else ' ')
+                i += 1
+        else:  # dq / sq / bt string literal
+            if c == '\\' and i + 1 < n:
+                out.append('  ')
+                i += 2
+            elif c == {'dq': '"', 'sq': "'", 'bt': '`'}[state]:
+                state = 'code'
+                out.append(' ')
+                i += 1
+            else:
+                out.append('\n' if c == '\n' else ' ')
+                i += 1
+    return ''.join(out)
+
+
 for path in QML:
-    text = path.read_text(encoding='utf-8')
+    text = strip_comments_and_strings(path.read_text(encoding='utf-8'))
     for m in re.finditer(r'\bStdioCollector\b', text):
         open_brace = text.find('{', m.end())
         if open_brace == -1:

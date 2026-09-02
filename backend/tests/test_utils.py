@@ -154,22 +154,40 @@ class RunCommandOutputBoundTests(unittest.TestCase):
             os.unlink(path)
         self.assertEqual(result.stdout, b'via-stdin')
 
-    def test_timeout_kills_child_and_raises(self):
+    def test_timeout_killpg_kills_whole_group_and_raises(self):
         # a sleeping child plus a tiny timeout: TimeoutExpired with the
-        # same shape callers see today, and no orphan left behind
-        marker = 'omarchy-sleep-marker'
-        code = f'import time; print("{marker}", flush=True); time.sleep(60)'
+        # same shape callers see today — and the WHOLE process group dies.
+        # The child (its own group leader via start_new_session) spawns a
+        # grandchild on DEVNULL stdio (so it holds no pipe fds and cannot
+        # stall the stream teardown) and records the pgid; run_command
+        # kills via os.killpg, so after the timeout no group member may
+        # survive. A regression to a plain proc.kill() would orphan the
+        # grandchild and make the killpg(0) liveness probe below succeed
+        # instead of raising.
+        fd, pgid_file = tempfile.mkstemp(prefix='killpg-probe-')
+        os.close(fd)
+        self.addCleanup(os.unlink, pgid_file)
+        code = (
+            'import os, subprocess, sys, time\n'
+            'gc = subprocess.Popen(\n'
+            '    [sys.executable, "-c", "import time; time.sleep(10)"],\n'
+            '    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n'
+            '    stderr=subprocess.DEVNULL)\n'
+            f'open({pgid_file!r}, "w").write(str(os.getpgrp()))\n'
+            'time.sleep(30)\n'
+        )
         start = time.monotonic()
         with self.assertRaises(subprocess.TimeoutExpired):
             utils.run_command([sys.executable, '-c', code], timeout=2)
         self.assertLess(time.monotonic() - start, 30)
 
-        # no orphan: the killed process must be gone (allow the kernel a
-        # moment to finish the reap)
+        # no orphan in the group: allow the kernel a moment to finish the
+        # SIGKILL reap, then the group must be gone entirely
         time.sleep(0.3)
-        ps = subprocess.run(['ps', '-eo', 'args'], stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL)
-        self.assertNotIn(marker.encode(), ps.stdout)
+        with open(pgid_file) as f:
+            pgid = int(f.read())
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(pgid, 0)
 
 
 if __name__ == '__main__':

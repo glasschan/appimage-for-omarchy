@@ -57,9 +57,9 @@ REQUIRED_SCENARIOS = [
     ('QML/backend output-stream bound (overflow)',
      [{'overflow'}], True),
     ('download / metadata byte caps',
-     [{'oversize'}, {'over_cap'}, {'byte'}], False),
-    ('process-group cleanup (no orphaned children)',
-     [{'kill'}, {'orphan'}, {'killpg'}], False),
+     [{'oversize'}, {'over_cap'}, {'max_size'}], False),
+    ('process-group cleanup: killpg reaps grandchildren, no orphans',
+     [{'killpg'}, {'process_group'}], False),
     ('env kill switch stays dead (no ALLOW_LOCAL re-entry)',
      [{'allow_local'}, {'environ'}, {'env_var'}], False),
 ]

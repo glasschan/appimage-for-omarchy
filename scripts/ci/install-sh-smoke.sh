@@ -113,10 +113,32 @@ SHIM
 # Fake running shell: argv[0] renamed so install.sh's stop block
 # (pgrep/pkill -f on the quickshell pattern) actually fires. Lives in a
 # script file so the pattern never appears in any process command line.
+#
+# The TERM handler is the stop-BEFORE-swap witness (P1: the pkill itself is
+# invisible to the shim log): when the shell is stopped correctly, the swap
+# has not happened yet and $DEST/canary.txt is still the OLD tree. If the
+# canary is already gone, the swap ran while the shell was up — the
+# quickshell #972 hazard — and SWAP_VIOLATION is recorded. `wait` (not a
+# foreground sleep) is what makes the trap run the moment TERM arrives.
 make_fake_shell() {
   cat > "$SBX/fake-shell" <<FAKE
 #!/bin/bash
-exec -a '$QS_PAT' sleep 30
+# Re-exec with the real quickshell command line so pgrep/pkill -f can
+# find it (same pid, argv[0] replaced).
+if [[ "\${1:-}" != "--started" ]]; then
+  exec -a "$QS_PAT" bash "\$0" --started
+fi
+trap '
+  kill "\${SLEEP_PID:-0}" 2>/dev/null
+  [[ -e "$DEST/canary.txt" ]] || touch "$SWAP_VIOLATION"
+  touch "$SHELL_STOPPED"
+  exit 0
+' TERM
+while :; do
+  sleep 3600 &
+  SLEEP_PID=\$!
+  wait "\$SLEEP_PID"
+done
 FAKE
   chmod +x "$SBX/fake-shell"
 }
@@ -127,6 +149,8 @@ new_sandbox() {
   LOG="$SBX/shim.log"
   : > "$LOG"
   DEST="$SBX/home/.config/omarchy/plugins/$PLUGIN_ID"
+  SHELL_STOPPED="$SBX/shell-stopped"
+  SWAP_VIOLATION="$SBX/swap-while-shell-up"
   make_shim
   make_fake_shell
 }
@@ -187,6 +211,17 @@ $events"
 
 restart_count() { grep -c '^restart shell$' -- "$LOG" || true; }
 
+# Stop-BEFORE-swap pin (P1): the shell must have been stopped (marker), and
+# it must have been stopped while the old tree was still live at DEST — the
+# fake shell's TERM handler records a violation if it observed the swap
+# already done. Catches a stop block moved after the swap or removed.
+assert_stop_before_swap() {
+  [[ -f "$SHELL_STOPPED" ]] ||
+    die "$1: shell was never stopped (no shell-stopped marker)"
+  [[ ! -e "$SWAP_VIOLATION" ]] ||
+    die "$1: SWAP HAPPENED WHILE THE SHELL WAS UP — the quickshell stop block must run BEFORE the swap"
+}
+
 # --- Scenarios. --------------------------------------------------------------
 GATE_FAIL_DEST=""
 GATE_FAIL_RESTART=""
@@ -210,9 +245,10 @@ cmp -s "$DEST/manifest.json" "$REPO_ROOT/manifest.json" ||
   die "scenario 1: old canary.txt still present — old tree was not swapped out"
 [[ "$(dot_dirs_left)" == "0" ]] ||
   die "scenario 1: leftover staging/.old dot-dirs: $(dot_dirs_left)"
+assert_stop_before_swap "scenario 1"
 ! shell_alive ||
   die "scenario 1: fake shell still alive — install.sh never stopped it"
-printf 'PASS: scenario 1 — happy path: validate staging, validate DEST, restart; old tree swapped out; dot-dirs cleaned\n'
+printf 'PASS: scenario 1 — happy path: validate staging, stop shell, swap, validate DEST, restart; old tree swapped out; dot-dirs cleaned\n'
 
 # Scenario 2: staging validation fails — nothing is touched, shell keeps running.
 new_sandbox pre-swap-gate
@@ -235,6 +271,8 @@ $(cat -- "$LOG")"
   die "scenario 2: DEST was modified although staging failed validation"
 [[ "$(dot_dirs_left)" == "0" ]] ||
   die "scenario 2: leftover staging dot-dirs after abort: $(dot_dirs_left)"
+[[ ! -e "$SHELL_STOPPED" ]] ||
+  die "scenario 2: the shell was stopped although staging failed validation"
 shell_alive ||
   die "scenario 2: fake shell is dead — the shell must not be stopped before staging validates"
 printf 'PASS: scenario 2 — staging validation failure: exit non-zero, DEST untouched, shell never stopped\n'
@@ -256,6 +294,7 @@ $(cat -- "$LOG")"
   die "scenario 3: old tree not restored after failed DEST validation"
 [[ "$(dot_dirs_left)" == "0" ]] ||
   die "scenario 3: leftover dot-dirs after rollback: $(dot_dirs_left)"
+assert_stop_before_swap "scenario 3"
 printf 'PASS: scenario 3 — post-swap validation failure: old tree restored at DEST, rollback restart attempted\n'
 
 # Scenario 4: restart fails — old tree restored after two restart attempts.
@@ -275,6 +314,7 @@ $(cat -- "$LOG")"
   die "scenario 4: old tree not restored after failed restart"
 [[ "$(dot_dirs_left)" == "0" ]] ||
   die "scenario 4: leftover dot-dirs after rollback: $(dot_dirs_left)"
+assert_stop_before_swap "scenario 4"
 printf 'PASS: scenario 4 — restart failure: old tree restored, exactly two restart attempts\n'
 
 printf 'install-sh-smoke: PASS (4 scenarios)\n'
