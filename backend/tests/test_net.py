@@ -1,24 +1,29 @@
 # test_net.py — hardened transport tests (SSRF guard, byte caps,
-# redirect validation). Hermetic: no external network.
+# redirect validation, absolute deadlines). Hermetic: no external network.
 #
 # Derived from GearLever (c) mijorus, GPL-3.0. Test suite written for
 # this plugin; integration behaviour verified against GearLever upstream.
 #
 # The production guard rejects loopback http.server fixtures (private
-# address, plain http), so tests open net.py's single seam
-# (net._TEST_ALLOW_LOCAL) for requests that must reach them; guard
-# behaviour itself is tested with the seam OFF.
+# address, plain http), so tests open net.py's single test-only seam
+# (net._ALLOW_LOCAL_FOR_TESTS, patched with mock.patch.object — there is
+# deliberately no environment variable; round 2 removed it) for requests
+# that must reach them; guard behaviour itself is tested with the seam
+# OFF.
 
 import email.message
 import os
 import socket
+import subprocess
+import sys
 import threading
+import time
 import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from helpers import FakeXDGTestCase
+from helpers import BACKEND_DIR, FakeXDGTestCase
 
 from omarchy_appimage import net
 
@@ -121,7 +126,7 @@ class LocalServerTests(FakeXDGTestCase):
 
     def setUp(self):
         super().setUp()
-        seam = mock.patch.object(net, '_TEST_ALLOW_LOCAL', True)
+        seam = mock.patch.object(net, '_ALLOW_LOCAL_FOR_TESTS', True)
         seam.start()
         self.addCleanup(seam.stop)
 
@@ -199,6 +204,162 @@ class LocalServerTests(FakeXDGTestCase):
         self.assertEqual(done, len(body))
         with open(dest, 'rb') as f:
             self.assertEqual(f.read(), body)
+
+
+class EnvKillSwitchTests(unittest.TestCase):
+    """Round 2: the old OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP environment
+    kill switch is gone — an inherited environment must not be able to
+    open the transport guards (tests patch net._ALLOW_LOCAL_FOR_TESTS
+    with mock.patch.object instead). Proven in a fresh interpreter with
+    the variable set."""
+
+    def test_env_var_is_dead_in_a_fresh_process(self):
+        child = (
+            'import sys\n'
+            f'sys.path.insert(0, {BACKEND_DIR!r})\n'
+            'from omarchy_appimage import net\n'
+            'assert net._ALLOW_LOCAL_FOR_TESTS is False, \\\n'
+            '    "seam opened: %r" % net._ALLOW_LOCAL_FOR_TESTS\n'
+            'try:\n'
+            '    net.validate_remote_host("127.0.0.1")\n'
+            'except net.NetworkError:\n'
+            '    print("GUARDS-UP")\n'
+            'else:\n'
+            '    raise SystemExit("loopback accepted despite the guard")\n'
+        )
+        env = dict(os.environ)
+        env['OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP'] = '1'
+        result = subprocess.run(
+            [sys.executable, '-B', '-c', child], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('GUARDS-UP', result.stdout)
+
+
+class _TrickleHandler(BaseHTTPRequestHandler):
+    """Writes `chunk_size` bytes every `interval` seconds (no
+    Content-Length: close-delimited), capped at `max_chunks` — a steady
+    slow drip whose individual reads all finish quickly but whose total
+    runs into the absolute whole-operation deadline."""
+    chunk_size = 65536
+    interval = 0.05
+    max_chunks = 200
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        try:
+            for _ in range(type(self).max_chunks):
+                self.wfile.write(b'x' * type(self).chunk_size)
+                self.wfile.flush()
+                time.sleep(type(self).interval)
+        except OSError:
+            pass  # the client gave up (deadline); stop dripping
+
+    def log_message(self, format, *args):  # silence the test output
+        pass
+
+
+class _StallHandler(BaseHTTPRequestHandler):
+    """Sends one byte, then stalls longer than the client's timeout —
+    the per-read stall guard must abort."""
+    stall = 2.5
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        try:
+            self.wfile.write(b'x')
+            self.wfile.flush()
+            time.sleep(type(self).stall)
+            self.wfile.write(b'y')
+        except OSError:
+            pass
+
+    def log_message(self, format, *args):  # silence the test output
+        pass
+
+
+class DeadlineTests(FakeXDGTestCase):
+    """Round-2 hardening: timeouts are whole-operation absolute
+    deadlines, not only per-socket-operation stall guards (seam ON for
+    the loopback fixtures; every test aborts in well under 5s)."""
+
+    def setUp(self):
+        super().setUp()
+        seam = mock.patch.object(net, '_ALLOW_LOCAL_FOR_TESTS', True)
+        seam.start()
+        self.addCleanup(seam.stop)
+        self._servers = []
+        self._threads = []
+        self.addCleanup(self._close_servers)
+
+    def _close_servers(self):
+        for server in self._servers:
+            server.shutdown()
+            server.server_close()
+        for thread in self._threads:
+            thread.join(timeout=5)
+
+    def _serve(self, handler_cls) -> str:
+        server = ThreadingHTTPServer(('127.0.0.1', 0), handler_cls)
+        self._servers.append(server)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self._threads.append(thread)
+        host, port = server.server_address[:2]
+        return f'http://{host}:{port}/f.appimage'
+
+    def test_spent_budget_raises(self):
+        # the absolute-deadline primitive itself: a budget that started
+        # in the past raises (deterministic half of the trickle tests,
+        # whose final read can race the armed socket timeout)
+        with self.assertRaises(net.NetworkError) as caught:
+            net._remaining_or_raise('https://x/f', time.monotonic() - 10,
+                                    5, 'request')
+        self.assertIn('deadline exceeded', str(caught.exception))
+        self.assertGreater(
+            net._remaining_or_raise('https://x/f', time.monotonic(), 5,
+                                    'request'), 0)
+
+    def test_fetch_text_slow_drip_hits_deadline(self):
+        url = self._serve(_TrickleHandler)
+        start = time.monotonic()
+        with self.assertRaises(net.NetworkError):
+            net.fetch_text(url, timeout=1)
+        self.assertLess(time.monotonic() - start, 5)
+
+    def test_fetch_text_stall_aborts(self):
+        url = self._serve(_StallHandler)
+        start = time.monotonic()
+        with self.assertRaises(net.NetworkError):
+            net.fetch_text(url, timeout=1)
+        self.assertLess(time.monotonic() - start, 5)
+
+    def test_download_deadline_exceeded_no_partial_file(self):
+        # download reads come in 1 MiB chunks: pace the trickle to the
+        # read size so each read completes quickly while the total runs
+        # into the absolute download deadline
+        url = self._serve(type('T', (_TrickleHandler,),
+                               {'chunk_size': 1 << 20, 'interval': 0.05,
+                                'max_chunks': 100}))
+        dest = os.path.join(self.sandbox, 'slow.appimage')
+        start = time.monotonic()
+        with self.assertRaises(net.NetworkError):
+            net.download_to_file(url, dest, timeout=30, deadline=1)
+        self.assertLess(time.monotonic() - start, 5)
+        # the partial artifact was cleaned up
+        self.assertFalse(os.path.exists(dest))
+
+    def test_download_stall_aborts_no_partial_file(self):
+        url = self._serve(_StallHandler)
+        dest = os.path.join(self.sandbox, 'stalled.appimage')
+        start = time.monotonic()
+        with self.assertRaises(net.NetworkError):
+            net.download_to_file(url, dest, timeout=1)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertFalse(os.path.exists(dest))
 
 
 class RedirectValidationTests(unittest.TestCase):

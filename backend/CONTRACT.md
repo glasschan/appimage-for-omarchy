@@ -108,6 +108,12 @@ Downloads the new release through the app's update source and installs it.
 - Availability check says "definitely up to date": exit 0, result
   `up-to-date`. An indeterminate state (network error, no matching asset —
   tri-state `None`) still attempts the download, like a `True` result.
+- Authenticity policy (v0.4.2): installation only proceeds for sources
+  that expose a cryptographic digest (GitHub asset digest, zsync SHA-1
+  control-file line). A source without one (plain static URL, GitLab,
+  Codeberg, Forgejo) fails the download with a clear refusal message —
+  exit 1, error document — even though the availability check may still
+  report the update.
 - `--keep-both` installs the new release next to the old one (KEEP logic,
   version-suffixed filename); default replaces in place (REPLACE, same
   filename + desktop id, so the app-menu entry stays valid).
@@ -185,9 +191,11 @@ The available update managers and the config keys each accepts.
 
 Update-source semantics (ported from GearLever): `repo_filename` is a glob
 matched against release asset names; when several assets match, the local
-architecture is preferred; for GitHub, a `sha256:` asset digest is compared
-against the local file when present, otherwise the size; `.zsync` assets use
-the control file's `SHA-1:` line. The FTP updater is **not ported** (P2).
+architecture is preferred; for GitHub, a `sha256:` asset digest is
+compared against the local file when present (otherwise the size —
+availability stays informative either way, only installation demands a
+digest); `.zsync` sources use the control file's `SHA-1:` line. The FTP
+updater is **not ported** (P2).
 
 ### `--fetch-updates [--json]`
 
@@ -276,11 +284,36 @@ Real example output:
 - **Byte caps** — metadata responses are capped at 4 MiB, downloads at
   4 GiB; caps are enforced against Content-Length *and* the running body
   size mid-stream. A failed download never leaves a partial file behind.
-- **Digest verification ladder** — every downloaded update is verified
-  before installation: zsync `SHA-1:` control-file line, GitHub `sha256:`
-  asset digest, or advertised-size equality (GitLab HEAD content-length,
-  Gitea asset size) depending on what the source exposes. A verification
-  failure raises an error and the partial artifact is removed.
+- **Absolute deadlines** — request timeouts are whole-operation
+  wall-clock budgets, not just per-socket-operation stall guards:
+  metadata requests get one absolute budget (20 s), downloads get a
+  per-read stall guard (30 s) plus an absolute deadline of 1 h, so a
+  slow-drip server cannot keep a request or a multi-GiB transfer alive
+  indefinitely.
+- **Mandatory digest verification (fail closed)** — an artifact is only
+  installed after verifying it against a publisher-attested
+  *cryptographic* digest; advertised-size equality alone never
+  authorizes an install:
+  - *GitHub* — the release asset's `sha256:<64 hex>` digest is
+    **required**; a missing or malformed digest refuses before any byte
+    is downloaded. When the embedded `gh-releases-zsync` flow selected a
+    `.zsync` twin, the control file's `SHA-1:` line is additionally
+    cross-checked.
+  - *zsync static sources* — installable only through a `.zsync` control
+    file with a `SHA-1:` line (the AppImageSpec's publisher-attested
+    binding for the target artifact). SHA-1 rationale: the control file
+    is published by the same party as the artifact, so a collision
+    attack requires publisher cooperation — which would equally defeat
+    any digest scheme, sha256 included (the publisher also controls the
+    release metadata). The binding's security rests on second-preimage
+    resistance, against which SHA-1 remains unbroken; no such claim is
+    made for sizes.
+  - *Plain static URLs, GitLab, Codeberg, Forgejo* — these sources
+    expose no digest metadata, so installation **refuses outright**
+    (no download is attempted). The tri-state availability checks stay
+    fully informative; only installation fails closed.
+  A verification failure raises an error and the partial artifact is
+  removed.
 - **Atomic install** — the AppImage and its icon are written through an
   exclusive mkstemp descriptor next to their destination, fchmod'd,
   fsync'd, then `os.replace()`d into place; a planted symlink or FIFO at

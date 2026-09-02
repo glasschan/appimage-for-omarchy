@@ -32,9 +32,10 @@ class UpdaterTestCase(FakeXDGTestCase):
     def setUp(self):
         super().setUp()
         # the loopback fixture servers are plain http on a private
-        # address: open net.py's test seam for the duration of each test
-        # (production paths keep the guard on)
-        seam = mock.patch.object(net, '_TEST_ALLOW_LOCAL', True)
+        # address: open net.py's test-only seam for the duration of each
+        # test (production paths keep the guard on; there is no
+        # environment variable — round 2 removed it)
+        seam = mock.patch.object(net, '_ALLOW_LOCAL_FOR_TESTS', True)
         seam.start()
         self.addCleanup(seam.stop)
         self._servers = []
@@ -131,22 +132,70 @@ class StaticFileUpdaterTests(UpdaterTestCase):
                                     + server.url('/f.appimage.zsync'))
         self.assertIsNone(manager.is_update_available())
 
-    def test_download_writes_served_bytes(self):
-        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02' + b'download' * 10
+    def test_download_plain_url_refuses_without_downloading(self):
+        # round 2, fail closed: a plain static URL exposes no digest, so
+        # download() refuses BEFORE downloading anything
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02plain'
         server = self.serve({'/f.appimage': (200, {}, body)})
         el = self.make_el()
         manager = StaticFileUpdater(el=el)
         self.set_source(el, 'StaticFileUpdater',
                         {'url': server.url('/f.appimage')})
 
-        dest_dir = os.path.join(self.sandbox, 'dl')
+        dest_dir = os.path.join(self.sandbox, 'dl-plain')
         os.makedirs(dest_dir)
-        fractions = []
-        dest = manager.download(dest_dir, progress_cb=fractions.append)
-        self.assertEqual(os.path.basename(dest), 'update.appimage')
-        with open(dest, 'rb') as f:
-            self.assertEqual(f.read(), body)
-        self.assertTrue(fractions)  # progress was reported
+        progress = mock.Mock()
+        with mock.patch.object(net, 'download_to_file') as m_dl:
+            with self.assertRaises(UpdateError) as caught:
+                manager.download(dest_dir, progress_cb=progress)
+        self.assertIn('no cryptographic digest', str(caught.exception))
+        self.assertIn('static URL sources', str(caught.exception))
+        m_dl.assert_not_called()          # nothing was downloaded
+        progress.assert_not_called()
+        self.assertEqual(os.listdir(dest_dir), [])  # no artifact written
+
+    def test_download_matching_size_still_refuses(self):
+        # a HEAD content-length that matches the artifact does not
+        # authorize an install either — the refusal is unconditional
+        # (round 1's size fallback is gone)
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02short'
+        server = self.serve({'/f.appimage': (200, {}, body)})
+        el = self.make_el()
+        manager = StaticFileUpdater(el=el)
+        self.set_source(el, 'StaticFileUpdater',
+                        {'url': server.url('/f.appimage')})
+
+        dest_dir = os.path.join(self.sandbox, 'dl-size')
+        os.makedirs(dest_dir)
+        with mock.patch.object(net, 'head_headers',
+                               return_value={'content-length':
+                                             str(len(body))}):
+            with self.assertRaises(UpdateError):
+                manager.download(dest_dir)
+        self.assertEqual(os.listdir(dest_dir), [])
+
+    def test_download_zsync_without_sha1_fails_closed(self):
+        # round 2, fail closed: a zsync control file without a SHA-1
+        # line has no cryptographic binding — the size fallback from
+        # round 1 is gone, and the target is never downloaded
+        body = b'zsync-no-sha1-body'
+        header = 'zsync: 0.6.2\nFilename: f.appimage\n\n[x]'
+        server = self.serve({
+            '/f.appimage.zsync': (200, {}, header.encode()),
+            '/f.appimage': (200, {}, body),
+        })
+        el = self.make_el()
+        manager = StaticFileUpdater(el=el, embedded='zsync|'
+                                    + server.url('/f.appimage.zsync'))
+
+        dest_dir = os.path.join(self.sandbox, 'dl-zsync-nosha1')
+        os.makedirs(dest_dir)
+        with mock.patch.object(net, 'download_to_file') as m_dl:
+            with self.assertRaises(UpdateError) as caught:
+                manager.download(dest_dir)
+        self.assertIn('no SHA-1 line', str(caught.exception))
+        m_dl.assert_not_called()          # target never downloaded
+        self.assertEqual(os.listdir(dest_dir), [])
 
     def test_download_resolves_absolute_zsync_url(self):
         body = b'appimage-bytes'
@@ -217,7 +266,7 @@ class StaticFileUpdaterTests(UpdaterTestCase):
         # sources are rejected by validation); the seam is forced OFF
         # here — UpdaterTestCase opens it only for the fixture servers
         manager = StaticFileUpdater(el=None)
-        with mock.patch.object(net, '_TEST_ALLOW_LOCAL', False):
+        with mock.patch.object(net, '_ALLOW_LOCAL_FOR_TESTS', False):
             with self.assertRaises(UpdateError):
                 manager.validate_config({'url': 'http://host/f.appimage'})
 
@@ -239,56 +288,6 @@ class StaticFileUpdaterTests(UpdaterTestCase):
         with self.assertRaises(UpdateError):
             manager.download(dest_dir)
         self.assertFalse(os.path.exists(dest))  # partial artifact removed
-
-    def test_download_advertised_size_mismatch_raises_and_unlinks(self):
-        # plain configured URL: a HEAD content-length that differs from
-        # the artifact must fail the download (no digest to check here)
-        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02short'
-        server = self.serve({'/f.appimage': (200, {}, body)})
-        el = self.make_el()
-        manager = StaticFileUpdater(el=el)
-        self.set_source(el, 'StaticFileUpdater',
-                        {'url': server.url('/f.appimage')})
-
-        dest_dir = os.path.join(self.sandbox, 'dl-size')
-        os.makedirs(dest_dir)
-        dest = os.path.join(dest_dir, 'update.appimage')
-        with mock.patch.object(net, 'head_headers',
-                               return_value={'content-length': '9999'}):
-            with self.assertRaises(UpdateError):
-                manager.download(dest_dir)
-        self.assertFalse(os.path.exists(dest))
-
-    def test_download_zsync_without_sha1_falls_back_to_advertised_size(self):
-        # a zsync control file without a SHA-1 line still verifies:
-        # advertised-size equality is enforced instead
-        body = b'zsync-no-sha1-body'
-        header = 'zsync: 0.6.2\nFilename: f.appimage\n\n[x]'
-        server = self.serve({
-            '/f.appimage.zsync': (200, {}, header.encode()),
-            '/f.appimage': (200, {}, body),
-        })
-        el = self.make_el()
-        manager = StaticFileUpdater(el=el, embedded='zsync|'
-                                    + server.url('/f.appimage.zsync'))
-
-        dest_dir = os.path.join(self.sandbox, 'dl-zsync-nosha1')
-        os.makedirs(dest_dir)
-        dest = os.path.join(dest_dir, 'update.appimage')
-        with mock.patch.object(net, 'head_headers',
-                               return_value={'content-length': '9999'}):
-            with self.assertRaises(UpdateError):
-                manager.download(dest_dir)
-        self.assertFalse(os.path.exists(dest))
-
-        # a matching advertised size passes (HEAD lies here, so the
-        # mismatch above is the binding; this asserts the fallback does
-        # not reject a consistent download)
-        with mock.patch.object(net, 'head_headers',
-                               return_value={'content-length':
-                                             str(len(body))}):
-            dest = manager.download(dest_dir)
-        self.assertTrue(os.path.exists(dest))
 
     def test_garbage_content_length_header_is_ignored(self):
         # a garbage Content-Length must not crash the size check
@@ -526,9 +525,10 @@ class GithubUpdaterTests(UpdaterTestCase):
             dest = manager.download(dest_dir)
         self.assertTrue(os.path.exists(dest))
 
-    def test_download_null_digest_is_skipped(self):
-        # GitHub's API can return a null digest: it must be ignored like
-        # the availability check does, not crash the download
+    def test_download_missing_digest_refuses_before_download(self):
+        # round 2, fail closed: the asset's sha256 digest is required.
+        # The API may return a null digest — it must refuse BEFORE any
+        # byte is downloaded, not fall through to size-only acceptance.
         body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02asset-bytes'
         manager, _el, patches = self._download_github(
             {'digest': None, 'size': len(body)}, body)
@@ -538,14 +538,37 @@ class GithubUpdaterTests(UpdaterTestCase):
         with contextlib.ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
-            dest = manager.download(dest_dir)
-        self.assertTrue(os.path.exists(dest))
+            with mock.patch.object(net, 'download_to_file') as m_dl:
+                with self.assertRaises(UpdateError) as caught:
+                    manager.download(dest_dir, progress_cb=mock.Mock())
+        self.assertIn('no sha256 digest', str(caught.exception))
+        m_dl.assert_not_called()          # nothing was downloaded
+        self.assertEqual(os.listdir(dest_dir), [])  # no artifact written
+
+    def test_download_malformed_digest_refuses(self):
+        # a digest that does not match sha256:<64 hex> is as good as none
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02asset-bytes'
+        manager, _el, patches = self._download_github(
+            {'digest': 'sha256:not-a-digest', 'size': len(body)}, body)
+
+        dest_dir = os.path.join(self.sandbox, 'gh-digest-bad')
+        os.makedirs(dest_dir)
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            with mock.patch.object(net, 'download_to_file') as m_dl:
+                with self.assertRaises(UpdateError) as caught:
+                    manager.download(dest_dir)
+        self.assertIn('no sha256 digest', str(caught.exception))
+        m_dl.assert_not_called()
+        self.assertEqual(os.listdir(dest_dir), [])
 
     def test_download_zsync_sha1_mismatch_raises_and_unlinks(self):
         body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02zsync-bytes'
         embedded = 'gh-releases-zsync|owner|repo|latest|Foo-*.appimage.zsync'
+        digest = 'sha256:' + hashlib.sha256(body).hexdigest()
         manager, _el, patches = self._download_github(
-            {'size': 0}, body, embedded=embedded,
+            {'digest': digest, 'size': 0}, body, embedded=embedded,
             fetch_text_value=zsync_body('', 'e' * 40).decode())
 
         dest_dir = os.path.join(self.sandbox, 'gh-zsync')
@@ -557,9 +580,35 @@ class GithubUpdaterTests(UpdaterTestCase):
             manager.download(dest_dir)
         self.assertFalse(os.path.exists(dest))
 
+    def test_download_zsync_sha1_cross_check_passes(self):
+        # belt and braces: the embedded flow verifies the digest AND the
+        # zsync control file's SHA-1 for the same artifact
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02zsync-ok'
+        embedded = 'gh-releases-zsync|owner|repo|latest|Foo-*.appimage.zsync'
+        digest = 'sha256:' + hashlib.sha256(body).hexdigest()
+        manager, _el, patches = self._download_github(
+            {'digest': digest, 'size': 0}, body, embedded=embedded,
+            fetch_text_value=zsync_body(
+                '', hashlib.sha1(body).hexdigest()).decode())
+
+        dest_dir = os.path.join(self.sandbox, 'gh-zsync-ok')
+        os.makedirs(dest_dir)
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            dest = manager.download(dest_dir)
+        self.assertTrue(os.path.exists(dest))
+        with open(dest, 'rb') as f:
+            self.assertEqual(f.read(), body)
+
     def test_download_size_mismatch_raises_and_unlinks(self):
+        # size is no longer an authenticity binding, but a mismatch with
+        # the advertised size still means metadata and artifact disagree
+        # (cross-check on top of a verified digest)
         body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02sized'
-        manager, _el, patches = self._download_github({'size': 9999}, body)
+        digest = 'sha256:' + hashlib.sha256(body).hexdigest()
+        manager, _el, patches = self._download_github(
+            {'digest': digest, 'size': 9999}, body)
 
         dest_dir = os.path.join(self.sandbox, 'gh-size')
         os.makedirs(dest_dir)
@@ -626,50 +675,57 @@ class OtherManagerTests(UpdaterTestCase):
             manager = CodebergUpdater(el=el)
             self.assertIs(manager.is_update_available(), True)
 
-    def test_gitlab_download_size_mismatch_raises_and_unlinks(self):
-        # the GitLab API exposes no digests: advertised-size equality is
-        # enforced at download time
-        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02gitlab'
-        server = self.serve({'/Foo': (200, {}, body)})
+    def test_gitlab_download_refuses_without_digest(self):
+        # round 2, fail closed: the GitLab API exposes no digests, so
+        # installation refuses outright (nothing is downloaded); the
+        # tri-state availability check above stays fully informative
         el = self.make_el()
         self.set_source(el, 'GitlabUpdater',
                         {'repo_url': 'https://gitlab.com/owner/project',
                          'repo_filename': 'Foo*'})
-        releases = [{'tag_name': 'v9',
-                     'assets': {'links': [{
-                         'name': 'Foo-1.0.appimage',
-                         'direct_asset_url': server.url('/Foo')}]}}]
 
-        dest_dir = os.path.join(self.sandbox, 'gl-size')
+        dest_dir = os.path.join(self.sandbox, 'gl-refuse')
         os.makedirs(dest_dir)
-        dest = os.path.join(dest_dir, 'update.appimage')
-        with mock.patch.object(net, 'fetch_json', return_value=releases), \
-                mock.patch.object(net, 'head_headers',
-                                  return_value={'content-length': '9999'}):
-            manager = GitlabUpdater(el=el)
-            with self.assertRaises(UpdateError):
-                manager.download(dest_dir)
-        self.assertFalse(os.path.exists(dest))
+        with mock.patch.object(net, 'download_to_file') as m_dl:
+            with self.assertRaises(UpdateError) as caught:
+                GitlabUpdater(el=el).download(dest_dir)
+        self.assertIn('Gitlab', str(caught.exception))
+        self.assertIn('no digest metadata', str(caught.exception))
+        m_dl.assert_not_called()
+        self.assertEqual(os.listdir(dest_dir), [])
 
-    def test_codeberg_download_size_mismatch_raises_and_unlinks(self):
-        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02gitea'
-        server = self.serve({'/Foo': (200, {}, body)})
+    def test_codeberg_download_refuses_without_digest(self):
         el = self.make_el()
         self.set_source(el, 'CodebergUpdater',
                         {'repo': 'owner/repo', 'repo_filename': 'Foo*',
                          'allow_prereleases': False})
-        releases = [{'tag_name': 'v1',
-                     'assets': [{'name': 'Foo-1.0.appimage', 'size': 9999,
-                                 'browser_download_url': server.url('/Foo')}]}]
 
-        dest_dir = os.path.join(self.sandbox, 'cb-size')
+        dest_dir = os.path.join(self.sandbox, 'cb-refuse')
         os.makedirs(dest_dir)
-        dest = os.path.join(dest_dir, 'update.appimage')
-        with mock.patch.object(net, 'fetch_json', return_value=releases):
-            manager = CodebergUpdater(el=el)
-            with self.assertRaises(UpdateError):
-                manager.download(dest_dir)
-        self.assertFalse(os.path.exists(dest))
+        with mock.patch.object(net, 'download_to_file') as m_dl:
+            with self.assertRaises(UpdateError) as caught:
+                CodebergUpdater(el=el).download(dest_dir)
+        self.assertIn('Codeberg', str(caught.exception))
+        self.assertIn('no digest metadata', str(caught.exception))
+        m_dl.assert_not_called()
+        self.assertEqual(os.listdir(dest_dir), [])
+
+    def test_forgejo_download_refuses_without_digest(self):
+        el = self.make_el()
+        self.set_source(el, 'ForgejoUpdater',
+                        {'repo_url': 'https://forge.example/owner/repo',
+                         'repo_filename': 'Foo*',
+                         'allow_prereleases': False})
+
+        dest_dir = os.path.join(self.sandbox, 'fj-refuse')
+        os.makedirs(dest_dir)
+        with mock.patch.object(net, 'download_to_file') as m_dl:
+            with self.assertRaises(UpdateError) as caught:
+                ForgejoUpdater(el=el).download(dest_dir)
+        self.assertIn('Forgejo', str(caught.exception))
+        self.assertIn('no digest metadata', str(caught.exception))
+        m_dl.assert_not_called()
+        self.assertEqual(os.listdir(dest_dir), [])
 
 
 # -------------------------------------------------- UpdateManagerChecker

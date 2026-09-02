@@ -29,7 +29,7 @@ DEFAULT_UPDATE_CHECK_DELAY = 5
 # the floor, matching the fastest sensible manual-refresh cadence).
 MIN_UPDATE_CHECK_INTERVAL = 15
 
-BACKEND_VERSION = '0.4.1'
+BACKEND_VERSION = '0.4.2'
 
 JSON_SCHEMA_VERSION = 1
 

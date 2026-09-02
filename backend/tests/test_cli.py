@@ -7,6 +7,7 @@
 # cmd_* functions in-process (with unittest.mock seams) instead of via the
 # main.py subprocess; everything else goes through the real CLI.
 
+import hashlib
 import io
 import json
 import os
@@ -403,8 +404,10 @@ class InProcessUpdateCliTests(InProcessCliMixin, FakeXDGTestCase):
     def setUp(self):
         super().setUp()
         # the loopback fixture servers are plain http on a private
-        # address: open net.py's test seam for the duration of each test
-        seam = mock.patch.object(net, '_TEST_ALLOW_LOCAL', True)
+        # address: open net.py's test-only seam for the duration of each
+        # test (there is deliberately no environment variable — round 2
+        # removed it)
+        seam = mock.patch.object(net, '_ALLOW_LOCAL_FOR_TESTS', True)
         seam.start()
         self.addCleanup(seam.stop)
 
@@ -754,10 +757,16 @@ class FixtureCliTests(FakeXDGTestCase):
         self.assertEqual(len(listed), 1)
 
 
-class UpdateFlowTests(FakeXDGTestCase):
-    """Full --update flow against the real fixture, served by a local
-    HTTP server as a 'new release' (same bytes + harmless appended
-    padding so the size check reports an update)."""
+class UpdateFlowTests(InProcessCliMixin, FakeXDGTestCase):
+    """Full --update flow against a real type-2 AppImage fixture, served
+    by a local HTTP server as a 'new release' (same bytes + harmless
+    appended padding so the availability check reports an update).
+
+    Round 2: the release is offered through a faked GitHub API response
+    carrying the asset's sha256 digest — installation refuses digest-less
+    sources now. The network-touching CLI calls run in-process so the
+    test-only seam (net._ALLOW_LOCAL_FOR_TESTS) covers them; the old
+    environment kill switch is gone."""
 
     def setUp(self):
         super().setUp()
@@ -767,12 +776,9 @@ class UpdateFlowTests(FakeXDGTestCase):
         self.fixture = fixture
         self.downloads = os.path.join(self.sandbox, 'downloads')
         os.makedirs(self.downloads, exist_ok=True)
-        # the update flow runs the real CLI in a subprocess against a
-        # loopback http server: open net.py's env-var test seam for the
-        # child processes (nothing in production ever sets this)
-        os.environ['OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP'] = '1'
-        self.addCleanup(os.environ.pop,
-                        'OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP', None)
+        seam = mock.patch.object(net, '_ALLOW_LOCAL_FOR_TESTS', True)
+        seam.start()
+        self.addCleanup(seam.stop)
 
     def _integrate_fixture(self) -> str:
         src = os.path.join(self.downloads, 'nvim.appimage')
@@ -795,6 +801,31 @@ class UpdateFlowTests(FakeXDGTestCase):
         self.addCleanup(server.close)
         return server.url('/' + name), body
 
+    def _set_github_source(self) -> None:
+        """A custom GithubUpdater source (wins over the fixture's
+        embedded gh-releases-zsync string)."""
+        out, err, code = self.run_cmd(
+            cli.cmd_set_update_source,
+            ['neovim', '--manager', 'GithubUpdater', 'repo=owner/repo',
+             'repo_filename=nvim-updated*.appimage',
+             'allow_prereleases=false', '--json'])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)['result'], 'set')
+
+    def _github_release_patch(self, url: str, body: bytes):
+        """A faked releases/latest API response whose single asset points
+        at the loopback server and carries the artifact's sha256 digest
+        (mandatory for installation since round 2)."""
+        release = {
+            'tag_name': 'v0.11.3', 'draft': False, 'prerelease': False,
+            'assets': [{
+                'name': 'nvim-updated.appimage', 'size': len(body),
+                'browser_download_url': url,
+                'digest': 'sha256:' + hashlib.sha256(body).hexdigest(),
+            }],
+        }
+        return mock.patch.object(net, 'fetch_json', return_value=release)
+
     def _state_path(self) -> str:
         return os.path.join(self.config_home, 'io.github.glasschan.appimage',
                             'updates-state.json')
@@ -802,28 +833,19 @@ class UpdateFlowTests(FakeXDGTestCase):
     def test_update_end_to_end(self):
         managed = self._integrate_fixture()
         url, body = self._serve_new_release(b'NEW-RELEASE-PADDING')
-
-        # custom static source (wins over the embedded gh-releases-zsync)
-        result = self.run_cli('--set-update-source', 'neovim',
-                              '--manager', 'StaticFileUpdater',
-                              f'url={url}', '--json')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload['result'], 'set')
-
-        payload = json.loads(self.run_cli('--list-installed', '--json').stdout)
-        self.assertEqual(payload['installed'][0]['manager'],
-                         'StaticFileUpdater')
-        self.assertFalse(payload['installed'][0]['embedded_source'])
+        self._set_github_source()
+        release = self._github_release_patch(url, body)
 
         # pre-seed a pending-notification marker like --fetch-updates would
         os.makedirs(os.path.dirname(self._state_path()), exist_ok=True)
         with open(self._state_path(), 'w') as f:
             json.dump({'neovim.desktop': 'v0.11.3|10996216'}, f)
 
-        result = self.run_cli('--update', 'neovim', '--yes', '--json')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
+        with release:
+            out, err, code = self.run_cmd(cli.cmd_update,
+                                          ['neovim', '--yes', '--json'])
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
         self.assertEqual(payload['result'], 'updated')
         self.assertEqual(payload['message'],
                          f'{managed} was updated successfully')
@@ -839,30 +861,33 @@ class UpdateFlowTests(FakeXDGTestCase):
         with open(self._state_path()) as f:
             self.assertEqual(json.load(f), {})
 
-        # app-menu consistency: one app left, same desktop id
-        payload = json.loads(self.run_cli('--list-installed', '--json').stdout)
+        # app-menu consistency: one app left, same desktop id, the custom
+        # source recorded
+        payload = json.loads(
+            self.run_cli('--list-installed', '--json').stdout)
         self.assertEqual(len(payload['installed']), 1)
         self.assertEqual(payload['installed'][0]['desktop_id'],
                          'neovim.desktop')
+        self.assertEqual(payload['installed'][0]['manager'], 'GithubUpdater')
 
-        # the served release is now installed -> up-to-date (exit 0)
-        result = self.run_cli('--update', 'neovim', '--yes', '--json')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)['result'], 'up-to-date')
+        # the served release is now installed -> up-to-date (exit 0):
+        # the asset digest matches the local file
+        with release:
+            out, err, code = self.run_cmd(cli.cmd_update,
+                                          ['neovim', '--yes', '--json'])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)['result'], 'up-to-date')
 
     def test_update_keep_both(self):
         managed = self._integrate_fixture()
         url, body = self._serve_new_release(b'KEEP-BOTH-PADDING')
+        self._set_github_source()
 
-        result = self.run_cli('--set-update-source', 'neovim',
-                              '--manager', 'StaticFileUpdater',
-                              f'url={url}', '--json')
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-        result = self.run_cli('--update', 'neovim', '--yes', '--keep-both',
-                              '--json')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
+        with self._github_release_patch(url, body):
+            out, err, code = self.run_cmd(
+                cli.cmd_update, ['neovim', '--yes', '--keep-both', '--json'])
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
         self.assertEqual(payload['result'], 'updated')
 
         # KEEP logic: the old appimage stays untouched, the new release
@@ -870,7 +895,8 @@ class UpdateFlowTests(FakeXDGTestCase):
         self.assertTrue(os.path.isfile(managed))
         with open(managed, 'rb') as f:
             self.assertNotEqual(f.read(), body)
-        payload = json.loads(self.run_cli('--list-installed', '--json').stdout)
+        payload = json.loads(
+            self.run_cli('--list-installed', '--json').stdout)
         self.assertEqual(len(payload['installed']), 2)
 
 

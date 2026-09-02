@@ -17,7 +17,11 @@
 #   * manual redirects — max 5 hops, each hop re-validated;
 #   * byte caps — metadata responses are capped at MAX_METADATA_BYTES,
 #     downloads at MAX_DOWNLOAD_BYTES (a running cap aborts mid-stream
-#     even when the server lies about or omits Content-Length).
+#     even when the server lies about or omits Content-Length);
+#   * absolute deadlines — timeouts are whole-operation wall-clock
+#     budgets, not just per-socket-operation stall guards: a slow-drip
+#     server cannot keep a request (or a multi-GiB download) alive
+#     indefinitely.
 
 import http.client
 import ipaddress
@@ -25,6 +29,7 @@ import json
 import logging
 import os
 import socket
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -36,6 +41,13 @@ USER_AGENT = (f'{constants.APP_ID}/{constants.BACKEND_VERSION} '
 
 DEFAULT_TIMEOUT = 20
 
+# A single stalled read on a download may outlive a metadata request's
+# whole budget, but must not hang forever either.
+DOWNLOAD_TIMEOUT = 30
+# Absolute wall-clock budget for one download: a slow-drip server must
+# not be able to keep a multi-GiB transfer alive indefinitely.
+DOWNLOAD_DEADLINE_SECONDS = 3600
+
 # Body caps: metadata responses (release JSON, zsync control files) are
 # tiny; AppImage downloads are the only legitimately large payloads.
 MAX_METADATA_BYTES = 4 * 1024 * 1024            # 4 MiB
@@ -44,19 +56,10 @@ MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024     # 4 GiB
 _MAX_REDIRECTS = 5
 _CHUNK = 64 * 1024
 
-# Test seam: the guard makes loopback http.server fixture servers
-# (http://127.0.0.1:port — plain http on a private address) unreachable.
-# In-process tests flip this module flag via unittest.mock; subprocess
-# tests can set OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP=1 in the environment.
-# Nothing in production ever sets either: with the seam off, BOTH
-# relaxations are inactive (https-only egress, public addresses only).
-_TEST_ALLOW_LOCAL = bool(os.environ.get('OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP'))
-if _TEST_ALLOW_LOCAL:
-    # loud so an accidentally exported variable never silences the guard
-    logging.warning(
-        '%s is set: the https-only and public-address transport guards '
-        'are DISABLED in this process (test seam — unset it outside the '
-        'test suite)', 'OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP')
+# Test-only seam: loopback/private targets for the loopback test servers.
+# NEVER set from the environment — tests patch this attribute directly
+# (mock.patch.object). Production processes cannot disable the guards.
+_ALLOW_LOCAL_FOR_TESTS = False
 
 # Small, fast endpoints used only to answer "is there a network at all"
 # (mirrors GearLever's lib/utils.check_internet).
@@ -76,7 +79,7 @@ def _addr_allowed(ip) -> bool:
     loopback, RFC1918, link-local, CGNAT, unspecified and reserved
     ranges; multicast is rejected explicitly (Python flags globally
     routed multicast scopes as is_global)."""
-    if _TEST_ALLOW_LOCAL:
+    if _ALLOW_LOCAL_FOR_TESTS:
         return True
     return ip.is_global and not ip.is_multicast
 
@@ -107,7 +110,7 @@ def _validate_url(url: str) -> None:
     addresses only (raises NetworkError)."""
     parts = urlsplit(url)
     if parts.scheme != 'https' \
-            and not (_TEST_ALLOW_LOCAL and parts.scheme == 'http'):
+            and not (_ALLOW_LOCAL_FOR_TESTS and parts.scheme == 'http'):
         raise NetworkError(f'{url}: only https:// URLs are allowed')
     if parts.username or parts.password:
         raise NetworkError(f'{url}: userinfo in URLs is not allowed')
@@ -214,22 +217,55 @@ def _unlink_quietly(path: str):
         pass
 
 
+def _remaining_or_raise(url: str, start: float, budget: float,
+                        what: str) -> float:
+    """Seconds left of an absolute `budget` (seconds) that started at
+    `start` (time.monotonic()); raises NetworkError once the budget is
+    spent. This is what makes timeouts whole-operation deadlines: a
+    slow-drip server that delivers each chunk just within the socket
+    timeout still runs out of budget here."""
+    remaining = budget - (time.monotonic() - start)
+    if remaining <= 0:
+        raise NetworkError(f'{url}: {what} deadline exceeded')
+    return remaining
+
+
+def _arm_socket(response, remaining: float) -> None:
+    """Cap the NEXT blocking read at `remaining` seconds so a single
+    socket operation cannot outrun the absolute deadline (best-effort:
+    degrades to the elapsed check alone if the stdlib's
+    response -> socket path ever changes)."""
+    fp = getattr(response, 'fp', None)
+    sock = getattr(getattr(fp, 'raw', None), '_sock', None)
+    if isinstance(sock, socket.socket):
+        try:
+            sock.settimeout(remaining)
+        except OSError:
+            pass
+
+
 def fetch_text(url: str, timeout: float = DEFAULT_TIMEOUT,
                max_bytes: int = MAX_METADATA_BYTES) -> str:
     """GET `url` and return the body as text (raises NetworkError).
 
     The body is capped at `max_bytes`: an over-long Content-Length is
     rejected before reading, a streamed/chunked body is cut off as soon
-    as the running total would exceed the cap."""
+    as the running total would exceed the cap. `timeout` is an absolute
+    deadline for the whole request (connect + headers + body), not a
+    per-socket-operation guard."""
+    chunks = []
+    total = 0
+    start = time.monotonic()
     try:
         with _open(url, timeout=timeout) as response:
             declared = _content_length(response)
             if declared is not None and declared > max_bytes:
                 raise NetworkError(f'{url}: response too large '
                                    f'({declared} > {max_bytes} bytes)')
-            chunks = []
-            total = 0
             while True:
+                _arm_socket(response,
+                            _remaining_or_raise(url, start, timeout,
+                                                'request'))
                 chunk = response.read(_CHUNK)
                 if not chunk:
                     break
@@ -262,7 +298,11 @@ def head_headers(url: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
     case-sensitive). Returns {} when both attempts fail."""
     for method in ('HEAD', 'GET'):
         try:
+            start = time.monotonic()
             with _open(url, method=method, timeout=timeout) as response:
+                # absolute deadline for the whole attempt (the socket
+                # timeout passed to _open bounds connect + headers)
+                _remaining_or_raise(url, start, timeout, 'request')
                 return {k.lower(): v
                         for k, v in response.headers.items()}
         except Exception as e:
@@ -271,16 +311,25 @@ def head_headers(url: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
 
 
 def download_to_file(url: str, dest_path: str, progress_cb=None,
-                     timeout: float = DEFAULT_TIMEOUT,
-                     max_bytes: int = MAX_DOWNLOAD_BYTES) -> int:
+                     timeout: float = DOWNLOAD_TIMEOUT,
+                     max_bytes: int = MAX_DOWNLOAD_BYTES,
+                     deadline: float = DOWNLOAD_DEADLINE_SECONDS) -> int:
     """Stream `url` to `dest_path` in 1 MiB chunks; returns the byte count.
+
+    Two independent time bounds: `timeout` is the per-read stall guard
+    (a single read that outlives it fails the download), `deadline` the
+    absolute wall-clock budget for the whole download — a slow-drip
+    server that never stalls long enough to trip the stall guard still
+    runs out of deadline.
 
     progress_cb(fraction) fires at most every ~1% with a value in [0, 1]
     (or not at all when the server sends no Content-Length). Raises
-    NetworkError on transport failure, a short body, or a body over
-    `max_bytes`; the partial `dest_path` is always removed on failure."""
+    NetworkError on transport failure, a short body, a body over
+    `max_bytes`, or a spent deadline; the partial `dest_path` is always
+    removed on failure."""
     done = 0
     declared = None
+    start = time.monotonic()
     try:
         with _open(url, timeout=timeout) as response:
             declared = _content_length(response)
@@ -291,6 +340,9 @@ def download_to_file(url: str, dest_path: str, progress_cb=None,
             with open(dest_path, 'wb') as out:
                 next_notify = 0.01
                 while True:
+                    remaining = _remaining_or_raise(url, start, deadline,
+                                                    'download')
+                    _arm_socket(response, min(timeout, remaining))
                     chunk = response.read(1 << 20)
                     if not chunk:
                         break

@@ -15,11 +15,28 @@
 #
 # Verification ladder (marketplace security-review hardening): every
 # download() must leave behind a *verified* artifact or raise UpdateError
-# (and unlink the partial temp file) — zsync SHA-1, GitHub sha256 asset
-# digest, or advertised-size equality, whichever the source exposes.
-# Sources that accept arbitrary hosts (GitLab/Forgejo) stay that way: any
-# *public* host is allowed, and the net.py SSRF guard is the transport
-# boundary — private/loopback targets are unreachable at dial time.
+# (and unlink the partial temp file) — cryptographic digests are
+# mandatory, advertised-size equality alone never authorizes an install:
+#   * GithubUpdater — the release asset's `sha256:<hex>` digest is
+#     required (refusing before any byte is downloaded when missing);
+#     the embedded zsync flow additionally cross-checks the control
+#     file's SHA-1;
+#   * StaticFileUpdater — installable only through a zsync control file
+#     with a SHA-1 line (the AppImageSpec's publisher-attested binding);
+#     plain static URLs and SHA-1-less control files refuse;
+#   * GitlabUpdater / CodebergUpdater / ForgejoUpdater — their release
+#     APIs expose no digests, so installation refuses outright (the
+#     tri-state availability checks stay fully informative).
+# SHA-1 rationale: in a zsync control file the digest is published by
+# the same publisher as the artifact, so a collision attack requires
+# publisher cooperation — which would equally defeat any digest scheme,
+# sha256 included (the publisher also controls the release metadata).
+# The binding's security therefore rests on second-preimage resistance,
+# against which SHA-1 remains unbroken; we do NOT extend this claim to
+# sizes. Sources that accept arbitrary hosts (GitLab/Forgejo) stay that
+# way: any *public* host is allowed, and the net.py SSRF guard is the
+# transport boundary — private/loopback targets are unreachable at dial
+# time.
 
 import fnmatch
 import logging
@@ -38,7 +55,8 @@ TRUE_VALUES = ('1', 'true', 'yes', 'on')
 
 class UpdateError(Exception):
     """Raised for invalid --set-update-source configurations and for a
-    downloaded update that failed verification (digest/size mismatch)."""
+    downloaded update that failed verification, or a source that exposes
+    no cryptographic digest at all (install-time refusals)."""
 
 
 def _unlink_quietly(path: str):
@@ -128,21 +146,15 @@ class UpdateManager():
                               f'check (expected {expected_hex}, got {actual})')
 
     def _verify_size(self, path: str, expected: int, source: str):
-        """The artifact must be exactly `expected` bytes (the download
-        itself already fails short bodies; this also catches an over-long
-        artifact when the server reported a size)."""
+        """The artifact must be exactly `expected` bytes. Size is never
+        an authenticity binding, but a mismatch with the size the source
+        advertised means the release metadata and the artifact disagree,
+        so it is still refused (used only as a cross-check on top of a
+        verified digest)."""
         actual = os.path.getsize(path)
         if actual != expected:
             raise UpdateError(f'Downloaded file has {actual} bytes but '
                               f'{source} advertised {expected}')
-
-    def _verify_advertised_size(self, url: str, path: str):
-        """Enforce size equality when a HEAD of `url` reported a length
-        (sources whose API exposes no digest: static URLs, GitLab)."""
-        headers = net.head_headers(url)
-        remote = _header_content_length(headers)
-        if remote > 0:
-            self._verify_size(path, remote, url)
 
     # ---- helpers ----------------------------------------------------------
 
@@ -174,9 +186,10 @@ class StaticFileUpdater(UpdateManager):
     def validate_config(self, config: dict):
         # https-only (marketplace review): plain http update sources are
         # rejected; the net.py transport would refuse them anyway. The
-        # test seam (net._TEST_ALLOW_LOCAL) also accepts http so the
-        # suite's loopback fixture servers can be configured end-to-end.
-        schemes = ('https://', 'http://') if net._TEST_ALLOW_LOCAL \
+        # test seam (net._ALLOW_LOCAL_FOR_TESTS) also accepts http so
+        # the suite's loopback fixture servers can be configured
+        # end-to-end.
+        schemes = ('https://', 'http://') if net._ALLOW_LOCAL_FOR_TESTS \
             else ('https://',)
         url = str(config.get('url', ''))
         if not url.startswith(schemes):
@@ -252,24 +265,36 @@ class StaticFileUpdater(UpdateManager):
 
     def download(self, dest_dir: str, progress_cb=None) -> str:
         url = self.get_config().get('url')
-        expected_sha1 = None
         e_url = self.get_embedded_url()
         if e_url:
-            url, expected_sha1 = self._fetch_zsync(e_url)
+            url = e_url
         if not url:
+            raise UpdateError('Missing download URL')
+
+        # Authenticity is mandatory (marketplace review round 2): a
+        # static source is only installable through a zsync control
+        # file, whose SHA-1 line is the AppImageSpec's publisher-attested
+        # binding for the target artifact. A plain static URL exposes no
+        # digest at all, so it is refused without downloading anything.
+        if not (e_url or url.endswith('.zsync')):
+            raise UpdateError('static URL sources provide no cryptographic '
+                              'digest; refusing to install an unverified '
+                              'artifact')
+
+        target_url, expected_sha1 = self._fetch_zsync(url)
+        if not expected_sha1:
+            # fail closed: without the control file's SHA-1 line there
+            # is nothing cryptographic to verify the artifact against
+            raise UpdateError(f'{url}: zsync control file has no SHA-1 '
+                              'line; refusing to install an unverified '
+                              'artifact')
+        if not target_url:
             raise UpdateError('Missing download URL')
 
         dest = os.path.join(dest_dir, 'update.appimage')
         try:
-            net.download_to_file(url, dest, progress_cb)
-            if expected_sha1:
-                self._verify_sha1(dest, expected_sha1)
-            else:
-                # no SHA-1 binding (plain configured URL, or a zsync
-                # control file without a SHA-1 line): fall back to
-                # enforcing the advertised size when the server
-                # reported one
-                self._verify_advertised_size(url, dest)
+            net.download_to_file(target_url, dest, progress_cb)
+            self._verify_sha1(dest, expected_sha1)
         except BaseException:
             _unlink_quietly(dest)
             raise
@@ -442,19 +467,27 @@ class GithubUpdater(UpdateManager):
             raise UpdateError(f'Missing target asset for {self.name}')
 
         asset = target_asset['asset']
+
+        # Authenticity is mandatory (marketplace review round 2): the
+        # release asset's `sha256:<64 hex>` digest is the only
+        # authoritative binding the GitHub API exposes, so it is
+        # required — missing or malformed refuses BEFORE any byte is
+        # downloaded. (The embedded flow's target is the non-zsync
+        # sibling asset, so its digest is what must be present.)
+        digest = asset.get('digest') or ''
+        if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+            raise UpdateError('release asset has no sha256 digest; '
+                              'refusing to install an unverified artifact')
+
         dest = os.path.join(dest_dir, 'update.appimage')
         try:
             net.download_to_file(
                 asset['browser_download_url'], dest, progress_cb)
+            self._verify_sha256(dest, digest[len('sha256:'):])
 
-            # verification ladder (strongest binding first): the release
-            # asset's sha256 digest, the embedded zsync's SHA-1, then the
-            # advertised size; digest can be null in the API response
-            # (guarded like the availability check does)
-            digest = asset.get('digest', '')
-            if digest and digest.startswith('sha256:'):
-                self._verify_sha256(dest, digest[len('sha256:'):])
-
+            # belt and braces: when the embedded flow selected a .zsync
+            # twin, the control file's SHA-1 line is a second
+            # publisher-attested binding for the same artifact
             if target_asset['zsync']:
                 zsync = net.fetch_text(
                     target_asset['zsync']['browser_download_url'])
@@ -463,6 +496,9 @@ class GithubUpdater(UpdateManager):
                 if match:
                     self._verify_sha1(dest, match.group(1))
 
+            # size is no longer an authenticity binding, but a mismatch
+            # with the advertised size still means the release metadata
+            # and the artifact disagree — refuse
             size = asset.get('size') or 0
             if size > 0:
                 self._verify_size(dest, size, 'the release asset')
@@ -537,21 +573,14 @@ class GitlabUpdater(UpdateManager):
         return False
 
     def download(self, dest_dir: str, progress_cb=None) -> str:
-        asset = self.fetch_target_asset()
-        if not asset:
-            raise UpdateError(f'Missing target asset for {self.name}')
-
-        dest = os.path.join(dest_dir, 'update.appimage')
-        try:
-            net.download_to_file(asset['direct_asset_url'], dest, progress_cb)
-            # the GitLab API exposes no digests: enforce advertised-size
-            # equality when the HEAD reported one (net.py caps bound the
-            # rest)
-            self._verify_advertised_size(asset['direct_asset_url'], dest)
-        except BaseException:
-            _unlink_quietly(dest)
-            raise
-        return dest
+        # Authenticity is mandatory (marketplace review round 2): the
+        # GitLab release API exposes no digest metadata, so there is no
+        # authoritative binding to verify an artifact against — refuse
+        # instead of trusting an uncorroborated download. The availability
+        # check stays fully informative; only installation refuses.
+        raise UpdateError(f'{self.label} release sources expose no digest '
+                          'metadata; refusing to install an unverified '
+                          'artifact')
 
 
 class _GiteaApiUpdater(UpdateManager):
@@ -626,23 +655,15 @@ class _GiteaApiUpdater(UpdateManager):
         return False
 
     def download(self, dest_dir: str, progress_cb=None) -> str:
-        asset = self.fetch_target_asset()
-        if not asset:
-            raise UpdateError(f'Missing target asset for {self.name}')
-
-        dest = os.path.join(dest_dir, 'update.appimage')
-        try:
-            net.download_to_file(asset['browser_download_url'], dest,
-                                 progress_cb)
-            # the Gitea API exposes no digests: enforce the advertised
-            # asset size when it reports one
-            size = asset.get('size') or 0
-            if size > 0:
-                self._verify_size(dest, size, 'the release asset')
-        except BaseException:
-            _unlink_quietly(dest)
-            raise
-        return dest
+        # Authenticity is mandatory (marketplace review round 2): the
+        # Gitea API exposes no digest metadata, so there is no
+        # authoritative binding to verify an artifact against — refuse
+        # instead of trusting an uncorroborated download. The
+        # availability check stays fully informative; only installation
+        # refuses.
+        raise UpdateError(f'{self.label} release sources expose no digest '
+                          'metadata; refusing to install an unverified '
+                          'artifact')
 
 
 class CodebergUpdater(_GiteaApiUpdater):
