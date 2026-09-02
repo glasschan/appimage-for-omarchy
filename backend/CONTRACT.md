@@ -262,6 +262,42 @@ Real example output:
 | `--delete` | Bypass the trash (irreversible) |
 | `--help` / `-h` | Usage text, exit 0 |
 
+## Security model (marketplace security-review hardening)
+
+- **https-only egress** — every request URL must be `https://`; plain
+  `http://` update-source configs are rejected by validation, and the
+  transport refuses anything else (`file`, `ftp`, ...).
+- **SSRF guard** — each hostname is resolved locally and *every* returned
+  address must be a global (public) IP; loopback, private, link-local,
+  CGNAT and reserved targets are unreachable. The socket is pinned to a
+  validated address (TLS still verifies the hostname), which removes the
+  DNS-rebinding resolve/connect window. Redirects are followed manually
+  (max 5 hops) and re-validated per hop.
+- **Byte caps** — metadata responses are capped at 4 MiB, downloads at
+  4 GiB; caps are enforced against Content-Length *and* the running body
+  size mid-stream. A failed download never leaves a partial file behind.
+- **Digest verification ladder** — every downloaded update is verified
+  before installation: zsync `SHA-1:` control-file line, GitHub `sha256:`
+  asset digest, or advertised-size equality (GitLab HEAD content-length,
+  Gitea asset size) depending on what the source exposes. A verification
+  failure raises an error and the partial artifact is removed.
+- **Atomic install** — the AppImage and its icon are copied into a temp
+  file next to their destination (O_EXCL|O_NOFOLLOW), fsync'd, then
+  `os.replace()`d into place; a planted symlink at the destination is
+  replaced, never written through.
+- **Containment-bound uninstall** — paths from the (mutable) desktop
+  entry are only removed when bound to the app: equal to the path
+  recorded at install time in `apps.ini`, or inside the managed-folder
+  layout (icon additionally must match the desktop id's stem). Directories
+  and FIFOs are never removed.
+- **Extraction quotas** — external extractors list the image first and
+  refuse to extract past 20 000 entries / 512 MiB (fail closed); the
+  extracted tree is sanitized afterwards (symlinks escaping the temp root
+  are unlinked, quotas re-checked).
+- **Bounded subprocess output** — helper commands' stdout/stderr are
+  capped at 10 MiB per stream; past the cap the reader stops and the
+  timeout reaps a still-writing child.
+
 ## Exit codes
 
 | Code | Meaning |

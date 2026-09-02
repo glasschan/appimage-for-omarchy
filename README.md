@@ -92,6 +92,17 @@ messages auto-clear after 5 s; errors stay until dismissed.
   still detected via the ELF header plus a squashfs magic at the
   section-header-table offset.
 
+Security posture (v0.4.1, from a marketplace security review): all
+backend egress is https-only with an SSRF guard (public addresses only,
+DNS-rebinding-safe dialing, validated redirects) and hard byte caps on
+responses; downloaded updates are verified against their zsync SHA-1 /
+GitHub sha256 digest / advertised size before anything is installed;
+installs are atomic (a planted symlink at a destination is replaced, not
+written through), uninstalls only remove paths provably bound to the app,
+extraction is quota-limited and symlink-contained, and subprocess output
+is size-capped. Details in [backend/CONTRACT.md](backend/CONTRACT.md)
+("Security model").
+
 ## Install
 
 From this repository:

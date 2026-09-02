@@ -10,8 +10,17 @@ import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 import tempfile
+import threading
+
+# Producer-side output bound (marketplace review): a chatty child can
+# never make the backend buffer more than this per stream. Past the cap
+# the reader stops draining the pipe, the child blocks on write() and
+# the timeout reaps it — so memory stays bounded without killing well-
+# behaved children early.
+MAX_OUTPUT_BYTES = 10 * 1024 * 1024
 
 
 def get_file_hash(file_path: str, alg: str = 'md5') -> str:
@@ -53,13 +62,74 @@ def extract_terminal_arguments(command: str) -> dict:
 
 
 def run_command(command: list, cwd: str = None, check: bool = True,
-                timeout: float = 120) -> subprocess.CompletedProcess:
+                timeout: float = 120, stdin=None,
+                max_output_bytes: int = MAX_OUTPUT_BYTES
+                ) -> subprocess.CompletedProcess:
     """Run a command with argument lists only (no shell), stdout/stderr
-    captured; raises CalledProcessError on failure when check=True."""
+    captured; raises CalledProcessError on failure when check=True.
+
+    Each output stream is capped at `max_output_bytes`: the reader stops
+    once the cap is reached and the captured bytes are truncated there
+    (truncated output is acceptable; a still-writing child simply blocks
+    on its full pipe until the timeout fires). `stdin` may be an open
+    file object (bsdtar reads the squashfs stream from one)."""
     logging.debug('Running %s', command)
-    result = subprocess.run(command, cwd=cwd, check=False,
+    proc = subprocess.Popen(command, cwd=cwd, stdin=stdin,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            timeout=timeout)
+                            start_new_session=True)
+
+    def _drain(stream) -> bytes:
+        # read at most cap + 1 per stream, then stop reading
+        chunks = []
+        remaining = max_output_bytes + 1
+        while remaining > 0:
+            chunk = stream.read(min(1 << 16, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b''.join(chunks)[:max_output_bytes]
+
+    holders = {'stdout': [], 'stderr': []}
+
+    def _drain_to(stream, key):
+        holders[key].append(_drain(stream))
+
+    threads = [
+        threading.Thread(target=_drain_to, args=(proc.stdout, 'stdout')),
+        threading.Thread(target=_drain_to, args=(proc.stderr, 'stderr')),
+    ]
+    for t in threads:
+        t.daemon = True
+        t.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            # the child runs in its own session: kill the whole group so
+            # no grandchild survives
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+        proc.wait()
+        raise
+    finally:
+        for t in threads:
+            t.join(timeout=5)
+        # the readers stop at the cap (the child then blocks on its full
+        # pipe until the timeout reaps it); the streams are only closed
+        # once the process is gone
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    result = subprocess.CompletedProcess(
+        command, proc.returncode,
+        stdout=(holders['stdout'][0] if holders['stdout'] else b''),
+        stderr=(holders['stderr'][0] if holders['stderr'] else b''))
     if check and result.returncode != 0:
         raise subprocess.CalledProcessError(
             result.returncode, command,

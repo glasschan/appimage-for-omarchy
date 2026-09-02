@@ -11,6 +11,12 @@
 #   3. fallback: `bsdtar` reading the squashfs stream at the offset
 #      (kept for the day libarchive grows squashfs support).
 #
+# Marketplace security-review hardening: the external fallbacks fail
+# closed — the listing is quota-checked before extraction, the extracted
+# tree is sanitized afterwards (escaping symlinks unlinked, aggregate
+# file-count/size quotas enforced) and _DirSource reads are
+# containment-bound and never follow a final symlink.
+#
 # The discovery logic below (root *.desktop, .DirIcon, icon search order)
 # mirrors GearLever's AppImageProvider._load_appimage_metadata.
 
@@ -19,8 +25,8 @@ import logging
 import os
 import re
 import shutil
+import stat
 import struct
-import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from typing import Optional
@@ -31,6 +37,15 @@ from .squashfs import SquashfsReader, SquashfsError
 from .utils import get_file_hash, run_command
 
 MAX_ICON_BYTES = 8 * 1024 * 1024
+
+# Extraction quotas (aggregate, enforced on the pre-extraction listing
+# and again as a post-extraction backstop while sanitizing).
+MAX_EXTRACT_FILES = 20_000
+MAX_EXTRACT_BYTES = 512 * 1024 * 1024
+
+# The desktop entry's Icon value is untrusted: name-based icon candidates
+# are only built for this strict shape (no separators, no traversal).
+_ICON_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 
 _TEMP_DIRS = []
 
@@ -132,50 +147,75 @@ class _VfsSource:
 
 class _DirSource:
     """File source backed by an already-extracted directory on disk
-    (unsquashfs / bsdtar fallbacks)."""
+    (unsquashfs / bsdtar fallbacks).
+
+    Containment (marketplace review): the root is resolved once, every
+    path is joined against it and its realpath must stay inside —
+    violations read as nonexistent. Reads never follow a final symlink
+    (O_NOFOLLOW); callers that want link resolution call resolve_symlink
+    first, which is itself containment-bound."""
 
     def __init__(self, root: str):
-        self.root = root
+        self.root = os.path.realpath(root)
 
     def close(self):
         pass  # temp dirs are cleaned up by cleanup_temp_dirs()
 
-    def _abs(self, path: str) -> str:
+    def _raw(self, path: str) -> str:
         return os.path.join(self.root, path.lstrip('/'))
+
+    def _contained(self, path: str) -> Optional[str]:
+        """realpath of `path` when it stays inside root, else None."""
+        real = os.path.realpath(self._raw(path))
+        if real != self.root and not real.startswith(self.root + os.sep):
+            logging.debug('dir path escapes %s: %s', self.root, path)
+            return None
+        return real
 
     def root_entries(self):
         for name in os.listdir(self.root):
             yield name
 
     def exists(self, path: str) -> bool:
-        return os.path.lexists(self._abs(path))
+        if not os.path.lexists(self._raw(path)):
+            return False
+        # a path whose final symlink escapes root does not exist for us
+        return self._contained(path) is not None
 
     def is_symlink(self, path: str) -> bool:
-        return os.path.islink(self._abs(path))
+        return os.path.islink(self._raw(path))
 
     def resolve_symlink(self, path: str) -> str:
-        real = os.path.realpath(self._abs(path))
-        if not os.path.exists(real):
+        real = self._contained(path)
+        if real is None or not os.path.exists(real):
             return ''
         return '/' + os.path.relpath(real, self.root)
 
     def read(self, path: str, max_size: int = MAX_ICON_BYTES) -> Optional[bytes]:
-        target = self._abs(path)
+        if self._contained(path) is None:
+            return None
         try:
-            if os.path.islink(target):
-                real = os.path.realpath(target)
-                if not os.path.exists(real):
-                    return None
-                target = real
-            if not os.path.isfile(target):
-                return None
-            if os.path.getsize(target) > max_size:
-                return None
-            with open(target, 'rb') as f:
-                return f.read()
+            # O_NOFOLLOW: never read *through* a final symlink (symlinked
+            # paths are resolved via resolve_symlink + containment
+            # instead); O_NONBLOCK keeps a planted FIFO from blocking the
+            # open — the fstat regular-file check rejects it right after
+            fd = os.open(self._raw(path),
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except OSError as e:
             logging.debug('dir read %s failed: %s', path, e)
             return None
+        with os.fdopen(fd, 'rb') as f:
+            try:
+                st = os.fstat(f.fileno())
+                if not stat.S_ISREG(st.st_mode):
+                    return None
+                if st.st_size > max_size:
+                    return None
+                # read at most max_size even if the file races upward
+                return f.read(max_size)
+            except OSError as e:
+                logging.debug('dir read %s failed: %s', path, e)
+                return None
 
 
 @dataclass
@@ -186,6 +226,79 @@ class ExtractedAppImage:
     desktop_file: Optional[str] = None      # path of copied .desktop
     icon_file: Optional[str] = None         # path of copied icon
     md5: str = ''
+
+
+def _listing_totals(output: str, size_token: int) -> tuple:
+    """(entry_count, regular_file_bytes) over a listing.
+
+    Both `unsquashfs -ls` and `tar -tv` start entry lines with a 10-char
+    mode string; the byte size sits at a tool-specific column (index
+    `size_token`). Header/non-entry lines don't match and are ignored;
+    the byte quota sums regular files only (symlinks count as entries,
+    their targets are unreadable through _DirSource anyway)."""
+    files = 0
+    total_bytes = 0
+    for line in output.splitlines():
+        tokens = line.split()
+        if len(tokens) <= size_token:
+            continue
+        mode = tokens[0]
+        if len(mode) != 10 or mode[0] not in '-bcdlps':
+            continue
+        if mode[0] == 'd':
+            continue
+        files += 1
+        if mode[0] == '-' and tokens[size_token].isdigit():
+            total_bytes += int(tokens[size_token])
+    return files, total_bytes
+
+
+def _enforce_quotas(files: int, total_bytes: int):
+    """Fail closed when the listing already shows an extraction bomb."""
+    if files > MAX_EXTRACT_FILES:
+        raise SquashfsError(f'extraction quota exceeded: listing shows '
+                            f'{files} entries (max {MAX_EXTRACT_FILES})')
+    if total_bytes > MAX_EXTRACT_BYTES:
+        raise SquashfsError(f'extraction quota exceeded: listing shows '
+                            f'{total_bytes} bytes '
+                            f'(max {MAX_EXTRACT_BYTES})')
+
+
+def _sanitize_extracted(root: str):
+    """Post-extraction backstop: unlink symlinks whose target escapes
+    `root` and enforce the aggregate quotas while walking (an image that
+    busts either gets its tree removed and is rejected)."""
+    files = 0
+    total_bytes = 0
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            files += 1
+            if files > MAX_EXTRACT_FILES:
+                shutil.rmtree(root, ignore_errors=True)
+                raise SquashfsError('extraction quota exceeded '
+                                    f'(more than {MAX_EXTRACT_FILES} files)')
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                real = os.path.realpath(path)
+                if real != root \
+                        and not real.startswith(root + os.sep):
+                    logging.warning('removing symlink escaping %s: %s',
+                                    root, path)
+                    try:
+                        os.unlink(path)
+                    except OSError as e:
+                        logging.warning('could not unlink %s: %s', path, e)
+            elif stat.S_ISREG(st.st_mode):
+                total_bytes += st.st_size
+                if total_bytes > MAX_EXTRACT_BYTES:
+                    shutil.rmtree(root, ignore_errors=True)
+                    raise SquashfsError('extraction quota exceeded '
+                                        f'(more than {MAX_EXTRACT_BYTES} '
+                                        'bytes)')
 
 
 def _open_source(appimage_path: str) -> tuple:
@@ -202,10 +315,20 @@ def _open_source(appimage_path: str) -> tuple:
         extracted_dir = new_temp_dir('unsquashfs-')
         try:
             offset = elf.get_squashfs_offset(appimage_path)
+            # fail closed: quota-check the listing before extracting
+            listing = run_command(['unsquashfs', '-ls', '-o', str(offset),
+                                   appimage_path], timeout=120)
+            files, total_bytes = _listing_totals(
+                listing.stdout.decode('utf-8', errors='replace'), 2)
+            _enforce_quotas(files, total_bytes)
             run_command(['unsquashfs', '-no-progress', '-f',
                          '-o', str(offset), '-d', extracted_dir,
                          appimage_path], timeout=600)
+            _sanitize_extracted(extracted_dir)
             return _DirSource(extracted_dir), extracted_dir
+        except SquashfsError:
+            shutil.rmtree(extracted_dir, ignore_errors=True)
+            raise
         except Exception as e:
             logging.warning('unsquashfs failed: %s', e)
             shutil.rmtree(extracted_dir, ignore_errors=True)
@@ -217,14 +340,20 @@ def _open_source(appimage_path: str) -> tuple:
             offset = elf.get_squashfs_offset(appimage_path)
             with open(appimage_path, 'rb') as f:
                 f.seek(offset)
-                result = subprocess.run(
-                    ['bsdtar', '-x', '-C', extracted_dir, '-f', '-'],
-                    stdin=f, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE, timeout=600)
-            if result.returncode == 0:
-                return _DirSource(extracted_dir), extracted_dir
-            raise RuntimeError('bsdtar exit code '
-                               + str(result.returncode))
+                listing = run_command(['bsdtar', '-tvf', '-'], stdin=f,
+                                      timeout=120)
+            files, total_bytes = _listing_totals(
+                listing.stdout.decode('utf-8', errors='replace'), 4)
+            _enforce_quotas(files, total_bytes)
+            with open(appimage_path, 'rb') as f:
+                f.seek(offset)
+                run_command(['bsdtar', '-x', '-C', extracted_dir, '-f', '-'],
+                            stdin=f, timeout=600)
+            _sanitize_extracted(extracted_dir)
+            return _DirSource(extracted_dir), extracted_dir
+        except SquashfsError:
+            shutil.rmtree(extracted_dir, ignore_errors=True)
+            raise
         except Exception as e:
             logging.warning('bsdtar failed: %s', e)
             shutil.rmtree(extracted_dir, ignore_errors=True)
@@ -253,6 +382,17 @@ def _find_desktop_file(source) -> tuple:
     return None, None
 
 
+def _safe_icon_base(icon_name: str) -> str:
+    """Sanitized icon name from the desktop entry's untrusted Icon value
+    ('' when unsafe): extension stripped, then a strict shape check —
+    the value feeds theme-path construction and must never traverse or
+    point at absolute paths."""
+    base = re.sub(r'\.(png|svg)$', '', icon_name or '')
+    if base in ('.', '..') or not _ICON_NAME_RE.match(base):
+        return ''
+    return base
+
+
 def _find_icon(source, icon_name: str) -> Optional[bytes]:
     """Icon discovery, mirroring GearLever's order: .DirIcon first, then
     root <icon>.svg / <icon>.png, then hicolor theme paths."""
@@ -271,15 +411,22 @@ def _find_icon(source, icon_name: str) -> Optional[bytes]:
             if fmt in ('image/png', 'image/svg+xml'):
                 candidates.append('/.DirIcon')
             elif fmt == 'text/plain':
+                # the text path is untrusted: strip it to image-absolute
+                # components and refuse any '..' traversal; as before it
+                # must also exist inside the image
                 possible = diricon.decode('utf-8', 'replace').strip()
-                if not possible.startswith('/'):
-                    possible = '/' + possible
-                if source.exists(possible):
-                    candidates.append(possible)
+                parts = [p for p in possible.split('/')
+                         if p not in ('', '.')]
+                if parts and '..' not in parts:
+                    possible = '/' + '/'.join(parts)
+                    if source.exists(possible):
+                        candidates.append(possible)
 
-    # 2) root-level <icon>.svg / <icon>.png (svg preferred)
-    if icon_name:
-        base = re.sub(r'\.(png|svg)$', '', icon_name)
+    # 2) root-level <icon>.svg / <icon>.png (svg preferred); the Icon
+    #    value is untrusted, so unsafe names skip the name-based
+    #    candidates entirely
+    base = _safe_icon_base(icon_name)
+    if base:
         candidates += [f'/{base}.svg', f'/{base}.png']
 
         # 3) hicolor theme locations inside the image

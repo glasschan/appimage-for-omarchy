@@ -8,6 +8,7 @@
 # omarchy_appimage.net.fetch_json / fetch_text, so the suite never leaves
 # the machine.
 
+import contextlib
 import hashlib
 import os
 import unittest
@@ -30,6 +31,12 @@ from omarchy_appimage.updaters import (CodebergUpdater, ForgejoUpdater,
 class UpdaterTestCase(FakeXDGTestCase):
     def setUp(self):
         super().setUp()
+        # the loopback fixture servers are plain http on a private
+        # address: open net.py's test seam for the duration of each test
+        # (production paths keep the guard on)
+        seam = mock.patch.object(net, '_TEST_ALLOW_LOCAL', True)
+        seam.start()
+        self.addCleanup(seam.stop)
         self._servers = []
         self.addCleanup(self._close_servers)
 
@@ -147,7 +154,7 @@ class StaticFileUpdaterTests(UpdaterTestCase):
         server.routes.update({
             '/f.appimage.zsync': (200, {},
                                   zsync_body(server.url('/real.appimage'),
-                                             'a' * 40)),
+                                             hashlib.sha1(body).hexdigest())),
             '/real.appimage': (200, {}, body),
         })
         el = self.make_el()
@@ -165,7 +172,8 @@ class StaticFileUpdaterTests(UpdaterTestCase):
         server = self.serve({
             '/updates/f.appimage.zsync': (200, {},
                                           zsync_body('real.appimage',
-                                                     'a' * 40)),
+                                                     hashlib.sha1(body)
+                                                     .hexdigest())),
             '/updates/real.appimage': (200, {}, body),
         })
         el = self.make_el()
@@ -181,7 +189,9 @@ class StaticFileUpdaterTests(UpdaterTestCase):
     def test_download_zsync_without_url_line_strips_suffix(self):
         body = b'no-url-line'
         server = self.serve({
-            '/updates/f.appimage.zsync': (200, {}, zsync_body('', 'a' * 40)),
+            '/updates/f.appimage.zsync': (200, {},
+                                          zsync_body('', hashlib.sha1(body)
+                                                     .hexdigest())),
             '/updates/f.appimage': (200, {}, body),
         })
         el = self.make_el()
@@ -201,6 +211,53 @@ class StaticFileUpdaterTests(UpdaterTestCase):
             manager.validate_config({'url': 'ftp://host/f.appimage'})
         with self.assertRaises(UpdateError):
             manager.validate_config({'url': ''})
+
+    def test_validate_config_rejects_http(self):
+        # https-only since the security hardening (plain http update
+        # sources are rejected by validation); the seam is forced OFF
+        # here — UpdaterTestCase opens it only for the fixture servers
+        manager = StaticFileUpdater(el=None)
+        with mock.patch.object(net, '_TEST_ALLOW_LOCAL', False):
+            with self.assertRaises(UpdateError):
+                manager.validate_config({'url': 'http://host/f.appimage'})
+
+    def test_download_zsync_sha1_mismatch_raises_and_unlinks(self):
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02served'
+        wrong = 'f' * 40
+        assert hashlib.sha1(body).hexdigest() != wrong
+        server = self.serve({
+            '/f.appimage.zsync': (200, {}, zsync_body('', wrong)),
+            '/f.appimage': (200, {}, body),
+        })
+        el = self.make_el()
+        manager = StaticFileUpdater(el=el, embedded='zsync|'
+                                    + server.url('/f.appimage.zsync'))
+
+        dest_dir = os.path.join(self.sandbox, 'dl-sha1')
+        os.makedirs(dest_dir)
+        dest = os.path.join(dest_dir, 'update.appimage')
+        with self.assertRaises(UpdateError):
+            manager.download(dest_dir)
+        self.assertFalse(os.path.exists(dest))  # partial artifact removed
+
+    def test_download_advertised_size_mismatch_raises_and_unlinks(self):
+        # plain configured URL: a HEAD content-length that differs from
+        # the artifact must fail the download (no digest to check here)
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02short'
+        server = self.serve({'/f.appimage': (200, {}, body)})
+        el = self.make_el()
+        manager = StaticFileUpdater(el=el)
+        self.set_source(el, 'StaticFileUpdater',
+                        {'url': server.url('/f.appimage')})
+
+        dest_dir = os.path.join(self.sandbox, 'dl-size')
+        os.makedirs(dest_dir)
+        dest = os.path.join(dest_dir, 'update.appimage')
+        with mock.patch.object(net, 'head_headers',
+                               return_value={'content-length': '9999'}):
+            with self.assertRaises(UpdateError):
+                manager.download(dest_dir)
+        self.assertFalse(os.path.exists(dest))
 
 
 # ----------------------------------------------------------- GithubUpdater
@@ -375,6 +432,89 @@ class GithubUpdaterTests(UpdaterTestCase):
         with self.assertRaises(UpdateError):
             manager.validate_config({'repo': 'justname'})
 
+    def _download_github(self, asset_overrides, body,
+                         embedded=None, fetch_text_value=None):
+        """Serve `body` from the fixture server for a faked release asset;
+        returns (manager, dest_path) after download() ran (or raised)."""
+        url = self.serve({'/Foo.appimage': (200, {}, body)}).url(
+            '/Foo.appimage')
+        el = self.make_el()
+        if embedded:
+            manager = GithubUpdater(el=el, embedded=embedded)
+        else:
+            self.set_source(el, 'GithubUpdater', dict(self.CONFIG))
+            manager = GithubUpdater(el=el)
+        asset = {'browser_download_url': url, **asset_overrides}
+        release = make_release([asset]) if not embedded else make_release([
+            {'name': 'Foo-1.0-x86_64.appimage.zsync', 'size': 300,
+             'browser_download_url': 'https://host/Foo.zsync'},
+            {'name': 'Foo-1.0-x86_64.appimage',
+             'browser_download_url': url, **asset_overrides},
+        ])
+        patches = [mock.patch.object(net, 'fetch_json', return_value=release)]
+        if fetch_text_value is not None:
+            patches.append(mock.patch.object(net, 'fetch_text',
+                                             return_value=fetch_text_value))
+        return manager, el, patches
+
+    def test_download_digest_mismatch_raises_and_unlinks(self):
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02asset-bytes'
+        wrong = 'sha256:' + hashlib.sha256(b'other').hexdigest()
+        manager, _el, patches = self._download_github(
+            {'digest': wrong, 'size': 0}, body)
+
+        dest_dir = os.path.join(self.sandbox, 'gh-digest')
+        os.makedirs(dest_dir)
+        dest = os.path.join(dest_dir, 'update.appimage')
+        with self.assertRaises(UpdateError), contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            manager.download(dest_dir)
+        self.assertFalse(os.path.exists(dest))  # partial artifact removed
+
+    def test_download_digest_match_succeeds(self):
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02asset-bytes'
+        digest = 'sha256:' + hashlib.sha256(body).hexdigest()
+        manager, _el, patches = self._download_github(
+            {'digest': digest, 'size': len(body)}, body)
+
+        dest_dir = os.path.join(self.sandbox, 'gh-digest-ok')
+        os.makedirs(dest_dir)
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            dest = manager.download(dest_dir)
+        self.assertTrue(os.path.exists(dest))
+
+    def test_download_zsync_sha1_mismatch_raises_and_unlinks(self):
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02zsync-bytes'
+        embedded = 'gh-releases-zsync|owner|repo|latest|Foo-*.appimage.zsync'
+        manager, _el, patches = self._download_github(
+            {'size': 0}, body, embedded=embedded,
+            fetch_text_value=zsync_body('', 'e' * 40).decode())
+
+        dest_dir = os.path.join(self.sandbox, 'gh-zsync')
+        os.makedirs(dest_dir)
+        dest = os.path.join(dest_dir, 'update.appimage')
+        with self.assertRaises(UpdateError), contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            manager.download(dest_dir)
+        self.assertFalse(os.path.exists(dest))
+
+    def test_download_size_mismatch_raises_and_unlinks(self):
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02sized'
+        manager, _el, patches = self._download_github({'size': 9999}, body)
+
+        dest_dir = os.path.join(self.sandbox, 'gh-size')
+        os.makedirs(dest_dir)
+        dest = os.path.join(dest_dir, 'update.appimage')
+        with self.assertRaises(UpdateError), contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            manager.download(dest_dir)
+        self.assertFalse(os.path.exists(dest))
+
 
 # ------------------------------------------------- Gitlab / Gitea family
 
@@ -430,6 +570,51 @@ class OtherManagerTests(UpdaterTestCase):
         with mock.patch.object(net, 'fetch_json', return_value=releases):
             manager = CodebergUpdater(el=el)
             self.assertIs(manager.is_update_available(), True)
+
+    def test_gitlab_download_size_mismatch_raises_and_unlinks(self):
+        # the GitLab API exposes no digests: advertised-size equality is
+        # enforced at download time
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02gitlab'
+        server = self.serve({'/Foo': (200, {}, body)})
+        el = self.make_el()
+        self.set_source(el, 'GitlabUpdater',
+                        {'repo_url': 'https://gitlab.com/owner/project',
+                         'repo_filename': 'Foo*'})
+        releases = [{'tag_name': 'v9',
+                     'assets': {'links': [{
+                         'name': 'Foo-1.0.appimage',
+                         'direct_asset_url': server.url('/Foo')}]}}]
+
+        dest_dir = os.path.join(self.sandbox, 'gl-size')
+        os.makedirs(dest_dir)
+        dest = os.path.join(dest_dir, 'update.appimage')
+        with mock.patch.object(net, 'fetch_json', return_value=releases), \
+                mock.patch.object(net, 'head_headers',
+                                  return_value={'content-length': '9999'}):
+            manager = GitlabUpdater(el=el)
+            with self.assertRaises(UpdateError):
+                manager.download(dest_dir)
+        self.assertFalse(os.path.exists(dest))
+
+    def test_codeberg_download_size_mismatch_raises_and_unlinks(self):
+        body = b'\x7fELF\x02\x01\x01\x00\x41\x49\x02gitea'
+        server = self.serve({'/Foo': (200, {}, body)})
+        el = self.make_el()
+        self.set_source(el, 'CodebergUpdater',
+                        {'repo': 'owner/repo', 'repo_filename': 'Foo*',
+                         'allow_prereleases': False})
+        releases = [{'tag_name': 'v1',
+                     'assets': [{'name': 'Foo-1.0.appimage', 'size': 9999,
+                                 'browser_download_url': server.url('/Foo')}]}]
+
+        dest_dir = os.path.join(self.sandbox, 'cb-size')
+        os.makedirs(dest_dir)
+        dest = os.path.join(dest_dir, 'update.appimage')
+        with mock.patch.object(net, 'fetch_json', return_value=releases):
+            manager = CodebergUpdater(el=el)
+            with self.assertRaises(UpdateError):
+                manager.download(dest_dir)
+        self.assertFalse(os.path.exists(dest))
 
 
 # -------------------------------------------------- UpdateManagerChecker

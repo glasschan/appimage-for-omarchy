@@ -400,6 +400,14 @@ class InProcessUpdateCliTests(InProcessCliMixin, FakeXDGTestCase):
     """--list-updates / --fetch-updates / --update flows that need patched
     connectivity or a fake FUSE mount (impossible in a subprocess)."""
 
+    def setUp(self):
+        super().setUp()
+        # the loopback fixture servers are plain http on a private
+        # address: open net.py's test seam for the duration of each test
+        seam = mock.patch.object(net, '_TEST_ALLOW_LOCAL', True)
+        seam.start()
+        self.addCleanup(seam.stop)
+
     def _app_with_source(self, routes):
         appimage, _desktop, _icon = self.install_fake_app()
         server = FixtureHTTPServer(routes)
@@ -759,6 +767,12 @@ class UpdateFlowTests(FakeXDGTestCase):
         self.fixture = fixture
         self.downloads = os.path.join(self.sandbox, 'downloads')
         os.makedirs(self.downloads, exist_ok=True)
+        # the update flow runs the real CLI in a subprocess against a
+        # loopback http server: open net.py's env-var test seam for the
+        # child processes (nothing in production ever sets this)
+        os.environ['OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP'] = '1'
+        self.addCleanup(os.environ.pop,
+                        'OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP', None)
 
     def _integrate_fixture(self) -> str:
         src = os.path.join(self.downloads, 'nvim.appimage')

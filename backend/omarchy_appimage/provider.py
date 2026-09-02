@@ -17,7 +17,8 @@ import filecmp
 import logging
 import os
 import shlex
-import shutil
+import stat
+import tempfile
 from enum import Enum
 from typing import List, Optional
 
@@ -43,6 +44,62 @@ class InternalError(Exception):
     def __init__(self, message: str):
         super().__init__(message)
         self.message = message
+
+
+def _atomic_install(src: str, dest: str, mode: int):
+    """Descriptor-safe install of `src` at `dest` (marketplace review).
+
+    The bytes land in a fresh temp file next to `dest` (created with
+    O_EXCL|O_NOFOLLOW), are chmod'd + fsync'd, then os.replace()'d over
+    the final name — rename never follows a symlink at `dest`, so a
+    planted symlink gets replaced instead of written through, and a crash
+    can never leave a truncated AppImage behind."""
+    try:
+        if stat.S_ISDIR(os.lstat(dest).st_mode):
+            raise InternalError(f'refusing to install over a directory: '
+                                f'{dest}')
+    except FileNotFoundError:
+        pass
+
+    dest_dir = os.path.dirname(dest) or '.'
+    # reserve a unique name, then reopen it with the exact safe flags
+    # (mkstemp cannot pass O_NOFOLLOW): between the unlink and the open
+    # nothing but us knows the name, and O_EXCL|O_NOFOLLOW still fail
+    # cleanly if anything plants a symlink there
+    reserve_fd, tmp_path = tempfile.mkstemp(prefix='.gearlever-tmp-',
+                                            dir=dest_dir)
+    os.close(reserve_fd)
+    os.unlink(tmp_path)
+
+    fd = None
+    src_fd = None
+    try:
+        fd = os.open(tmp_path,
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600)
+        src_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+        if not stat.S_ISREG(os.fstat(src_fd).st_mode):
+            raise InternalError(f'source is not a regular file: {src}')
+        with os.fdopen(fd, 'wb') as out, os.fdopen(src_fd, 'rb') as f:
+            fd = src_fd = None  # the fdopen contexts own them now
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                out.write(chunk)
+            os.fchmod(out.fileno(), mode)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp_path, dest)
+    except BaseException:
+        for open_fd in (fd, src_fd):
+            if open_fd is not None:
+                try:
+                    os.close(open_fd)
+                except OSError:
+                    pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 @dataclasses.dataclass
@@ -71,6 +128,12 @@ class AppImageListElement():
         self.installed_status = installed_status
 
     def set_trusted(self):
+        # defense in depth: only ever chmod a regular file we own
+        # (the file is ours post-rename, but lstat it anyway)
+        st = os.lstat(self.file_path)
+        if not stat.S_ISREG(st.st_mode):
+            raise InternalError('refusing to chmod a non-regular file: '
+                                + self.file_path)
         logging.debug('Chmod file ' + self.file_path)
         os.chmod(self.file_path, 0o755)
         self.trusted = True
@@ -296,7 +359,7 @@ class AppImageProvider():
                                           appimage_filename)
         original_appimage_path = extracted_appimage.appimage_file
 
-        shutil.copyfile(original_appimage_path, dest_appimage_file)
+        _atomic_install(original_appimage_path, dest_appimage_file, 0o755)
         logging.debug('file copied to %s', appimages_destination_path)
 
         el.file_path = dest_appimage_file
@@ -313,7 +376,7 @@ class AppImageProvider():
             dest_appimage_icon_file = os.path.join(
                 appimages_destination_path, '.icons',
                 prefixed_filename + icon_file_ext)
-            shutil.copyfile(icon_file, dest_appimage_icon_file)
+            _atomic_install(icon_file, dest_appimage_icon_file, 0o644)
 
         # Move .desktop file to its default location
         os.makedirs(self.user_desktop_files_path, exist_ok=True)
@@ -393,6 +456,12 @@ class AppImageProvider():
 
         app_config = Config.get_app_config(el)
         app_config['default_exec_arguments'] = new_default_exec_arguments
+        # provenance for the containment-bound uninstall: the desktop
+        # entry is mutable, so uninstall never trusts its Icon/TryExec
+        # values alone — it cross-checks what was recorded here
+        app_config['appimage_path'] = dest_appimage_file
+        app_config['desktop_file_path'] = dest_desktop_file_path
+        app_config['icon_path'] = dest_appimage_icon_file or ''
         Config.set_app_config(el, app_config)
 
         if settings.load_settings()['move_appimage_on_integration']:
@@ -489,11 +558,29 @@ class AppImageProvider():
         Deviation from GearLever: upstream only trashes the AppImage and
         hard-deletes the .desktop file and icon; per this project's spec
         (PRD F3) all three artifacts are sent to the trash (with a
-        delete fallback, like upstream's binary handling)."""
+        delete fallback, like upstream's binary handling).
+
+        Marketplace-review hardening: the desktop entry is mutable, so a
+        path taken from it (Icon= especially) is only removed when it is
+        bound to this app — either equal to the path recorded at install
+        time in apps.ini, or inside the managed-folder layout (AppImage
+        in the managed folder, desktop file in the user applications
+        dir, icon in <managed folder>/.icons with a stem matching the
+        desktop id). Anything unbound is logged and skipped; directories
+        and FIFOs are never removed."""
         logging.info('Removing %s', el.file_path)
 
         def _remove(path: str):
             if not path:
+                return
+            try:
+                st = os.lstat(path)
+            except OSError:
+                return
+            # only regular files and symlinks qualify
+            if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+                logging.warning('refusing to remove non-regular path: %s',
+                                path)
                 return
             if force_delete:
                 os.remove(path)
@@ -505,19 +592,61 @@ class AppImageProvider():
                                 'instead...', path, e)
                 os.remove(path)
 
-        _remove(el.file_path)
+        def _inside(real: str, container: str) -> bool:
+            return bool(container) and \
+                (real == container or real.startswith(container + os.sep))
 
-        if el.desktop_entry and el.desktop_entry.getFileName():
-            logging.info('Removing %s', el.desktop_entry.getFileName())
-            try:
-                _remove(el.desktop_entry.getFileName())
-            except FileNotFoundError:
-                logging.warning('desktop file already gone')
+        app_config = Config.get_app_config(el)
+        default_folder = os.path.realpath(
+            self._get_appimages_default_destination_path())
+        desktop_path = (el.desktop_entry.getFileName()
+                        if el.desktop_entry else None)
 
+        # 1) the AppImage: recorded path or inside the managed folder
+        if el.file_path:
+            real = os.path.realpath(el.file_path)
+            recorded = app_config.get('appimage_path') or ''
+            if (bool(recorded) and real == os.path.realpath(recorded)) \
+                    or _inside(real, default_folder):
+                _remove(el.file_path)
+            else:
+                logging.warning('not removing unbound AppImage path: %s',
+                                el.file_path)
+
+        # 2) the .desktop file: recorded path or in user applications
+        if desktop_path:
+            real = os.path.realpath(desktop_path)
+            applications_dir = os.path.realpath(_user_applications_dir())
+            recorded = app_config.get('desktop_file_path') or ''
+            if (bool(recorded) and real == os.path.realpath(recorded)) \
+                    or _inside(real, applications_dir):
+                try:
+                    _remove(desktop_path)
+                except FileNotFoundError:
+                    logging.warning('desktop file already gone')
+            else:
+                logging.warning('not removing unbound desktop file: %s',
+                                desktop_path)
+
+        # 3) the icon, only when tied to this app's entry: recorded path,
+        #    or inside <managed folder>/.icons with the desktop id's stem
         if el.desktop_entry:
             icon = el.desktop_entry.getIcon()
-            if icon and '/' in icon and os.path.isfile(icon):
-                _remove(icon)
+            if icon and '/' in icon:
+                real = os.path.realpath(icon)
+                icons_dir = os.path.join(default_folder, '.icons')
+                desktop_stem = os.path.splitext(
+                    os.path.basename(desktop_path or ''))[0]
+                stem_matches = (desktop_stem
+                                == os.path.splitext(
+                                    os.path.basename(real))[0])
+                recorded = app_config.get('icon_path') or ''
+                if (bool(recorded) and real == os.path.realpath(recorded)) \
+                        or (_inside(real, icons_dir) and stem_matches):
+                    _remove(icon)
+                else:
+                    logging.warning('not removing unbound icon path: %s',
+                                    icon)
 
         if remove_configuration:
             Config.delete_app_update_config(el)

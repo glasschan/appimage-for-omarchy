@@ -12,6 +12,14 @@
 #   * FTPUpdater is not ported (PRD F13 / P2)
 # Selection semantics follow upstream: a per-app update-manager config in
 # apps.ini overrides the AppImage's embedded .upd_info section.
+#
+# Verification ladder (marketplace security-review hardening): every
+# download() must leave behind a *verified* artifact or raise UpdateError
+# (and unlink the partial temp file) — zsync SHA-1, GitHub sha256 asset
+# digest, or advertised-size equality, whichever the source exposes.
+# Sources that accept arbitrary hosts (GitLab/Forgejo) stay that way: any
+# *public* host is allowed, and the net.py SSRF guard is the transport
+# boundary — private/loopback targets are unreachable at dial time.
 
 import fnmatch
 import logging
@@ -29,7 +37,16 @@ TRUE_VALUES = ('1', 'true', 'yes', 'on')
 
 
 class UpdateError(Exception):
-    """Raised for invalid --set-update-source configurations."""
+    """Raised for invalid --set-update-source configurations and for a
+    downloaded update that failed verification (digest/size mismatch)."""
+
+
+def _unlink_quietly(path: str):
+    """Remove a failed download's partial artifact (best-effort)."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def config_bool(config: dict, key: str, default: bool = False) -> bool:
@@ -85,6 +102,39 @@ class UpdateManager():
         """Download the new release into `dest_dir`; returns its path."""
         raise NotImplementedError
 
+    # ---- verification helpers ----------------------------------------------
+
+    def _verify_sha1(self, path: str, expected: str):
+        """SHA-1 of `path` must match `expected` (zsync control file)."""
+        actual = get_file_hash(path, alg='sha1')
+        if actual != expected:
+            raise UpdateError(f'Downloaded file failed the SHA-1 check '
+                              f'(expected {expected}, got {actual})')
+
+    def _verify_sha256(self, path: str, expected_hex: str):
+        """SHA-256 of `path` must match `expected_hex` (GitHub digest)."""
+        actual = get_file_hash(path, alg='sha256')
+        if actual != expected_hex:
+            raise UpdateError(f'Downloaded file failed the sha256 digest '
+                              f'check (expected {expected_hex}, got {actual})')
+
+    def _verify_size(self, path: str, expected: int, source: str):
+        """The artifact must be exactly `expected` bytes (the download
+        itself already fails short bodies; this also catches an over-long
+        artifact when the server reported a size)."""
+        actual = os.path.getsize(path)
+        if actual != expected:
+            raise UpdateError(f'Downloaded file has {actual} bytes but '
+                              f'{source} advertised {expected}')
+
+    def _verify_advertised_size(self, url: str, path: str):
+        """Enforce size equality when a HEAD of `url` reported a length
+        (sources whose API exposes no digest: static URLs, GitLab)."""
+        headers = net.head_headers(url)
+        remote = int(headers.get('content-length') or 0)
+        if remote > 0:
+            self._verify_size(path, remote, url)
+
     # ---- helpers ----------------------------------------------------------
 
     def _pick_asset_by_arch(self, possible: list) -> dict:
@@ -113,9 +163,15 @@ class StaticFileUpdater(UpdateManager):
         return {'url': ''}
 
     def validate_config(self, config: dict):
+        # https-only (marketplace review): plain http update sources are
+        # rejected; the net.py transport would refuse them anyway. The
+        # test seam (net._TEST_ALLOW_LOCAL) also accepts http so the
+        # suite's loopback fixture servers can be configured end-to-end.
+        schemes = ('https://', 'http://') if net._TEST_ALLOW_LOCAL \
+            else ('https://',)
         url = str(config.get('url', ''))
-        if not url.startswith(('http://', 'https://')):
-            raise UpdateError('Enter a valid HTTP(S) url')
+        if not url.startswith(schemes):
+            raise UpdateError('Enter a valid HTTPS url')
 
     def get_embedded_url(self) -> str:
         if not self.embedded:
@@ -125,22 +181,33 @@ class StaticFileUpdater(UpdateManager):
         # strip the 'zsync|' prefix
         return self.embedded[len(self.handles_embedded):]
 
-    def _resolve_zsync_target(self, zsync_url: str) -> str:
-        """Read a .zsync control file and return the AppImage URL it
-        points at (absolute URL: line, or the .zsync name with the
-        suffix stripped — upstream StaticFileUpdater.download)."""
+    def _fetch_zsync(self, zsync_url: str) -> tuple:
+        """(target_url, sha1_or_None) from a .zsync control file.
+
+        The target is the absolute URL: line when present, else the .zsync
+        name with the suffix stripped (upstream
+        StaticFileUpdater.download); sha1 is the control file's SHA-1
+        line when it carries one."""
         zsync = net.fetch_text(zsync_url)
         header = zsync.split('\n\n', 1)[0]
         match = re.search(r'URL:\s*(\S+)', header)
         if match:
             target = match.group(1)
             if target.startswith(('https://', 'http://')):
-                return target
-            parts = urlsplit(zsync_url)
-            path = posixpath.join(posixpath.dirname(parts.path), target)
-            return urlunsplit(parts._replace(path=path, query='',
-                                             fragment=''))
-        return re.sub(r'\.zsync$', '', zsync_url)
+                resolved = target
+            else:
+                parts = urlsplit(zsync_url)
+                path = posixpath.join(posixpath.dirname(parts.path), target)
+                resolved = urlunsplit(parts._replace(path=path, query='',
+                                                     fragment=''))
+        else:
+            resolved = re.sub(r'\.zsync$', '', zsync_url)
+        sha = re.search(r'SHA-1:\s*([0-9a-f]{40})', header)
+        return resolved, (sha.group(1) if sha else None)
+
+    def _resolve_zsync_target(self, zsync_url: str) -> str:
+        """The AppImage URL a .zsync control file points at."""
+        return self._fetch_zsync(zsync_url)[0]
 
     def is_update_available(self):
         e_url = self.get_embedded_url()
@@ -176,14 +243,25 @@ class StaticFileUpdater(UpdateManager):
 
     def download(self, dest_dir: str, progress_cb=None) -> str:
         url = self.get_config().get('url')
+        expected_sha1 = None
         e_url = self.get_embedded_url()
         if e_url:
-            url = self._resolve_zsync_target(e_url)
+            url, expected_sha1 = self._fetch_zsync(e_url)
         if not url:
             raise UpdateError('Missing download URL')
 
         dest = os.path.join(dest_dir, 'update.appimage')
-        net.download_to_file(url, dest, progress_cb)
+        try:
+            net.download_to_file(url, dest, progress_cb)
+            if expected_sha1:
+                self._verify_sha1(dest, expected_sha1)
+            elif not e_url:
+                # plain configured URL: enforce the advertised size when
+                # the server reported one (no zsync SHA-1 to check here)
+                self._verify_advertised_size(url, dest)
+        except BaseException:
+            _unlink_quietly(dest)
+            raise
         return dest
 
 
@@ -352,9 +430,33 @@ class GithubUpdater(UpdateManager):
         if not target_asset:
             raise UpdateError(f'Missing target asset for {self.name}')
 
+        asset = target_asset['asset']
         dest = os.path.join(dest_dir, 'update.appimage')
-        net.download_to_file(
-            target_asset['asset']['browser_download_url'], dest, progress_cb)
+        try:
+            net.download_to_file(
+                asset['browser_download_url'], dest, progress_cb)
+
+            # verification ladder (strongest binding first): the release
+            # asset's sha256 digest, the embedded zsync's SHA-1, then the
+            # advertised size
+            digest = asset.get('digest', '')
+            if digest.startswith('sha256:'):
+                self._verify_sha256(dest, digest[len('sha256:'):])
+
+            if target_asset['zsync']:
+                zsync = net.fetch_text(
+                    target_asset['zsync']['browser_download_url'])
+                match = re.search(r'SHA-1:\s*([0-9a-f]{40})',
+                                  zsync.split('\n\n', 1)[0])
+                if match:
+                    self._verify_sha1(dest, match.group(1))
+
+            size = asset.get('size') or 0
+            if size > 0:
+                self._verify_size(dest, size, 'the release asset')
+        except BaseException:
+            _unlink_quietly(dest)
+            raise
         return dest
 
 
@@ -428,7 +530,15 @@ class GitlabUpdater(UpdateManager):
             raise UpdateError(f'Missing target asset for {self.name}')
 
         dest = os.path.join(dest_dir, 'update.appimage')
-        net.download_to_file(asset['direct_asset_url'], dest, progress_cb)
+        try:
+            net.download_to_file(asset['direct_asset_url'], dest, progress_cb)
+            # the GitLab API exposes no digests: enforce advertised-size
+            # equality when the HEAD reported one (net.py caps bound the
+            # rest)
+            self._verify_advertised_size(asset['direct_asset_url'], dest)
+        except BaseException:
+            _unlink_quietly(dest)
+            raise
         return dest
 
 
@@ -509,8 +619,17 @@ class _GiteaApiUpdater(UpdateManager):
             raise UpdateError(f'Missing target asset for {self.name}')
 
         dest = os.path.join(dest_dir, 'update.appimage')
-        net.download_to_file(asset['browser_download_url'], dest,
-                             progress_cb)
+        try:
+            net.download_to_file(asset['browser_download_url'], dest,
+                                 progress_cb)
+            # the Gitea API exposes no digests: enforce the advertised
+            # asset size when it reports one
+            size = asset.get('size') or 0
+            if size > 0:
+                self._verify_size(dest, size, 'the release asset')
+        except BaseException:
+            _unlink_quietly(dest)
+            raise
         return dest
 
 
