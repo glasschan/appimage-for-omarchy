@@ -24,8 +24,10 @@ fail() {
 # --- 1) Disable the plugin. -------------------------------------------------
 # Note: `omarchy plugin --help` may exit non-zero even when it prints usage,
 # so match on its output rather than its exit code (we run under pipefail).
-plugin_help="$(command -v omarchy >/dev/null 2>&1 &&
-  omarchy plugin --help 2>&1 || true)"
+plugin_help=""
+if command -v omarchy >/dev/null 2>&1; then
+  plugin_help="$(omarchy plugin --help 2>&1 || true)"
+fi
 if command -v omarchy >/dev/null 2>&1 &&
   grep -q -- 'plugin disable' <<<"$plugin_help"; then
   omarchy plugin disable "$PLUGIN_ID" || true
