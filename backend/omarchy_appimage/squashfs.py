@@ -84,9 +84,18 @@ def _zstd_decompress(data: bytes) -> bytes:
         return zstd.ZstdDecompressor().decompress(data)
 
     if _ZSTD_MODE == 'cli':
-        result = subprocess.run(
-            ['zstd', '-d', '-c', '-q'],
-            input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # CI invariant (scripts/ci/security-gates.sh): every raw
+        # subprocess.run outside utils.py must carry a bounded timeout —
+        # one squashfs block is at most a few MiB, so 120s (the same
+        # ceiling utils.run_command uses) is generous.
+        try:
+            result = subprocess.run(
+                ['zstd', '-d', '-c', '-q'],
+                input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=120)
+        except subprocess.TimeoutExpired as exc:
+            raise SquashfsError(
+                f'zstd CLI timed out after {exc.timeout}s') from exc
         if result.returncode != 0:
             raise SquashfsError(
                 'zstd CLI failed: ' + result.stderr.decode(errors='replace'))
