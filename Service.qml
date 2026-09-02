@@ -231,10 +231,13 @@ Item {
     stdout: StdioCollector {
       id: fetchStdout
       waitForEnd: true
+      // streamed producer-side bound (see Backend.feedStream)
+      onRead: function(data) { Backend.feedStream(root.fetchCtx, "stdout", data) }
     }
     stderr: StdioCollector {
       id: fetchStderr
       waitForEnd: true
+      onRead: function(data) { Backend.feedStream(root.fetchCtx, "stderr", data) }
     }
     onStarted: Backend.markStarted(root.fetchCtx)
     onExited: function(exitCode) {
@@ -254,10 +257,13 @@ Item {
     stdout: StdioCollector {
       id: settingsStdout
       waitForEnd: true
+      // streamed producer-side bound (see Backend.feedStream)
+      onRead: function(data) { Backend.feedStream(root.settingsCtx, "stdout", data) }
     }
     stderr: StdioCollector {
       id: settingsStderr
       waitForEnd: true
+      onRead: function(data) { Backend.feedStream(root.settingsCtx, "stderr", data) }
     }
     onStarted: Backend.markStarted(root.settingsCtx)
     onExited: function(exitCode) {
@@ -279,10 +285,13 @@ Item {
     stdout: StdioCollector {
       id: listStdout
       waitForEnd: true
+      // streamed producer-side bound (see Backend.feedStream)
+      onRead: function(data) { Backend.feedStream(root.listCtx, "stdout", data) }
     }
     stderr: StdioCollector {
       id: listStderr
       waitForEnd: true
+      onRead: function(data) { Backend.feedStream(root.listCtx, "stderr", data) }
     }
     onStarted: Backend.markStarted(root.listCtx)
     onExited: function(exitCode) {

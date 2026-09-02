@@ -92,16 +92,21 @@ messages auto-clear after 5 s; errors stay until dismissed.
   still detected via the ELF header plus a squashfs magic at the
   section-header-table offset.
 
-Security posture (v0.4.1, from a marketplace security review): all
+Security posture (v0.4.2, from a marketplace security review): all
 backend egress is https-only with an SSRF guard (public addresses only,
-DNS-rebinding-safe dialing, validated redirects) and hard byte caps on
-responses; downloaded updates are verified against their zsync SHA-1 /
-GitHub sha256 digest / advertised size before anything is installed;
-installs are atomic (a planted symlink at a destination is replaced, not
-written through), uninstalls only remove paths provably bound to the app,
-extraction is quota-limited and symlink-contained, and subprocess output
-is size-capped. Details in [backend/CONTRACT.md](backend/CONTRACT.md)
-("Security model").
+DNS-rebinding-safe dialing, validated redirects), hard byte caps and
+absolute whole-operation deadlines on responses; downloaded updates are
+installed only after verification against a mandatory cryptographic
+digest (GitHub sha256 asset digest, zsync SHA-1 control-file line) —
+sources that expose no digest refuse to install; the trust boundaries
+cannot be disabled from the environment; installs are atomic (a planted
+symlink at a destination is replaced, not written through), uninstalls
+only remove paths provably bound to the app, extraction is quota-limited
+and symlink-contained, subprocess output is size-capped on the producer
+side, and install.sh validates the staged tree before swapping and keeps
+the previous installation for rollback until the new one is validated
+and the shell is back up. Details in
+[backend/CONTRACT.md](backend/CONTRACT.md) ("Security model").
 
 ## Install
 

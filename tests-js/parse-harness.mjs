@@ -312,5 +312,64 @@ check("heal counts the new app", Model.findItem("thirdapp.desktop") !== null
 check("heal keeps known apps counted", Model.findItem("neovim.desktop").hasUpdate === true
   && Model.updateCount() === 2)
 
+// ---- Backend.js streamed producer bound (security round 2) -----------------
+// StdioCollector.onRead feeds every chunk through Backend.feedStream; past
+// the per-stream cap the child is killed via proc.running = false (same
+// kill path as handleTimeout — Quickshell Process has no terminate()).
+function fakeProc() {
+  return {
+    _v: false,
+    killCount: 0,
+    set running(v) { if (v === false && this._v === true) this.killCount++; this._v = v },
+    get running() { return this._v }
+  }
+}
+const fakeTimer = { interval: 0, restarted: false, stopped: false,
+  restart() { this.restarted = true }, stop() { this.stopped = true } }
+let doneResults = []
+const onDone = (r) => doneResults.push(r)
+
+// ctx accounting fields + options override
+{
+  const proc = fakeProc()
+  const ctx = Backend.run(proc, fakeTimer, ["python3", "main.py"], ["--json"], { maxStreamChars: 10 }, onDone)
+  check("run ctx stream accounting", ctx.stdoutLen === 0 && ctx.stderrLen === 0
+    && ctx.overflow === false, JSON.stringify(ctx))
+  check("run maxStreamChars override", ctx.maxStreamChars === 10, String(ctx.maxStreamChars))
+  const ctxDefault = Backend.run(fakeProc(), fakeTimer, ["python3"], [], {}, onDone)
+  check("run maxStreamChars default", ctxDefault.maxStreamChars === Backend.MAX_STREAM_CHARS,
+    String(ctxDefault.maxStreamChars))
+
+  // chunks under the cap accumulate; no kill
+  Backend.feedStream(ctx, "stdout", "aaaaaaaaaa") // exactly 10
+  check("feedStream under cap no kill", ctx.stdoutLen === 10
+    && ctx.overflow === false && proc.killCount === 0, JSON.stringify(ctx))
+  // the chunk that pushes past the cap flips overflow and kills once
+  Backend.feedStream(ctx, "stdout", "bbbb")
+  check("feedStream past cap kills once", ctx.overflow === true
+    && proc.killCount === 1 && proc.running === false, JSON.stringify(ctx))
+  // later chunks never double-kill
+  Backend.feedStream(ctx, "stderr", "err!!")
+  check("feedStream overflow once only", proc.killCount === 1 && ctx.stderrLen === 5,
+    JSON.stringify(ctx))
+  // null ctx is a safe no-op
+  let threw = false
+  try { Backend.feedStream(null, "stdout", "ignored") } catch (e) { threw = true }
+  check("feedStream null ctx no-op", threw === false)
+
+  // handleExit maps overflow to the error shape, exactly once
+  // (no markStarted on this ctx -> spawnFailed reports true)
+  Backend.handleExit(ctx, 0, "truncated-garbage", "stderr-leftover")
+  Backend.handleExit(ctx, 0, "truncated-garbage", "stderr-leftover") // late exit ignored
+  const r = doneResults[0]
+  check("handleExit overflow shape", r && r.ok === false && r.json === null
+    && r.timedOut === false && r.spawnFailed === true && r.error === "output-overflow",
+    JSON.stringify(r))
+  check("handleExit overflow clamp + once", r.stdout === "truncated-garbage"
+    && r.stderr === "stderr-leftover" && doneResults.length === 1,
+    JSON.stringify(doneResults))
+  check("handleExit overflow stops watchdog", fakeTimer.stopped === true)
+}
+
 console.log(failures === 0 ? "\nALL PASS" : "\n" + failures + " FAILURES")
 process.exit(failures === 0 ? 0 : 1)

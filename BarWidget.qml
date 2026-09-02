@@ -187,10 +187,13 @@ BarWidget {
     stdout: StdioCollector {
       id: syncStdout
       waitForEnd: true
+      // streamed producer-side bound (see Backend.feedStream)
+      onRead: function(data) { Backend.feedStream(root.syncCtx, "stdout", data) }
     }
     stderr: StdioCollector {
       id: syncStderr
       waitForEnd: true
+      onRead: function(data) { Backend.feedStream(root.syncCtx, "stderr", data) }
     }
     onStarted: Backend.markStarted(root.syncCtx)
     onExited: function(exitCode) {

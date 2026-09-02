@@ -93,6 +93,15 @@ fi
 find "$STAGING" -type d -name '__pycache__' -prune -exec rm -rf -- {} +
 find "$STAGING" -type f \( -name '*.pyc' -o -name '.DS_*' \) -delete
 
+# --- Validate the staging copy BEFORE touching anything live. ----------------
+# `omarchy plugin validate` is a pure file/schema check that needs no
+# running shell, so a bad staging tree aborts here: old installation
+# untouched, shell never stopped.
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy plugin validate "$STAGING" ||
+    fail "staged copy failed validation; nothing was swapped (old installation intact, shell not stopped)"
+fi
+
 # --- Stop the shell so the swap can never trigger a reload. ------------------
 # Per quickshell issue #972 (see note above) ANY in-place reload of this
 # plugin can segfault quickshell 0.3.1, so deploy while the shell is down.
@@ -111,46 +120,90 @@ if pgrep -f "$QS_PAT" >/dev/null 2>&1; then
   fi
 fi
 
+# --- Failure paths after the swap: keep a bootable tree installed. -----------
+# The previous installation is retained in OLD_DIR until validation AND
+# restart handling have fully succeeded, so a failed post-swap validation
+# or restart rolls back to the known-good tree and brings the shell back
+# up. Fresh installs (no prior DEST) have nothing to roll back to.
+shell_up_attempt() {
+  if command -v omarchy >/dev/null 2>&1; then
+    if ! omarchy restart shell; then
+      echo "install.sh: WARNING: 'omarchy restart shell' failed; the shell is still down." >&2
+      echo "install.sh: start it manually with: omarchy restart shell" >&2
+    fi
+  else
+    echo "install.sh: NOTE: 'omarchy' CLI not found; the shell is still stopped. Start it with:" >&2
+    echo "  omarchy restart shell" >&2
+  fi
+}
+
+restore_old_and_die() {
+  echo "install.sh: $*" >&2
+  if [[ -d "$OLD_DIR" ]]; then
+    rm -rf -- "$DEST"
+    if mv -- "$OLD_DIR" "$DEST"; then
+      echo "install.sh: previous installation restored." >&2
+    else
+      echo "install.sh: CRITICAL: rollback failed; the previous installation is left at $OLD_DIR" >&2
+    fi
+  else
+    echo "install.sh: no previous tree to roll back to (fresh install; the new tree is left in place)." >&2
+  fi
+  shell_up_attempt
+  exit 1
+}
+
 # --- Swap the finished tree into place. --------------------------------------
-# If any rename fails, fail loudly without destroying the old copy.
-# OLD_DIR is dot-prefixed + pid-tagged so the watcher never sees it (see note
-# above); do not make it visible again.
+# If any rename fails, fail loudly: the old copy is restored where
+# possible and the shell is never left down without a restart attempt.
+# OLD_DIR is dot-prefixed + pid-tagged so the watcher never sees it (see
+# note above); do not make it visible again.
 rm -rf -- "$OLD_DIR"
 if [[ -e "$DEST" ]]; then
   if ! mv -- "$DEST" "$OLD_DIR"; then
+    shell_up_attempt
     fail "could not move the current installation aside"
   fi
   if ! mv -- "$STAGING" "$DEST"; then
     if ! mv -- "$OLD_DIR" "$DEST"; then
+      shell_up_attempt
       fail "restore failed; previous installation left at $OLD_DIR"
     fi
+    shell_up_attempt
     fail "could not move staged files into place; previous installation restored"
   fi
-  rm -rf -- "$OLD_DIR"
 else
   if ! mv -- "$STAGING" "$DEST"; then
+    shell_up_attempt
     fail "could not move staged files into place"
   fi
 fi
 
-# --- Validate the final DEST (post-swap), then bring the shell back up. -----
-# `omarchy plugin validate` is pure file/schema checking and works while the
-# shell is down; `omarchy plugin list` talks to the shell over IPC, so it is
-# only usable after the restart below.
+# --- Validate the live DEST post-swap, then bring the shell back up. --------
+# `omarchy plugin validate` is pure file/schema checking and works while
+# the shell is down; `omarchy plugin list` talks to the shell over IPC, so
+# it is only usable after the restart below. On ANY failure the retained
+# old tree is restored before giving up.
 if command -v omarchy >/dev/null 2>&1; then
-  omarchy plugin validate "$DEST" || fail "installed copy failed validation"
-  # The shell was stopped for the swap; bring it back (best-effort). The
-  # fresh instance loads the new files from disk, so there is deliberately
-  # no rescanPlugins call — any in-place reload of this plugin must never be
-  # triggered, since it can segfault quickshell 0.3.1 (issue #972).
+  omarchy plugin validate "$DEST" ||
+    restore_old_and_die "installed copy failed validation"
+  # The shell was stopped for the swap; bring it back. The fresh instance
+  # loads the new files from disk, so there is deliberately no rescan
+  # call — any in-place reload of this plugin must never be triggered,
+  # since it can segfault quickshell 0.3.1 (issue #972). A failed restart
+  # rolls back too: the shell stays down either way, so at least leave
+  # the known-good tree installed.
   if ! omarchy restart shell; then
-    echo "install.sh: WARNING: 'omarchy restart shell' failed; the shell is still down." >&2
-    echo "install.sh: start it manually with: omarchy restart shell" >&2
+    restore_old_and_die "'omarchy restart shell' failed"
   fi
 else
   echo "NOTE: 'omarchy' CLI not found; the shell is still stopped. Start it with:"
   echo "  omarchy restart shell"
 fi
+
+# Success: validate + restart both made it past — the retained old tree
+# can finally go.
+rm -rf -- "$OLD_DIR"
 
 echo "Installed runtime files to: $DEST"
 

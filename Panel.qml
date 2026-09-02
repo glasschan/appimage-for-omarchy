@@ -774,10 +774,13 @@ Panel {
     stdout: StdioCollector {
       id: backendStdout
       waitForEnd: true
+      // streamed producer-side bound (see Backend.feedStream)
+      onRead: function(data) { Backend.feedStream(root.runCtx, "stdout", data) }
     }
     stderr: StdioCollector {
       id: backendStderr
       waitForEnd: true
+      onRead: function(data) { Backend.feedStream(root.runCtx, "stderr", data) }
     }
     // Proof of spawn: separates "python3 missing" (never started) from
     // "ran and failed" in the failure reporting above.
@@ -802,10 +805,13 @@ Panel {
     stdout: StdioCollector {
       id: updateStdout
       waitForEnd: true
+      // streamed producer-side bound (see Backend.feedStream)
+      onRead: function(data) { Backend.feedStream(root.updateCtx, "stdout", data) }
     }
     stderr: StdioCollector {
       id: updateStderr
       waitForEnd: true
+      onRead: function(data) { Backend.feedStream(root.updateCtx, "stderr", data) }
     }
     onStarted: Backend.markStarted(root.updateCtx)
     onExited: function(exitCode) {
