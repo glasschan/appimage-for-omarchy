@@ -56,6 +56,16 @@ jobs:
       - name: lib/*.js parse harness
         run: node tests-js/parse-harness.mjs
 
+      # Same shared gates as the CI `security-gates` job (never duplicated
+      # inline, so CI and release cannot drift): gate 1+2 invariant greps +
+      # shellcheck, gate 3 install.sh deploy smoke test. Gate 4 (the
+      # security-regression coverage manifest) already ran inside the unit
+      # tests above. A release must never ship past a broken gate.
+      - name: Security gates (invariants, shellcheck, install smoke)
+        run: |
+          bash scripts/ci/security-gates.sh
+          bash scripts/ci/install-sh-smoke.sh
+
       - name: Package the runtime file set
         env:
           VERSION: ${{ steps.version.outputs.version }}
