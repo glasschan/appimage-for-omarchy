@@ -2,8 +2,8 @@
 #
 # tag v<version> → verify manifest parity → test → package → publish.
 # Pushing a v* tag re-runs the CI quality gates, packages the runtime
-# file set (exactly what install.sh copies) into a zip, and publishes it
-# as a GitHub Release with auto-generated changelog notes.
+# file set into a zip, and publishes it as a GitHub Release with
+# auto-generated changelog notes.
 # workflow_dispatch runs the same flow as a dry run: the zip is uploaded
 # as a workflow artifact and nothing is published.
 name: Release
@@ -56,15 +56,13 @@ jobs:
       - name: lib/*.js parse harness
         run: node tests-js/parse-harness.mjs
 
-      # Same shared gates as the CI `security-gates` job (never duplicated
-      # inline, so CI and release cannot drift): gate 1+2 invariant greps +
-      # shellcheck, gate 3 install.sh deploy smoke test. Gate 4 (the
-      # security-regression coverage manifest) already ran inside the unit
-      # tests above. A release must never ship past a broken gate.
-      - name: Security gates (invariants, shellcheck, install smoke)
-        run: |
-          bash scripts/ci/security-gates.sh
-          bash scripts/ci/install-sh-smoke.sh
+      # Same shared gate as the CI `security-gates` job (never duplicated
+      # inline, so CI and release cannot drift): gate 1 backend invariant
+      # greps. Gate 4 (the security-regression coverage manifest) already
+      # ran inside the unit tests above. A release must never ship past a
+      # broken gate.
+      - name: Security gates (backend invariants)
+        run: bash scripts/ci/security-gates.sh
 
       - name: Package the runtime file set
         env:
@@ -76,7 +74,7 @@ jobs:
           rm -rf staging dist
           mkdir -p "staging/$plugin_id" dist
 
-          # Same copy set as install.sh: manifest, root QML, lib/, icons/,
+          # The runtime copy set: manifest, root QML, lib/, icons/,
           # backend/main.py, backend/omarchy_appimage/ (source only),
           # README, LICENSE. No tests, PRD, docs, or preview.png.
           cp -a -- manifest.json README.md LICENSE ./*.qml "staging/$plugin_id/"
@@ -88,7 +86,7 @@ jobs:
           cp -a -- backend/main.py "staging/$plugin_id/backend/"
           cp -a -- backend/omarchy_appimage/*.py "staging/$plugin_id/backend/omarchy_appimage/"
 
-          # Defense in depth: strip bytecode, like install.sh does.
+          # Defense in depth: strip bytecode
           # (unittest above may have produced fresh __pycache__ dirs.)
           find "staging/$plugin_id" -type d -name '__pycache__' -prune -exec rm -rf -- {} +
           find "staging/$plugin_id" -type f -name '*.pyc' -delete

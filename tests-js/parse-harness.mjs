@@ -257,15 +257,25 @@ check("unset-source passthrough", unsetSourceDoc.ok === true && unsetSourceDoc.r
   && unsetSourceDoc.app.manager === "" && unsetSourceDoc.app.downloadSize === 0)
 
 // ---- Panel-side error mapping (mirrors reportFailure branches) ---------------
-function reportFailureLike(result) {
-  if (result.timedOut || result.spawnFailed || result.error === "no-backend-command") return "backendMissing"
+// Timeout is its own message ("Backend timed out") — blaming python3 for a
+// slow update sent users hunting the wrong fix. A spawn failure only maps to
+// the python hint when the probe has not already confirmed python missing
+// (then the install card owns the screen and the banner is cleared).
+function reportFailureLike(result, pythonMissing) {
+  if (result.timedOut) return "timeout"
+  if (result.spawnFailed || result.error === "no-backend-command") {
+    if (result.spawnFailed && pythonMissing === true) return "cleared"
+    return "backendMissing"
+  }
   var doc = Backend.parseJson(result.stdout)
   if (doc && doc.result === "error" && doc.error) return String(doc.error)
   if (result.stderr !== "" || result.stdout !== "") return "backendFailed"
   return "backendFailed"
 }
 check("spawn failure → hint", reportFailureLike({ timedOut: false, spawnFailed: true, error: "exit--1" }) === "backendMissing")
-check("timeout → hint", reportFailureLike({ timedOut: true }) === "backendMissing")
+check("spawn failure with python confirmed missing → card owns it",
+  reportFailureLike({ timedOut: false, spawnFailed: true, error: "exit--1" }, true) === "cleared")
+check("timeout → its own message", reportFailureLike({ timedOut: true }) === "timeout")
 check("exit1 error doc → backend message",
   reportFailureLike({ ok: false, exitCode: 1, stdout: cap("error.json"), stderr: "", error: "exit-1" })
     .includes("not integrated"))
@@ -373,6 +383,50 @@ const onDone = (r) => doneResults.push(r)
     && r.stderr === "stderr-leftover" && doneResults.length === 1,
     JSON.stringify(doneResults))
 }
+
+// ---- Python dependency card (authorized in-panel install) ---------------------
+// All machinery is pure string/argv building plus one exit-code mapper, so
+// the whole flow is pinned here without spawning anything. The real flow:
+// probe → (missing) card → button → detached `omarchy launch floating
+// terminal with presentation <command>` → marker files → 1 s probe poll.
+check("python strings present", !!Model.strings.pythonMissingTitle && !!Model.strings.installPython
+  && !!Model.strings.installingPython && !!Model.strings.pythonInstallCanceled
+  && !!Model.strings.pythonInstallFailed && !!Model.strings.pythonInstallWaiting)
+check("python marker paths", Model.pythonMarkerPaths("/run/user/1").failure
+    === "/run/user/1/appimage-plugin-python-install.failed"
+  && Model.pythonMarkerPaths("/run/user/1").complete
+    === "/run/user/1/appimage-plugin-python-install.complete")
+check("python marker paths tolerate empty dir", Model.pythonMarkerPaths("").failure
+  === "/appimage-plugin-python-install.failed")
+
+const installArgv = Model.pythonInstallArgv("/run/user/1")
+check("python install argv opens omarchy floating terminal", installArgv.slice(0, 6).join(" ")
+  === "omarchy launch floating terminal with presentation")
+const presented = installArgv[6]
+check("python install command runs omarchy pkg add", presented.includes("omarchy pkg add python"))
+check("python install command clears markers first",
+  presented.indexOf("rm -f") !== -1
+  && presented.indexOf("rm -f") < presented.indexOf("omarchy pkg add"))
+check("python install command touches complete marker on success",
+  presented.includes(': > "/run/user/1/appimage-plugin-python-install.complete"'))
+check("python install command writes status to failure marker",
+  presented.includes('printf \'%s\\n\' "$status" > "/run/user/1/appimage-plugin-python-install.failed"'))
+check("python install command preserves exit status",
+  presented.includes('(exit "$status")'))
+
+const probeArgv = Model.pythonProbeArgv("/f", "/c", true)
+check("python probe argv shape", probeArgv[0] === "sh" && probeArgv[1] === "-c"
+  && probeArgv[3] === "sh" && probeArgv[4] === "/f" && probeArgv[5] === "/c"
+  && probeArgv[6] === "1")
+check("python probe argv idle flag", Model.pythonProbeArgv("/f", "/c", false)[6] === "0")
+
+// Exit-code semantics the panel's handleProbe routes on (pythonProbeOutcome).
+check("probe 0 → present", Model.pythonProbeOutcome(0, "", true) === "present")
+check("probe 1 → missing", Model.pythonProbeOutcome(1, "", false) === "missing")
+check("probe 3 while idle → missing", Model.pythonProbeOutcome(3, "", false) === "missing")
+check("probe 3 while installing → waiting", Model.pythonProbeOutcome(3, "", true) === "waiting")
+check("probe 2 with status 130 → canceled", Model.pythonProbeOutcome(2, "130\n", true) === "canceled")
+check("probe 2 with other status → failed", Model.pythonProbeOutcome(2, "1\n", true) === "failed")
 
 console.log(failures === 0 ? "\nALL PASS" : "\n" + failures + " FAILURES")
 process.exit(failures === 0 ? 0 : 1)

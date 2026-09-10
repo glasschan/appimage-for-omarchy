@@ -70,15 +70,19 @@ Integrate, Refresh, Check updates, Pin, Settings. Pin toggles the panel
 between the full-screen overlay and a compact floating window
 (session-only, never persisted).
 
-Errors are never silent: a missing `python3`, a hung backend, or invalid
-JSON all surface as a dismissible banner in the panel (with an
-`omarchy pkg add python` hint when the backend could not start). Status
-messages auto-clear after 5 s; errors stay until dismissed.
+Errors are never silent: a hung backend or invalid JSON surfaces as a
+dismissible banner in the panel, and a missing `python3` swaps the panel
+body for an authorized-install card (see *Install → Python dependency*).
+Status messages auto-clear after 5 s; errors stay until dismissed. A
+backend call that overruns its watchdog reports a timeout — never a
+misleading "python3 missing" hint.
 
 ## Requirements
 
 - `python3` (the backend is standard-library only) — present on a normal
-  Omarchy install; otherwise `omarchy pkg add python`.
+  Omarchy install. If it is missing, the panel offers a one-click,
+  terminal-authorized install (see below); nothing is ever installed
+  without that explicit okay.
 - `notify-send` (libnotify) for the background-check desktop notification —
   present on Omarchy; a missing binary just means no notification, never
   a failure.
@@ -102,35 +106,36 @@ sources that expose no digest refuse to install; the trust boundaries
 cannot be disabled from the environment; installs are atomic (a planted
 symlink at a destination is replaced, not written through), uninstalls
 only remove paths provably bound to the app, extraction is quota-limited
-and symlink-contained, subprocess output is size-capped on the producer
-side, and install.sh validates the staged tree before swapping and keeps
-the previous installation for rollback until the new one is validated
-and the shell is back up. Details in
+and symlink-contained, and subprocess output is size-capped on the
+producer side. Details in
 [backend/CONTRACT.md](backend/CONTRACT.md) ("Security model").
 
 ## Install
 
-From this repository:
+Everything happens through Omarchy itself — the plugin ships no install
+scripts and has no manual setup steps:
 
 ```sh
 omarchy plugin add https://github.com/glasschan/appimage-for-omarchy --enable
 ```
 
-From a local checkout (runtime files only — no tests/docs/bytecode), use the
-bundled scripts:
+Update and removal go through the shell too:
 
 ```sh
-./install.sh      # stop the shell, swap the files in atomically, restart it
-./uninstall.sh    # disable, remove the plugin dir, hint a shell restart
+omarchy plugin update io.github.glasschan.appimage   # then: omarchy restart shell
+omarchy plugin remove io.github.glasschan.appimage
 ```
 
-`./install.sh` never hot-reloads the plugin in place: it stops the Omarchy
-shell, swaps the staged runtime files into place atomically, validates the
-installed copy, and restarts the shell so it loads the new files cleanly.
-In-place hot-reloading this plugin can segfault quickshell 0.3.1 when a
-backend process exits mid-reload
-([quickshell #972](https://github.com/quickshell-mirror/quickshell/issues/972)),
-so deploys always go through a clean stop/swap/start.
+### Python dependency (authorized in the panel)
+
+The backend needs `python3` — standard library only, no pip packages. On
+the rare Omarchy install without it, the panel detects that, and its body
+is replaced by an explanation plus an **Install Python** button. Pressing
+the button is the authorization: it opens a floating Omarchy terminal
+presenting the exact command it will run (`omarchy pkg add python`), which
+you watch — and can cancel — like any terminal install. The panel polls
+the outcome and picks up automatically: success loads your AppImages,
+a cancel or failure says so.
 
 For development, validate and load straight from a checkout:
 

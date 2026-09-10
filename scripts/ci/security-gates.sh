@@ -8,12 +8,12 @@
 # Gates in this script:
 #   1  backend invariant greps (os.environ / urllib egress / atomic copy /
 #      bounded subprocess / QML collector wiring)
-#   2  shellcheck on install.sh + uninstall.sh (hard fail under CI, which
-#      always has shellcheck; warn-only on a local machine without it)
-# Gate 3 (install.sh deploy smoke test) lives in install-sh-smoke.sh and is
-# run right after this script; gate 4 (security-regression coverage
-# manifest) is backend/tests/test_security_coverage.py and therefore runs
-# inside the normal `unittest discover` suite.
+# The former gate 2 (shellcheck on the bundled install/uninstall scripts)
+# and gate 3 (install.sh deploy smoke test) died with those scripts: the
+# marketplace requires plugins to install via `omarchy plugin add`, which
+# leaves nothing repo-side to shellcheck or smoke-test. Gate 4 (security-
+# regression coverage manifest) is backend/tests/test_security_coverage.py
+# and therefore runs inside the normal `unittest discover` suite.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -208,26 +208,9 @@ else
   fail 'gate 1 (backend invariant greps)'
 fi
 
-# --- Gate 2: shellcheck. -----------------------------------------------------
-# Preinstalled on GitHub ubuntu runners, so a missing binary there is a
-# broken runner, not a reason to skip; locally it may genuinely be absent.
-if command -v shellcheck >/dev/null 2>&1; then
-  if shellcheck install.sh uninstall.sh; then
-    printf 'PASS: gate 2 — shellcheck install.sh uninstall.sh\n'
-  else
-    fail 'gate 2 (shellcheck)'
-  fi
-elif [[ -n "${CI:-}" ]]; then
-  fail "gate 2 (shellcheck): shellcheck is missing under CI — it must be " \
-    "preinstalled on ubuntu runners; refusing to skip silently"
-  exit 1
-else
-  printf 'WARN: gate 2 — shellcheck not installed locally; gate SKIPPED (CI enforces it on ubuntu-latest)\n'
-fi
-
 # --- Summary. ----------------------------------------------------------------
 if [[ -n "$FAILED_GATES" ]]; then
   printf 'security-gates: FAILED gates: %s\n' "$FAILED_GATES" >&2
   exit 1
 fi
-printf 'security-gates: PASS (invariant greps + shellcheck)\n'
+printf 'security-gates: PASS (backend invariant greps)\n'

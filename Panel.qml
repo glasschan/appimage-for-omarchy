@@ -79,6 +79,22 @@ Panel {
   // mirror of Service.qml's fetchProc/settingsProc split.
   property var updateCtx: null
 
+  // ---- python3 dependency (authorized install) ------------------------------
+  // The probe settles python presence once per open (and every second while
+  // an authorized install runs). Until it answers the panel assumes nothing;
+  // a confirmed-missing python3 swaps the body for the install card, whose
+  // button opens a visible floating terminal presenting `omarchy pkg add
+  // python` — the terminal (and its sudo prompt) is the authorization, the
+  // marker files in XDG_RUNTIME_DIR are its report channel.
+  property bool pythonStateKnown: false
+  property bool pythonMissing: false
+  property bool installingPython: false
+  // Backend.run context for the in-flight probe (null while idle).
+  property var probeCtx: null
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  readonly property string pythonFailureMarker: Model.pythonMarkerPaths(runtimeDir).failure
+  readonly property string pythonCompleteMarker: Model.pythonMarkerPaths(runtimeDir).complete
+
   // Mirrored from the shared Model store (no property notifications in a
   // JS library, so a subscription copies state into reactive properties).
   property var items: []
@@ -159,12 +175,15 @@ Panel {
 
   // argv for the backend CLI. Priority: an explicit setting handed to
   // Model.configureBackend(), then python3 + <pluginDir>/backend/main.py
-  // derived from the manifest's source dir. Nothing is hardcoded to an
-  // absolute path.
+  // derived from the manifest's source dir, then the canonical install
+  // location (the shell strips __sourceDir from third-party manifests —
+  // shell.qml publicPluginManifest() — so the manifest hint is usually
+  // absent and the PluginRegistry path is the real source of truth).
   readonly property var backendCommand: {
     var configured = Model.state.backendCommand
     if (configured && configured.length > 0) return configured
     var sourceDir = manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : ""
+    if (sourceDir === "") sourceDir = homeDir + "/.config/omarchy/plugins/" + moduleName
     if (sourceDir !== "") return ["python3", sourceDir + "/backend/main.py"]
     return []
   }
@@ -211,6 +230,9 @@ Panel {
     Model.setMockMode(false)
     if (backendCommand.length > 0) Model.configureBackend(backendCommand)
     syncFromModel()
+    // Settle the python3 state first: with it missing, refresh() below is
+    // a no-op and the install card takes over the body instead.
+    probePython()
     // Cache-first: whatever the store holds renders now; a backend rescan
     // only fires when the cache is empty or stale (never blocks the UI —
     // the Process is asynchronous and the watchdog bounds it).
@@ -252,10 +274,23 @@ Panel {
   }
 
   // Map a finished Backend.run result onto the store's error/status state.
-  // Covers: spawn failure + timeout (python3 missing / hung backend),
-  // non-JSON stdout, and the backend's own {"result":"error"} documents.
+  // Covers: watchdog timeout, spawn failure (python3 missing), non-JSON
+  // stdout, and the backend's own {"result":"error"} documents.
   function reportFailure(result, what) {
-    if (result.timedOut || result.spawnFailed || result.error === "no-backend-command") {
+    // A watchdog timeout means the backend ran but overran its budget —
+    // a different problem from "never ran at all", and blaming python3
+    // here sent users hunting for the wrong fix during slow updates.
+    if (result.timedOut) {
+      Model.setError(strings.timeout)
+      return
+    }
+    if (result.spawnFailed || result.error === "no-backend-command") {
+      // A probe-confirmed missing python3 is the install card's job — the
+      // banner would only duplicate it.
+      if (result.spawnFailed && root.pythonStateKnown && root.pythonMissing) {
+        Model.clearError()
+        return
+      }
       Model.setError(strings.backendMissing)
       return
     }
@@ -274,9 +309,87 @@ Panel {
     Model.setError(strings.backendFailed + " (" + what + ")")
   }
 
+  // ---- python3 dependency (authorized install) ------------------------------
+
+  // One probe run through the same Backend.run plumbing as every backend
+  // call: settles python presence, and while an authorized install runs,
+  // reads the terminal's marker files (Model.pythonProbeArgv). Cheap enough
+  // to re-run on every panel open and every poll tick.
+  function probePython() {
+    if (root.probeCtx && root.probeCtx.active) return
+    var ctx = Backend.run(pythonProbeProc, pythonProbeTimer,
+      Model.pythonProbeArgv(root.pythonFailureMarker, root.pythonCompleteMarker,
+        root.installingPython),
+      {}, {}, function(result) {
+        root.probeCtx = null
+        handleProbe(result.exitCode, result.stdout)
+      })
+    probeCtx = ctx && ctx.active ? ctx : null
+  }
+
+  // Route a finished probe. "waiting" keeps the poll running; "present"
+  // tears the install state down and refreshes the now-working backend;
+  // "canceled"/"failed" surface the terminal's verdict. While python is
+  // missing, refresh() early-returns and the install card owns the screen,
+  // so a racing spawn failure's banner is cleared here rather than stacked.
+  function handleProbe(exitCode, output) {
+    var outcome = Model.pythonProbeOutcome(exitCode, output, root.installingPython)
+    if (outcome === "waiting") return
+    root.pythonStateKnown = true
+    if (outcome === "missing") {
+      root.pythonMissing = true
+      Model.clearError()
+      syncFromModel()
+      return
+    }
+    if (outcome === "present") {
+      var recovered = root.pythonMissing || root.installingPython
+      root.pythonMissing = false
+      root.installingPython = false
+      pythonPoll.stop()
+      pythonInstallTimeout.stop()
+      if (recovered) {
+        Model.setStatus(strings.pythonReady)
+        syncFromModel()
+        refresh()
+      }
+      return
+    }
+    root.installingPython = false
+    pythonPoll.stop()
+    pythonInstallTimeout.stop()
+    Model.setError(outcome === "canceled"
+      ? strings.pythonInstallCanceled : strings.pythonInstallFailed)
+    syncFromModel()
+  }
+
+  // The Install button. Nothing runs until this is pressed — and what then
+  // runs is a visible floating terminal presenting the exact command (sudo
+  // prompt included), never a hidden process. The user can Ctrl-C it.
+  function installPython() {
+    if (root.installingPython) return
+    if (root.runtimeDir === "") {
+      Model.setError(strings.pythonNoRuntimeDir)
+      syncFromModel()
+      return
+    }
+    root.installingPython = true
+    Model.clearError()
+    syncFromModel()
+    // Clear stale markers first so the poll can only see THIS attempt's
+    // verdict; the terminal command clears them again defensively.
+    pythonInstallPrepProc.command = ["rm", "-f",
+      root.pythonFailureMarker, root.pythonCompleteMarker]
+    pythonInstallPrepProc.running = true
+  }
+
   function refresh() {
     if (Model.state.busy.list) return
     if (Model.state.mockMode) return
+    // Probe-confirmed missing python3: every call would just spawn-fail;
+    // the install card owns the screen until the user authorizes Python.
+    // The card's success path clears pythonMissing before refreshing.
+    if (root.pythonStateKnown && root.pythonMissing) return
     if (backendCommand.length === 0) {
       Model.setError(strings.backendMissing)
       syncFromModel()
@@ -762,6 +875,7 @@ Panel {
   Component.onCompleted: {
     syncFromModel()
     unsubscribe = Model.subscribe(syncFromModel)
+    probePython()
   }
 
   Component.onDestruction: {
@@ -794,6 +908,78 @@ Panel {
     id: backendTimer
     repeat: false
     onTriggered: Backend.handleTimeout(root.runCtx)
+  }
+
+  // ---- python3 dependency plumbing -------------------------------------------
+  // A dedicated probe Process (it must answer even while a backend call is
+  // failing or in flight), the install pair — a short marker cleanup, then
+  // the detached floating terminal — and the poll/watchdog timers. The
+  // timers are driven imperatively (restart on install start, stop on every
+  // terminal outcome) so no leftover binding can fire a stray probe.
+  Process {
+    id: pythonProbeProc
+    command: []
+    stdout: StdioCollector {
+      id: pythonProbeOutput
+      waitForEnd: true
+      // streamed producer-side bound (see Backend.feedStream)
+      onRead: function(data) { Backend.feedStream(root.probeCtx, "stdout", data) }
+    }
+    stderr: StdioCollector {
+      id: pythonProbeStderr
+      waitForEnd: true
+      onRead: function(data) { Backend.feedStream(root.probeCtx, "stderr", data) }
+    }
+    onStarted: Backend.markStarted(root.probeCtx)
+    onExited: function(exitCode) {
+      Backend.handleExit(root.probeCtx, exitCode, pythonProbeOutput.text, pythonProbeStderr.text)
+    }
+  }
+
+  Timer {
+    id: pythonProbeTimer
+    repeat: false
+    onTriggered: Backend.handleTimeout(root.probeCtx)
+  }
+
+  Process {
+    id: pythonInstallPrepProc
+    onExited: function(exitCode) {
+      if (!root.installingPython) return
+      if (exitCode !== 0) {
+        root.installingPython = false
+        Model.setError(strings.pythonInstallFailed)
+        syncFromModel()
+        return
+      }
+      pythonInstallerProc.command = Model.pythonInstallArgv(root.runtimeDir)
+      pythonInstallerProc.startDetached()
+      pythonPoll.restart()
+      pythonInstallTimeout.restart()
+    }
+  }
+
+  // Detached on purpose: the terminal outlives probe polls and reports
+  // through the marker files, not through this process object.
+  Process { id: pythonInstallerProc }
+
+  Timer {
+    id: pythonPoll
+    interval: 1000
+    repeat: true
+    onTriggered: root.probePython()
+  }
+
+  Timer {
+    id: pythonInstallTimeout
+    interval: 300000
+    onTriggered: {
+      if (!root.installingPython) return
+      root.installingPython = false
+      pythonPoll.stop()
+      Model.setError(strings.pythonInstallWaiting)
+      syncFromModel()
+    }
   }
 
   // Long-op pair for --update (F7), kept separate from backendProc so a
@@ -1230,6 +1416,59 @@ Panel {
             }
           }
 
+          // ---- Python dependency card (authorized install) --------------
+          // Shown only after the probe positively confirmed python3 is
+          // absent. The button never installs anything by itself: it opens
+          // omarchy's floating terminal presenting `omarchy pkg add python`
+          // so the user watches and authorizes every step (hyprmoncfg's
+          // plugin-managed-dependency pattern).
+          BorderSurface {
+            id: pythonCard
+            width: parent.width
+            visible: root.pythonStateKnown && root.pythonMissing
+            implicitHeight: visible ? pythonCol.implicitHeight + Style.spacing.sm * 2 : 0
+            color: Util.alpha(Color.urgent, 0.06)
+            borderSpec: Border.flat(Util.alpha(Color.urgent, 0.35), Math.max(1, Style.normalBorderWidth))
+            radius: Style.cornerRadius
+
+            Column {
+              id: pythonCol
+              width: parent.width - Style.spacing.sm * 2
+              anchors.centerIn: parent
+              spacing: Style.spacing.xs
+
+              Text {
+                text: root.strings.pythonMissingTitle
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+
+              Text {
+                text: root.strings.pythonMissingHint
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+                width: parent.width
+              }
+
+              Button {
+                width: parent.width
+                text: root.installingPython
+                  ? root.strings.installingPython : root.strings.installPython
+                enabled: !root.installingPython
+                foreground: root.foreground
+                accent: Color.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                implicitHeight: root.controlHeight
+                onClicked: root.installPython()
+              }
+            }
+          }
+
           // ---- Integrate picker (F2) ------------------------------------
           BorderSurface {
             id: pickerCard
@@ -1452,8 +1691,11 @@ Panel {
           }
 
           // ---- Body: loading / list / empty ------------------------------
+          // The install card replaces the whole body while python3 is
+          // confirmed missing — a list of nothing is noise next to it.
           Item {
             id: body
+            visible: !(root.pythonStateKnown && root.pythonMissing)
             width: parent.width
             implicitHeight: root.items.length === 0
               ? (root.busyList ? Style.space(110) : emptyCol.implicitHeight)

@@ -8,10 +8,8 @@
 #                      that keeps every reviewer finding regression-tested)
 #   frontend-js      — lib/*.js parser harness on Node
 #   plugin-manifest  — manifest/repo hygiene + the PRD §2 < 1MB size budget
-#   security-gates   — gate 1+2 (backend invariant greps + shellcheck, the
-#                      shared scripts/ci/security-gates.sh) and gate 3
-#                      (install.sh deploy smoke test, the shared
-#                      scripts/ci/install-sh-smoke.sh)
+#   security-gates   — gate 1 (backend invariant greps, the shared
+#                      scripts/ci/security-gates.sh)
 name: CI
 
 on:
@@ -131,7 +129,8 @@ jobs:
           python3 - <<'EOF'
           import os, sys
 
-          # Runtime whitelist — must stay in sync with install.sh's copy set.
+          # Runtime whitelist — the plugin's entire shipped file set
+          # (manifest, root QML, README/LICENSE, lib/, icons/, backend).
           paths = ['manifest.json', 'README.md', 'LICENSE', 'backend/main.py']
           paths += [n for n in os.listdir('.') if n.endswith('.qml') and os.path.isfile(n)]
           for d in ('lib', 'icons', 'backend/omarchy_appimage'):
@@ -155,18 +154,15 @@ jobs:
           EOF
 
   security-gates:
-    name: Security gates (invariants, shellcheck, install smoke)
+    name: Security gates (backend invariants)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Gates 1+2: backend invariant greps + shellcheck on install.sh and
-      # uninstall.sh (shared with release.yml so the two can never drift).
-      - name: Backend invariant greps + shellcheck
+      # Gate 1: backend invariant greps (shared with release.yml so the two
+      # can never drift). The former gate 2 (shellcheck) and gate 3 (deploy
+      # smoke test) died with the bundled install/uninstall scripts — the
+      # marketplace requires plugins to install via `omarchy plugin add`,
+      # which has no repo-side scripts to check.
+      - name: Backend invariant greps
         run: bash scripts/ci/security-gates.sh
-
-      # Gate 3: the real install.sh against a fake HOME, a shimmed omarchy
-      # CLI and a fake quickshell process (CI has no Omarchy running, so no
-      # PID-namespace wrapper is needed here).
-      - name: install.sh deploy smoke test
-        run: bash scripts/ci/install-sh-smoke.sh
