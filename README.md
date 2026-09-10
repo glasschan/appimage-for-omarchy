@@ -16,59 +16,11 @@ this plugin is licensed under **GPL-3.0** as well — see [LICENSE](LICENSE).
 UI icons are from [tabler-icons](https://github.com/tabler/tabler-icons)
 (MIT, Paweł Kuna) — see [icons/LICENSE-TABLER.md](icons/LICENSE-TABLER.md).
 
-## Status (F1–F9)
-
-- **List (F1)** — panel shows integrated AppImages with name, version,
-  extracted icon and a running dot. The list is cached in the shared
-  store, so opening the panel renders instantly and rescans in the
-  background (only when the cache is stale or empty — never blocking).
-  While the panel is open the running state re-polls about every 10 s
-  (only while idle), so dots stay current even if an app is closed
-  outside the panel.
-- **Integrate (F2)** — `Integrate` opens an inline picker: type a path
-  or click an AppImage found in `~/Downloads` / `~/downloads`. The
-  backend extracts the `.desktop` entry and icon, moves the file into
-  `~/AppImages` and reports success, "already integrated", or the exact
-  error. Quickshell ships no file dialog, hence the inline picker.
-- **Remove (F3)** — two-click inline confirmation on the row (click once
-  to arm "Remove?", again to trash). Targets the stable `desktop_id`, so
-  two versions of the same app coexist cleanly.
-- **Launch (F4)** — click the row (or Launch) to start the AppImage
-  detached, with `DESKTOPINTEGRATION=1` like the generated desktop entry.
-  The running dot refreshes shortly after launch.
-- **Bar widget (F5)** — tabler cube-unfolded icon + installed count; updates live as
-  the store changes (one backend probe at login seeds the count). When
-  updates are pending the badge turns urgent and counts them, and the
-  tooltip switches to the pending-updates count.
-- **Update checks (F6)** — `Check updates` in the panel header sweeps every
-  app that has an update source: the AppImage's embedded `.upd_info` string
-  (`gh-releases-zsync|…` → GitHub releases, `zsync|<url>` → static file) or
-  a custom source (F9). Rows with a new release grow an
-  "⬆ version available" marker.
-- **One-click update (F7)** — the row's `Update` button — shown only once
-  an update is actually available for that row — downloads the release
-  through the app's source and replaces the AppImage in place (same
-  filename and desktop id, so the app-menu entry stays valid). While the
-  download runs, the row's arrow loops an upward fade-out/fade-in slide
-  (no spinner). A running app is skipped with a status message instead;
-  `--keep-both` on the CLI keeps the old file next to the new one.
-- **Background checks (F8)** — the plugin ships a service kind that sweeps
-  ~5 minutes after login and then every 6 hours (defaults; both
-  configurable, or off, in the panel's settings card). Genuinely new
-  updates get one desktop notification per release — signatures are
-  deduped in `updates-state.json`, and updating an app re-arms the
-  notification for the next release.
-- **Custom update sources (F9)** — per-app source editor on each app row
-  (a padded card, like the settings card) or `--set-update-source` on the
-  CLI: Static URL, GitHub, GitLab, Codeberg, or Forgejo. The row's gear
-  opens the editor pre-filled from the stored config; clicking the same
-  gear again closes it, discarding unsaved edits. A custom source wins
-  over the embedded `.upd_info`.
-
 The panel header is a row of icon-only buttons with tooltips —
 Integrate, Refresh, Check updates, Pin, Settings. Pin toggles the panel
 between the full-screen overlay and a compact floating window
-(session-only, never persisted).
+(session-only, never persisted). When updates are pending, the bar
+badge turns urgent and counts them.
 
 Errors are never silent: a hung backend or invalid JSON surfaces as a
 dismissible banner in the panel, and a missing `python3` swaps the panel
