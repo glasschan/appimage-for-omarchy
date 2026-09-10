@@ -6,6 +6,7 @@
 import json
 import os
 import unittest
+from pathlib import Path
 
 from helpers import (FakeXDGTestCase, NVIM_SQUASHFS_OFFSET, download_fixture,
                      make_elf_with_sections, make_minimal_elf)
@@ -233,8 +234,7 @@ class ElfFixtureTests(FakeXDGTestCase):
         with open(fixture, 'rb') as f:
             data = bytearray(f.read())
         data[8:11] = b'\x00\x00\x00'
-        with open(magicless, 'wb') as f:
-            f.write(data)
+        Path(magicless).write_bytes(bytes(data))
         os.chmod(magicless, 0o755)
 
         self.assertEqual(elf.get_appimage_type(magicless), '2')

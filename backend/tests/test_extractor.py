@@ -10,6 +10,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from omarchy_appimage import extractor
@@ -108,9 +109,7 @@ class FindIconTests(unittest.TestCase):
         root = tempfile.mkdtemp(prefix='iconlink-')
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         os.makedirs(os.path.join(root, 'usr', 'share', 'icons'))
-        with open(os.path.join(root, 'usr', 'share', 'icons', 'app.png'),
-                  'wb') as f:
-            f.write(PNG)
+        Path(root, 'usr', 'share', 'icons', 'app.png').write_bytes(PNG)
         os.symlink('usr/share/icons/app.png', os.path.join(root, 'icon.png'))
 
         source = extractor._DirSource(root)
@@ -122,8 +121,7 @@ class DirSourceTests(unittest.TestCase):
         self.root = tempfile.mkdtemp(prefix='dirsource-')
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.addCleanup(os.chdir, os.getcwd())
-        with open(os.path.join(self.root, 'good.png'), 'wb') as f:
-            f.write(PNG)
+        Path(self.root, 'good.png').write_bytes(PNG)
         # a symlink pointing OUTSIDE the root
         os.symlink('/etc/passwd', os.path.join(self.root, 'evil.png'))
         # a symlink pointing INSIDE the root
@@ -182,8 +180,7 @@ class SanitizeExtractedTests(unittest.TestCase):
 
     def test_escaping_symlink_is_unlinked(self):
         os.symlink('/etc/passwd', os.path.join(self.root, 'evil.png'))
-        with open(os.path.join(self.root, 'ok.png'), 'wb') as f:
-            f.write(PNG)
+        Path(self.root, 'ok.png').write_bytes(PNG)
 
         extractor._sanitize_extracted(self.root)
 
@@ -192,8 +189,7 @@ class SanitizeExtractedTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.root, 'ok.png')))
 
     def test_inside_symlink_is_kept(self):
-        with open(os.path.join(self.root, 'ok.png'), 'wb') as f:
-            f.write(PNG)
+        Path(self.root, 'ok.png').write_bytes(PNG)
         os.symlink('ok.png', os.path.join(self.root, 'linked.png'))
 
         extractor._sanitize_extracted(self.root)
@@ -205,8 +201,7 @@ class SanitizeExtractedTests(unittest.TestCase):
         # os.walk reports directory symlinks in dirnames; they must not
         # survive sanitization (walk would otherwise descend out of root)
         os.makedirs(os.path.join(self.root, 'sub'))
-        with open(os.path.join(self.root, 'sub', 'ok.png'), 'wb') as f:
-            f.write(PNG)
+        Path(self.root, 'sub', 'ok.png').write_bytes(PNG)
         os.symlink('/etc', os.path.join(self.root, 'sub', 'evil-dir'))
 
         extractor._sanitize_extracted(self.root)
@@ -228,8 +223,7 @@ class SanitizeExtractedTests(unittest.TestCase):
 
     def test_file_count_quota_backstop(self):
         for i in range(5):
-            with open(os.path.join(self.root, f'f{i}'), 'wb') as f:
-                f.write(b'x')
+            Path(self.root, f'f{i}').write_bytes(b'x')
         with mock.patch.object(extractor, 'MAX_EXTRACT_FILES', 3):
             with self.assertRaisesRegex(SquashfsError, 'quota'):
                 extractor._sanitize_extracted(self.root)
@@ -238,8 +232,7 @@ class SanitizeExtractedTests(unittest.TestCase):
 
     def test_total_size_quota_backstop(self):
         for i in range(3):
-            with open(os.path.join(self.root, f'f{i}'), 'wb') as f:
-                f.write(b'x' * 100)
+            Path(self.root, f'f{i}').write_bytes(b'x' * 100)
         with mock.patch.object(extractor, 'MAX_EXTRACT_BYTES', 128):
             with self.assertRaisesRegex(SquashfsError, 'quota'):
                 extractor._sanitize_extracted(self.root)

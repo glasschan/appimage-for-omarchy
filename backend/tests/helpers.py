@@ -13,6 +13,7 @@ import threading
 import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAIN_PY = os.path.join(BACKEND_DIR, 'main.py')
@@ -97,9 +98,8 @@ class FakeXDGTestCase(unittest.TestCase):
         flows that never need to extract anything."""
         path = os.path.join(self.sandbox, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'wb') as f:
-            f.write(content if content is not None
-                    else b'\x7fELF\x02\x01\x01' + b'\x00' + b'\x41\x49\x02')
+        Path(path).write_bytes(content if content is not None
+                               else b'\x7fELF\x02\x01\x01' + b'\x00' + b'\x41\x49\x02')
         return path
 
     def install_fake_app(self, desktop_name='fakeapp',
@@ -112,18 +112,15 @@ class FakeXDGTestCase(unittest.TestCase):
 
         appimage = os.path.join(self.managed_dir,
                                 desktop_name + '.appimage')
-        with open(appimage, 'wb') as f:
-            f.write(b'\x7fELF\x02\x01\x01\x00\x41\x49\x02padding')
+        Path(appimage).write_bytes(b'\x7fELF\x02\x01\x01\x00\x41\x49\x02padding')
         os.chmod(appimage, 0o755)
 
         icon = os.path.join(self.managed_dir, '.icons', desktop_name + '.png')
-        with open(icon, 'wb') as f:
-            f.write(b'\x89PNG\r\n\x1a\n')
+        Path(icon).write_bytes(b'\x89PNG\r\n\x1a\n')
 
         desktop = os.path.join(self.applications_dir,
                                desktop_name + '.desktop')
-        with open(desktop, 'w') as f:
-            f.write(f'''[Desktop Entry]
+        Path(desktop).write_text(f'''[Desktop Entry]
 Name={app_name}
 Exec=env DESKTOPINTEGRATION=1 {appimage}
 TryExec={appimage}

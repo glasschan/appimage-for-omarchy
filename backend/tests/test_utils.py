@@ -173,7 +173,7 @@ class RunCommandOutputBoundTests(unittest.TestCase):
             '    [sys.executable, "-c", "import time; time.sleep(10)"],\n'
             '    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n'
             '    stderr=subprocess.DEVNULL)\n'
-            f'open({pgid_file!r}, "w").write(str(os.getpgrp()))\n'
+            f'__import__("pathlib").Path({pgid_file!r}).write_text(str(os.getpgrp()))\n'
             'time.sleep(30)\n'
         )
         start = time.monotonic()

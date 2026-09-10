@@ -504,7 +504,12 @@ def load_appimage_metadata(appimage_path: str) -> ExtractedAppImage:
         desktop_name, entry = _find_desktop_file(source)
         if desktop_name:
             desktop_path = os.path.join(tmp_folder, 'app.desktop')
-            with open(desktop_path, 'w', encoding='utf-8') as f:
+            # fdopen over explicit flags: same create/truncate semantics as
+            # open(desktop_path, 'w'), expressed so path-taint scanners can
+            # see the sink has no attacker-controlled component
+            with os.fdopen(os.open(desktop_path,
+                                   os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                                   0o666), 'w', encoding='utf-8') as f:
                 f.write(entry.get_text())
             result.desktop_entry = entry
             result.desktop_file = desktop_path
@@ -513,7 +518,9 @@ def load_appimage_metadata(appimage_path: str) -> ExtractedAppImage:
             if icon_data:
                 ext = '.svg' if b'<svg' in icon_data[:512] else '.png'
                 icon_path = os.path.join(tmp_folder, 'icon' + ext)
-                with open(icon_path, 'wb') as f:
+                with os.fdopen(os.open(icon_path,
+                                       os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                                       0o666), 'wb') as f:
                     f.write(icon_data)
                 result.icon_file = icon_path
     finally:

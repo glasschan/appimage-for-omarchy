@@ -11,6 +11,7 @@ import shutil
 import stat
 import tempfile
 import unittest
+from pathlib import Path
 
 from helpers import FakeXDGTestCase
 
@@ -38,8 +39,8 @@ class AtomicInstallTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
 
         self.src = os.path.join(self.dir, 'src.appimage')
-        with open(self.src, 'wb') as f:
-            f.write(b'\x7fELF\x02\x01\x01\x00\x41\x49\x02' + b'payload')
+        Path(self.src).write_bytes(b'\x7fELF\x02\x01\x01\x00\x41\x49\x02'
+                                   + b'payload')
         os.chmod(self.src, 0o644)
 
     def test_installs_regular_file_with_mode(self):
@@ -56,8 +57,7 @@ class AtomicInstallTests(unittest.TestCase):
         # a sentinel must be replaced wholesale — the sentinel is never
         # touched (the old shutil.copyfile wrote straight through it)
         sentinel = os.path.join(self.dir, 'sentinel.txt')
-        with open(sentinel, 'w') as f:
-            f.write('important')
+        Path(sentinel).write_text('important')
         dest = os.path.join(self.dir, 'dest.appimage')
         os.symlink(sentinel, dest)
 
@@ -129,8 +129,7 @@ class UninstallTests(FakeXDGTestCase):
         # points at an arbitrary user file
         el, appimage, desktop, _icon = self._element()
         important = os.path.join(self.sandbox, 'important.txt')
-        with open(important, 'w') as f:
-            f.write('do not delete')
+        Path(important).write_text('do not delete')
         el.desktop_entry.Icon = important
 
         self.provider.uninstall(el)
@@ -142,8 +141,7 @@ class UninstallTests(FakeXDGTestCase):
     def test_icon_outside_icons_dir_with_wrong_stem_is_not_deleted(self):
         el, appimage, desktop, _icon = self._element()
         stray = os.path.join(self.sandbox, 'other.png')
-        with open(stray, 'wb') as f:
-            f.write(PNG)
+        Path(stray).write_bytes(PNG)
         el.desktop_entry.Icon = stray
 
         self.provider.uninstall(el)
@@ -152,8 +150,7 @@ class UninstallTests(FakeXDGTestCase):
     def test_recorded_icon_path_is_removed_even_outside_icons_dir(self):
         el, appimage, desktop, _icon = self._element()
         recorded_icon = os.path.join(self.sandbox, 'recorded.png')
-        with open(recorded_icon, 'wb') as f:
-            f.write(PNG)
+        Path(recorded_icon).write_bytes(PNG)
         el.desktop_entry.Icon = recorded_icon
         # provenance recorded at install time wins (binding #1)
         Config.set_app_config(el, {

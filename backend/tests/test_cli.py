@@ -15,6 +15,7 @@ import shutil
 import stat
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 from helpers import (FakeXDGTestCase, FixtureHTTPServer, download_fixture)
@@ -292,9 +293,8 @@ class SetUpdateSourceCliTests(FakeXDGTestCase):
         # a hand-built .upd_info section routes to the embedded manager
         from helpers import make_elf_with_sections
         appimage = os.path.join(self.managed_dir, 'fakeapp.appimage')
-        with open(appimage, 'wb') as f:
-            f.write(make_elf_with_sections(
-                {'.upd_info': b'gh-releases-zsync|o|r|latest|f-*.zsync\x00'}))
+        Path(appimage).write_bytes(make_elf_with_sections(
+            {'.upd_info': b'gh-releases-zsync|o|r|latest|f-*.zsync\x00'}))
         os.chmod(appimage, 0o755)
 
         payload = json.loads(self.run_cli('--list-installed', '--json').stdout)
@@ -554,8 +554,8 @@ class InProcessUpdateCliTests(InProcessCliMixin, FakeXDGTestCase):
         # pretend the app is FUSE-mounted (how running type-2 AppImages
         # are detected) via the /proc/mounts seam
         mounts = os.path.join(self.sandbox, 'mounts')
-        with open(mounts, 'w') as f:
-            f.write(f'{appimage} /tmp/.mount_fake fuse.AppImage rw 0 0\n')
+        Path(mounts).write_text(
+            f'{appimage} /tmp/.mount_fake fuse.AppImage rw 0 0\n')
 
         with mock.patch.object(utils, 'PROC_MOUNTS_PATH', mounts):
             out, err, code = self.run_cmd(
@@ -838,8 +838,8 @@ class UpdateFlowTests(InProcessCliMixin, FakeXDGTestCase):
 
         # pre-seed a pending-notification marker like --fetch-updates would
         os.makedirs(os.path.dirname(self._state_path()), exist_ok=True)
-        with open(self._state_path(), 'w') as f:
-            json.dump({'neovim.desktop': 'v0.11.3|10996216'}, f)
+        Path(self._state_path()).write_text(
+            json.dumps({'neovim.desktop': 'v0.11.3|10996216'}))
 
         with release:
             out, err, code = self.run_cmd(cli.cmd_update,

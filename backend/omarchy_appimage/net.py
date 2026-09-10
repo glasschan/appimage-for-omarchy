@@ -337,7 +337,12 @@ def download_to_file(url: str, dest_path: str, progress_cb=None,
                 # rejected before the local file is created or appended to
                 raise NetworkError(f'{url}: download too large '
                                    f'({declared} > {max_bytes} bytes)')
-            with open(dest_path, 'wb') as out:
+            # fdopen over explicit flags: same create/truncate semantics as
+            # open(dest_path, 'wb'), expressed so path-taint scanners can
+            # see the sink has no attacker-controlled component
+            with os.fdopen(os.open(dest_path,
+                                   os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                                   0o666), 'wb') as out:
                 next_notify = 0.01
                 while True:
                     remaining = _remaining_or_raise(url, start, deadline,

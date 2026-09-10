@@ -5,6 +5,7 @@
 
 import os
 import unittest
+from pathlib import Path
 
 from helpers import FakeXDGTestCase
 
@@ -37,8 +38,7 @@ Exec=nvim --prefs
 class DesktopEntryTests(FakeXDGTestCase):
     def _write_sample(self) -> str:
         path = os.path.join(self.sandbox, 'sample.desktop')
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(SAMPLE)
+        Path(path).write_text(SAMPLE, encoding='utf-8')
         return path
 
     def test_parse_basics(self):

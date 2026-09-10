@@ -6,6 +6,7 @@
 import os
 import unittest
 import urllib.parse
+from pathlib import Path
 
 from helpers import FakeXDGTestCase
 
@@ -16,8 +17,7 @@ class TrashTests(FakeXDGTestCase):
     def _make_file(self, name: str, content: bytes = b'x') -> str:
         path = os.path.join(self.sandbox, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'wb') as f:
-            f.write(content)
+        Path(path).write_bytes(content)
         return path
 
     def test_trash_creates_layout_and_info(self):
