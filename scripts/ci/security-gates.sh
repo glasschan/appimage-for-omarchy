@@ -7,7 +7,7 @@
 #
 # Gates in this script:
 #   1  backend invariant greps (os.environ / urllib egress / atomic copy /
-#      bounded subprocess / QML collector wiring)
+#      bounded subprocess / QML collector wiring / shell-source constancy)
 # The former gate 2 (shellcheck on the bundled install/uninstall scripts)
 # and gate 3 (install.sh deploy smoke test) died with those scripts: the
 # marketplace requires plugins to install via `omarchy plugin add`, which
@@ -196,11 +196,75 @@ for path in QML:
                 'StdioCollector block without onRead: — the producer-side '
                 'stream bound must stay wired')
 
+# Rule 7: shell-source constancy (round-3 finding). The functions below
+# build the shell SOURCE STRING handed to `omarchy launch floating terminal
+# with presentation`, and that wrapper turns the string into bash source
+# (presentation_script="…; $cmd; …" → bash -c). The source must therefore
+# be CONSTANT: environment-derived values may only ever appear as shell
+# expansions inside double quotes ("${XDG_RUNTIME_DIR:?}…") or as argv/env
+# data (sh -c script sh "$1" …), never interpolated into the literal. Any
+# of these tokens inside a builder body means runtime values are being
+# spliced into shell source: runtimeDir / Quickshell.env (environment
+# reads), pythonMarkerPaths / marker. (paths derived from a runtime dir).
+SHELL_SOURCE_BUILDERS = ['pythonInstallCommand', 'pythonInstallPrepScript']
+BUILDER_TOKENS = ['runtimeDir', 'Quickshell.env', 'pythonMarkerPaths', 'marker.']
+builder_res = [re.compile(r'\bfunction\s+' + re.escape(name) + r'\s*\(')
+               for name in SHELL_SOURCE_BUILDERS]
+for path in sorted(ROOT.glob('lib/*.js')) + QML:
+    # strip_comments_and_strings() (defined under rule 6) blanks // and
+    # /* */ comments AND the contents of string literals while preserving
+    # newlines — so line numbers stay true, a "//" inside a string literal
+    # cannot truncate the scan, and builder doc comments that merely
+    # discuss runtimeDir stay clean. Only live code can trip the rule.
+    text = strip_comments_and_strings(path.read_text(encoding='utf-8'))
+    for name, bres in zip(SHELL_SOURCE_BUILDERS, builder_res):
+        for m in bres.finditer(text):
+            lineno = text.count('\n', 0, m.start()) + 1
+            open_brace = text.find('{', m.end())
+            if open_brace == -1:
+                err('shell-source-constancy', path, lineno,
+                    f'{name}() without a brace block')
+                continue
+            depth, i = 0, open_brace
+            while i < len(text):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            if i >= len(text):
+                err('shell-source-constancy', path, lineno,
+                    f'{name}() has no closing brace — unbalanced builder '
+                    'body, the rule cannot bound its scan')
+                continue
+            # Model.js top-level builders close at column 0; anything else
+            # is a layout change worth a loud look before trusting the rule
+            # (the token scan below stays correctly bounded regardless).
+            line_start = text.rfind('\n', 0, i) + 1
+            line_end = text.find('\n', i)
+            if line_end == -1:
+                line_end = len(text)
+            if text[line_start:line_end] != '}':
+                err('shell-source-constancy', path,
+                    text.count('\n', 0, i) + 1,
+                    f'{name}() closes at a non-column-0 brace — top-level '
+                    'builders close at column 0; re-check the body bounds')
+            for token in BUILDER_TOKENS:
+                for tm in re.finditer(re.escape(token), text[m.start():i + 1]):
+                    err('shell-source-constancy', path,
+                        text.count('\n', 0, m.start() + tm.start()) + 1,
+                        f'{name}() interpolates "{token}" into shell '
+                        'source — the presented string must be constant; '
+                        'environment values only as expansion/argv data')
+
 if errors:
     print(f'gate 1: {len(errors)} backend invariant violation(s)')
     sys.exit(1)
 print('gate 1: backend invariants OK '
-      '(env boundary, egress, atomic install, bounded subprocess, QML collectors)')
+      '(env boundary, egress, atomic install, bounded subprocess, '
+      'QML collectors, shell-source constancy)')
 PY
 then
   printf 'PASS: gate 1 — backend invariant greps\n'

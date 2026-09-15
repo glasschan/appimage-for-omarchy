@@ -84,10 +84,13 @@ The backend needs `python3` — standard library only, no pip packages. On
 the rare Omarchy install without it, the panel detects that, and its body
 is replaced by an explanation plus an **Install Python** button. Pressing
 the button is the authorization: it opens a floating Omarchy terminal
-presenting the exact command it will run (`omarchy pkg add python`), which
-you watch — and can cancel — like any terminal install. The panel polls
-the outcome and picks up automatically: success loads your AppImages,
-a cancel or failure says so.
+presenting the exact command it will run (`/usr/bin/omarchy pkg add
+python`), which you watch — and can cancel — like any terminal install.
+The command is a fixed string (your `XDG_RUNTIME_DIR` is never spliced
+into it), and the install is refused up front unless that directory is an
+absolute, owner-only (0700) directory owned by you. The panel polls the
+outcome and picks up automatically: success loads your AppImages, a
+cancel or failure says so.
 
 For development, validate and load straight from a checkout:
 

@@ -391,7 +391,8 @@ const onDone = (r) => doneResults.push(r)
 // terminal with presentation <command>` → marker files → 1 s probe poll.
 check("python strings present", !!Model.strings.pythonMissingTitle && !!Model.strings.installPython
   && !!Model.strings.installingPython && !!Model.strings.pythonInstallCanceled
-  && !!Model.strings.pythonInstallFailed && !!Model.strings.pythonInstallWaiting)
+  && !!Model.strings.pythonInstallFailed && !!Model.strings.pythonInstallWaiting
+  && !!Model.strings.pythonNoRuntimeDir)
 check("python marker paths", Model.pythonMarkerPaths("/run/user/1").failure
     === "/run/user/1/appimage-plugin-python-install.failed"
   && Model.pythonMarkerPaths("/run/user/1").complete
@@ -399,20 +400,77 @@ check("python marker paths", Model.pythonMarkerPaths("/run/user/1").failure
 check("python marker paths tolerate empty dir", Model.pythonMarkerPaths("").failure
   === "/appimage-plugin-python-install.failed")
 
-const installArgv = Model.pythonInstallArgv("/run/user/1")
+const installArgv = Model.pythonInstallArgv()
 check("python install argv opens omarchy floating terminal", installArgv.slice(0, 6).join(" ")
-  === "omarchy launch floating terminal with presentation")
+  === "/usr/bin/omarchy launch floating terminal with presentation")
 const presented = installArgv[6]
-check("python install command runs omarchy pkg add", presented.includes("omarchy pkg add python"))
+check("python install command runs omarchy pkg add",
+  presented.includes("/usr/bin/omarchy pkg add python"))
 check("python install command clears markers first",
-  presented.indexOf("rm -f") !== -1
-  && presented.indexOf("rm -f") < presented.indexOf("omarchy pkg add"))
+  presented.indexOf("/usr/bin/rm -f") !== -1
+  && presented.indexOf("/usr/bin/rm -f") < presented.indexOf("/usr/bin/omarchy pkg add"))
 check("python install command touches complete marker on success",
-  presented.includes(': > "/run/user/1/appimage-plugin-python-install.complete"'))
+  presented.includes(': > "${XDG_RUNTIME_DIR:?}/appimage-plugin-python-install.complete"'))
 check("python install command writes status to failure marker",
-  presented.includes('printf \'%s\\n\' "$status" > "/run/user/1/appimage-plugin-python-install.failed"'))
+  presented.includes('printf \'%s\\n\' "$status" > "${XDG_RUNTIME_DIR:?}/appimage-plugin-python-install.failed"'))
 check("python install command preserves exit status",
   presented.includes('(exit "$status")'))
+check("python install command absolute paths only",
+  !presented.includes(" rm ") && !presented.includes("; omarchy ")
+  && !presented.includes(";rm ") && !presented.includes(";omarchy "))
+
+// Round-3 security finding: XDG_RUNTIME_DIR used to be interpolated into the
+// presented shell SOURCE (the omarchy wrapper does bash -c "$cmd"), so a
+// crafted runtime-dir value executed as code on Install. The source must be
+// CONSTANT: environment-derived values may only ever reach the terminal as
+// shell expansions inside double quotes or as argv/env data — never this
+// string. HOSTILE_DIRS includes command substitutions, backticks, quote
+// breakouts, newlines, expansions, traversal, relative and empty values.
+const HOSTILE_DIRS = ["$(id > /tmp/pwned)", "`id > /tmp/pwned`", '"; evil; :"', "a\nnewline", "$PATH", "/run/user/1/../../escape", "relative/path", "", "/run/user/1"]
+{
+  const constantSource = Model.pythonInstallArgv().slice(-1)[0]
+  let identical = true
+  for (const dir of HOSTILE_DIRS) {
+    // Exercise the whole builder chain for each hostile value: whatever the
+    // environment holds, the presented shell line may not change.
+    Model.pythonMarkerPaths(dir)
+    if (Model.pythonInstallArgv().slice(-1)[0] !== constantSource) identical = false
+  }
+  check("shell source constant regardless of environment-derived input",
+    identical === true, "presented command changed with hostile runtime dir")
+  check("shell source free of hostile values",
+    constantSource.indexOf("$(id") === -1 && constantSource.indexOf("`") === -1
+    && constantSource.indexOf("\n") === -1 && constantSource.indexOf("$PATH") === -1,
+    JSON.stringify(constantSource))
+  check("shell source reads runtime dir via :? expansion",
+    constantSource.includes("${XDG_RUNTIME_DIR:?}"))
+}
+
+// Cheap panel-side gate: syntactic absolute-path sanity only (the
+// filesystem-level owner/mode check is the prep script below).
+check("runtime dir usable rejects empty", Model.pythonRuntimeDirUsable("") === false)
+check("runtime dir usable rejects relative", Model.pythonRuntimeDirUsable("relative/path") === false)
+check("runtime dir usable rejects traversal",
+  Model.pythonRuntimeDirUsable("/run/user/1/../../escape") === false)
+check("runtime dir usable accepts absolute", Model.pythonRuntimeDirUsable("/run/user/1") === true)
+
+// Prep step: constant `sh -c` source + the runtime dir/markers as argv DATA.
+const prepArgv = Model.pythonInstallPrepArgv("/run/user/1")
+const prepScript = prepArgv[2]
+check("python prep argv shape", prepArgv[0] === "sh" && prepArgv[1] === "-c"
+  && typeof prepScript === "string" && prepArgv[3] === "sh"
+  && prepArgv[4] === "/run/user/1"
+  && prepArgv[5] === "/run/user/1/appimage-plugin-python-install.failed"
+  && prepArgv[6] === "/run/user/1/appimage-plugin-python-install.complete",
+  JSON.stringify(prepArgv))
+check("python prep argv passes empty dir verbatim",
+  Model.pythonInstallPrepArgv("")[4] === "")
+check("python prep script guards the runtime dir",
+  prepScript.includes('case "$1" in') && prepScript.includes("stat -c %a")
+  && prepScript.includes('"700"'), JSON.stringify(prepScript))
+check("python prep script is positional-only",
+  prepScript.indexOf("runtimeDir") === -1 && prepScript.indexOf("pythonMarkerPaths") === -1
+  && prepScript.includes('"$1"') && prepScript.includes('"$2"') && prepScript.includes('"$3"'))
 
 const probeArgv = Model.pythonProbeArgv("/f", "/c", true)
 check("python probe argv shape", probeArgv[0] === "sh" && probeArgv[1] === "-c"

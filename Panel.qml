@@ -83,9 +83,16 @@ Panel {
   // The probe settles python presence once per open (and every second while
   // an authorized install runs). Until it answers the panel assumes nothing;
   // a confirmed-missing python3 swaps the body for the install card, whose
-  // button opens a visible floating terminal presenting `omarchy pkg add
-  // python` — the terminal (and its sudo prompt) is the authorization, the
-  // marker files in XDG_RUNTIME_DIR are its report channel.
+  // button opens a visible floating terminal presenting `/usr/bin/omarchy
+  // pkg add python` — the terminal (and its sudo prompt) is the
+  // authorization, the marker files under XDG_RUNTIME_DIR are its report
+  // channel. The presented terminal command is a CONSTANT shell source (the
+  // omarchy wrapper would run an interpolated string as bash source): it
+  // reads XDG_RUNTIME_DIR itself via "${XDG_RUNTIME_DIR:?}" expansion, and
+  // the runtime dir the panel holds is validated — syntactically by
+  // Model.pythonRuntimeDirUsable(), then authoritatively by the prep step
+  // (absolute, a directory, owned by the euid, mode 700) — and travels
+  // only as argv data, never inside a shell string.
   property bool pythonStateKnown: false
   property bool pythonMissing: false
   property bool installingPython: false
@@ -364,11 +371,13 @@ Panel {
   }
 
   // The Install button. Nothing runs until this is pressed — and what then
-  // runs is a visible floating terminal presenting the exact command (sudo
-  // prompt included), never a hidden process. The user can Ctrl-C it.
+  // runs is a visible floating terminal presenting the exact (constant)
+  // command (sudo prompt included), never a hidden process. The user can
+  // Ctrl-C it. The runtime dir gets its cheap syntactic gate here; the
+  // prep step below re-checks the filesystem before the terminal launches.
   function installPython() {
     if (root.installingPython) return
-    if (root.runtimeDir === "") {
+    if (!Model.pythonRuntimeDirUsable(root.runtimeDir)) {
       Model.setError(strings.pythonNoRuntimeDir)
       syncFromModel()
       return
@@ -376,10 +385,11 @@ Panel {
     root.installingPython = true
     Model.clearError()
     syncFromModel()
-    // Clear stale markers first so the poll can only see THIS attempt's
+    // The prep script re-validates the runtime dir against the filesystem
+    // (absolute, directory, euid-owned, mode 700 — exit 5 = refused) and
+    // clears stale markers so the poll can only see THIS attempt's
     // verdict; the terminal command clears them again defensively.
-    pythonInstallPrepProc.command = ["rm", "-f",
-      root.pythonFailureMarker, root.pythonCompleteMarker]
+    pythonInstallPrepProc.command = Model.pythonInstallPrepArgv(root.runtimeDir)
     pythonInstallPrepProc.running = true
   }
 
@@ -912,10 +922,11 @@ Panel {
 
   // ---- python3 dependency plumbing -------------------------------------------
   // A dedicated probe Process (it must answer even while a backend call is
-  // failing or in flight), the install pair — a short marker cleanup, then
-  // the detached floating terminal — and the poll/watchdog timers. The
-  // timers are driven imperatively (restart on install start, stop on every
-  // terminal outcome) so no leftover binding can fire a stray probe.
+  // failing or in flight), the install pair — a short prep that re-validates
+  // the runtime dir and clears stale markers, then the detached floating
+  // terminal — and the poll/watchdog timers. The timers are driven
+  // imperatively (restart on install start, stop on every terminal outcome)
+  // so no leftover binding can fire a stray probe.
   Process {
     id: pythonProbeProc
     command: []
@@ -946,13 +957,23 @@ Panel {
     id: pythonInstallPrepProc
     onExited: function(exitCode) {
       if (!root.installingPython) return
+      // 5 = the prep script refused the runtime dir (not an absolute
+      // directory owned by the euid with mode 700): the cheap JS gate
+      // passed but the filesystem disagreed, so surface the same message
+      // and stand down without ever opening the terminal.
+      if (exitCode === 5) {
+        root.installingPython = false
+        Model.setError(strings.pythonNoRuntimeDir)
+        syncFromModel()
+        return
+      }
       if (exitCode !== 0) {
         root.installingPython = false
         Model.setError(strings.pythonInstallFailed)
         syncFromModel()
         return
       }
-      pythonInstallerProc.command = Model.pythonInstallArgv(root.runtimeDir)
+      pythonInstallerProc.command = Model.pythonInstallArgv()
       pythonInstallerProc.startDetached()
       pythonPoll.restart()
       pythonInstallTimeout.restart()
@@ -1419,9 +1440,9 @@ Panel {
           // ---- Python dependency card (authorized install) --------------
           // Shown only after the probe positively confirmed python3 is
           // absent. The button never installs anything by itself: it opens
-          // omarchy's floating terminal presenting `omarchy pkg add python`
-          // so the user watches and authorizes every step (hyprmoncfg's
-          // plugin-managed-dependency pattern).
+          // omarchy's floating terminal presenting `/usr/bin/omarchy pkg
+          // add python` so the user watches and authorizes every step
+          // (hyprmoncfg's plugin-managed-dependency pattern).
           BorderSurface {
             id: pythonCard
             width: parent.width

@@ -62,6 +62,9 @@ REQUIRED_SCENARIOS = [
      [{'killpg'}, {'process_group'}], False),
     ('env kill switch stays dead (no ALLOW_LOCAL re-entry)',
      [{'allow_local'}, {'environ'}, {'env_var'}], False),
+    ('shell source stays constant under hostile runtime dir (round 3: '
+     'XDG_RUNTIME_DIR must never be interpolated into the presented command)',
+     [{'hostile', 'constant'}], True),
 ]
 
 
