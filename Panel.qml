@@ -96,6 +96,12 @@ Panel {
   property bool pythonStateKnown: false
   property bool pythonMissing: false
   property bool installingPython: false
+  // Install-button verify gate (verify-then-start): set when the user
+  // presses Install and consumed by the next probe result, which alone
+  // decides whether the prep step + terminal may start. The verify probe
+  // runs with installingPython=false — a plain presence check, so stale
+  // marker files from an old attempt cannot trigger a new terminal.
+  property bool installVerifyPending: false
   // Backend.run context for the in-flight probe (null while idle).
   property var probeCtx: null
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
@@ -341,11 +347,38 @@ Panel {
   // so a racing spawn failure's banner is cleared here rather than stacked.
   function handleProbe(exitCode, output) {
     var outcome = Model.pythonProbeOutcome(exitCode, output, root.installingPython)
+    // Verify-then-start: a pending Install press is answered by this probe
+    // alone. Only a confirmed-missing verdict backed by a REAL exit may
+    // start the install; any other outcome stands down — "present" falls
+    // through to the present branch below (python is already there, the
+    // refresh IS the answer), and canceled/failed can only arrive from a
+    // stale install-mode poll the click rode on, none of which may open a
+    // terminal. The exitCode >= 0 gate matters: a probe that never
+    // answered arrives from Backend.handleTimeout as exitCode -1, which
+    // the outcome mapper's fall-through default also labels "missing" —
+    // trusting that would open the sudo terminal with no presence check
+    // at all.
+    if (root.installVerifyPending) {
+      root.installVerifyPending = false
+      if (outcome === "missing" && exitCode >= 0) {
+        startPythonInstall()
+        return
+      }
+      if (outcome !== "present") {
+        syncFromModel()
+        return
+      }
+    }
     if (outcome === "waiting") return
     root.pythonStateKnown = true
     if (outcome === "missing") {
+      // Wipe a stale banner only on the false→true transition: the slow
+      // post-timeout poll re-reports "missing" every 15 s, and an
+      // unconditional clear would keep erasing the pythonInstallWaiting
+      // message the timeout just posted.
+      var wasMissing = root.pythonMissing
       root.pythonMissing = true
-      Model.clearError()
+      if (!wasMissing) Model.clearError()
       syncFromModel()
       return
     }
@@ -355,6 +388,7 @@ Panel {
       root.installingPython = false
       pythonPoll.stop()
       pythonInstallTimeout.stop()
+      pythonSlowPoll.stop()
       if (recovered) {
         Model.setStatus(strings.pythonReady)
         syncFromModel()
@@ -365,6 +399,9 @@ Panel {
     root.installingPython = false
     pythonPoll.stop()
     pythonInstallTimeout.stop()
+    // Defensive: a canceled/failed verdict also retires the slow poll so a
+    // dead attempt cannot keep probing behind the error banner.
+    pythonSlowPoll.stop()
     Model.setError(outcome === "canceled"
       ? strings.pythonInstallCanceled : strings.pythonInstallFailed)
     syncFromModel()
@@ -374,7 +411,21 @@ Panel {
   // runs is a visible floating terminal presenting the exact (constant)
   // command (sudo prompt included), never a hidden process. The user can
   // Ctrl-C it. The runtime dir gets its cheap syntactic gate here; the
-  // prep step below re-checks the filesystem before the terminal launches.
+  // prep step re-checks the filesystem before the terminal launches.
+  //
+  // Verify-then-start: the click does NOT spawn anything directly. It arms
+  // installVerifyPending and probes; only a confirmed-missing answer
+  // (handleProbe → startPythonInstall) opens the terminal. The guarantee
+  // is bounded but real: a terminal only ever opens behind a fresh
+  // absence verdict, and a completed install is never followed by a
+  // redundant one. It does NOT dedupe against an earlier terminal still
+  // sitting at its sudo prompt — a post-timeout re-press probes missing
+  // again and can still open a second `pkg add` (the old
+  // concurrent-pacman-lock race survives in that corner). Single-flight
+  // nuance: if a probe is already in flight, probePython() early-returns
+  // and the pending flag rides on THAT probe's result; only in the rare
+  // case that probe already delivered does the click look inert —
+  // pressing again re-arms.
   function installPython() {
     if (root.installingPython) return
     if (!Model.pythonRuntimeDirUsable(root.runtimeDir)) {
@@ -382,15 +433,29 @@ Panel {
       syncFromModel()
       return
     }
+    // A slow poll from a timed-out attempt may still be running; this new
+    // attempt owns the flow from here.
+    pythonSlowPoll.stop()
+    root.installVerifyPending = true
+    probePython()
+  }
+
+  // The verified install start, reached only through handleProbe once the
+  // verify probe confirmed python3 is still missing. Enters install mode,
+  // then arms the prep step: it re-validates the runtime dir against the
+  // filesystem (absolute, directory, euid-owned, mode 700 — exit 5 =
+  // refused) and clears stale markers so the poll can only see THIS
+  // attempt's verdict; the terminal command clears them again defensively.
+  function startPythonInstall() {
     root.installingPython = true
     Model.clearError()
     syncFromModel()
-    // The prep script re-validates the runtime dir against the filesystem
-    // (absolute, directory, euid-owned, mode 700 — exit 5 = refused) and
-    // clears stale markers so the poll can only see THIS attempt's
-    // verdict; the terminal command clears them again defensively.
     pythonInstallPrepProc.command = Model.pythonInstallPrepArgv(root.runtimeDir)
     pythonInstallPrepProc.running = true
+    // Prep watchdog: nothing else bounds the prep step (the install
+    // timeout only arms after prep success), so a hung prep would leave
+    // installingPython stuck true forever without this.
+    pythonPrepTimer.restart()
   }
 
   function refresh() {
@@ -892,6 +957,16 @@ Panel {
     if (unsubscribe) unsubscribe()
   }
 
+  // Closing the panel (every path — Escape, outside click, host hide, IPC
+  // close — ends in `opened` going false) stops the post-timeout recovery
+  // poll, and the install timeout itself only starts that poll while the
+  // panel is open — so no 15 s probe survives a closed panel for the
+  // shell's lifetime. open() re-probes on every open, and a fresh Install
+  // press re-arms recovery.
+  onOpenedChanged: {
+    if (!root.opened) pythonSlowPoll.stop()
+  }
+
   Process {
     id: backendProc
     command: []
@@ -956,6 +1031,9 @@ Panel {
   Process {
     id: pythonInstallPrepProc
     onExited: function(exitCode) {
+      // Any real exit retires the one-shot watchdog first: the timer must
+      // never fire after the prep answered.
+      pythonPrepTimer.stop()
       if (!root.installingPython) return
       // 5 = the prep script refused the runtime dir (not an absolute
       // directory owned by the euid with mode 700): the cheap JS gate
@@ -968,8 +1046,10 @@ Panel {
         return
       }
       if (exitCode !== 0) {
+        // The terminal never opened here, so the terminal-focused install
+        // copy would be a lie — this message says nothing was changed.
         root.installingPython = false
-        Model.setError(strings.pythonInstallFailed)
+        Model.setError(strings.pythonInstallPrepFailed)
         syncFromModel()
         return
       }
@@ -977,6 +1057,24 @@ Panel {
       pythonInstallerProc.startDetached()
       pythonPoll.restart()
       pythonInstallTimeout.restart()
+    }
+  }
+
+  // Prep watchdog: bounds the prep Process (10 s for local stat/rm work is
+  // generous — the install watchdog only arms after prep success, so this
+  // is the only bound a hung prep can ever have). Kill it, stand down and
+  // show the honest prep-failure copy; the eventual onExited is a no-op
+  // because installingPython is already false here.
+  Timer {
+    id: pythonPrepTimer
+    interval: 10000
+    repeat: false
+    onTriggered: {
+      if (!pythonInstallPrepProc.running) return
+      pythonInstallPrepProc.running = false
+      root.installingPython = false
+      Model.setError(strings.pythonInstallPrepFailed)
+      root.syncFromModel()
     }
   }
 
@@ -1000,7 +1098,34 @@ Panel {
       pythonPoll.stop()
       Model.setError(strings.pythonInstallWaiting)
       syncFromModel()
+      // The terminal can outlive the panel's patience: hand recovery to a
+      // slow probe — but only while the panel is open. A timeout firing on
+      // a closed panel (Install, then close mid-install) must not start a
+      // 15 s probe that outlives the session; open() re-probes on every
+      // open and a fresh Install press re-arms recovery instead. The probe
+      // re-checks python presence from the SYSTEM every 15 s —
+      // installingPython is false now, so it ignores the markers and plain
+      // `command -v python3` decides; a leftover marker cannot
+      // false-positive it. When the user finishes the install in the
+      // still-open terminal, the next tick flips the open panel to
+      // pythonReady through handleProbe's recovered path — no reopen
+      // needed.
+      if (root.opened) pythonSlowPoll.restart()
     }
+  }
+
+  // Post-timeout recovery poll: 15 s probes that keep an OPEN panel
+  // learning after the 5-minute install watchdog gave up. Only ever
+  // started while the panel is open (the timeout gates its restart on
+  // root.opened), and stopped on any terminal verdict
+  // (present/canceled/failed), when a new install attempt starts, and
+  // when the panel closes; open() re-probes on every open, so reopening
+  // resumes recovery from a settled state.
+  Timer {
+    id: pythonSlowPoll
+    interval: 15000
+    repeat: true
+    onTriggered: root.probePython()
   }
 
   // Long-op pair for --update (F7), kept separate from backendProc so a

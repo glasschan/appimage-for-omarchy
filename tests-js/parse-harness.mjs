@@ -392,7 +392,13 @@ const onDone = (r) => doneResults.push(r)
 check("python strings present", !!Model.strings.pythonMissingTitle && !!Model.strings.installPython
   && !!Model.strings.installingPython && !!Model.strings.pythonInstallCanceled
   && !!Model.strings.pythonInstallFailed && !!Model.strings.pythonInstallWaiting
-  && !!Model.strings.pythonNoRuntimeDir)
+  && !!Model.strings.pythonNoRuntimeDir && !!Model.strings.pythonInstallPrepFailed)
+// The prep-failure copy must stay honest: the terminal never opened, so
+// nothing was installed — never point the user at a terminal that does not
+// exist (the generic pythonInstallFailed/Waiting copy does, correctly).
+check("python prep-failure copy owns its honesty",
+  Model.strings.pythonInstallPrepFailed.includes("nothing was installed")
+  && !Model.strings.pythonInstallPrepFailed.includes("terminal and try"))
 check("python marker paths", Model.pythonMarkerPaths("/run/user/1").failure
     === "/run/user/1/appimage-plugin-python-install.failed"
   && Model.pythonMarkerPaths("/run/user/1").complete
@@ -455,10 +461,13 @@ check("runtime dir usable rejects traversal",
 check("runtime dir usable accepts absolute", Model.pythonRuntimeDirUsable("/run/user/1") === true)
 
 // Prep step: constant `sh -c` source + the runtime dir/markers as argv DATA.
+// argv[0] and the "$0" label are the absolute /usr/bin/sh — fixed-path
+// invariant, same as /usr/bin/omarchy, /usr/bin/rm and /usr/bin/stat; a
+// bare "sh" would silently reintroduce a PATH-resolved exec hop.
 const prepArgv = Model.pythonInstallPrepArgv("/run/user/1")
 const prepScript = prepArgv[2]
-check("python prep argv shape", prepArgv[0] === "sh" && prepArgv[1] === "-c"
-  && typeof prepScript === "string" && prepArgv[3] === "sh"
+check("python prep argv shape", prepArgv[0] === "/usr/bin/sh" && prepArgv[1] === "-c"
+  && typeof prepScript === "string" && prepArgv[3] === "/usr/bin/sh"
   && prepArgv[4] === "/run/user/1"
   && prepArgv[5] === "/run/user/1/appimage-plugin-python-install.failed"
   && prepArgv[6] === "/run/user/1/appimage-plugin-python-install.complete",
@@ -473,10 +482,37 @@ check("python prep script is positional-only",
   && prepScript.includes('"$1"') && prepScript.includes('"$2"') && prepScript.includes('"$3"'))
 
 const probeArgv = Model.pythonProbeArgv("/f", "/c", true)
-check("python probe argv shape", probeArgv[0] === "sh" && probeArgv[1] === "-c"
-  && probeArgv[3] === "sh" && probeArgv[4] === "/f" && probeArgv[5] === "/c"
+check("python probe argv shape", probeArgv[0] === "/usr/bin/sh" && probeArgv[1] === "-c"
+  && probeArgv[3] === "/usr/bin/sh" && probeArgv[4] === "/f" && probeArgv[5] === "/c"
   && probeArgv[6] === "1")
 check("python probe argv idle flag", Model.pythonProbeArgv("/f", "/c", false)[6] === "0")
+// The installing flag stays argv DATA driving the marker-aware poll mode
+// (pythonProbeOutcome unchanged): slow-poll recovery probes pass "0" and
+// decide from `command -v python3` alone — markers cannot false-positive.
+check("python probe outcome semantics unchanged",
+  Model.pythonProbeOutcome(0, "", false) === "present"
+  && Model.pythonProbeOutcome(3, "", false) === "missing")
+
+// Panel-side install-verify gate (Panel.qml handleProbe, installVerifyPending
+// branch): a probe that never answered arrives from Backend.handleTimeout as
+// exitCode -1, and the mapper's fall-through default labels -1 "missing".
+// Panel.qml therefore requires `outcome === "missing" && exitCode >= 0`
+// before the verify branch may open the sudo terminal. These checks pin both
+// ends of that chain — the timeout result really carries -1, and the mapper
+// really defaults -1 to "missing" — so either changing forces a re-look at
+// that gate.
+{
+  const timeoutResults = []
+  const probeCtx = Backend.run(fakeProc(), { interval: 0, restart() {}, stop() {} },
+    ["python3"], [], {}, (r) => timeoutResults.push(r))
+  Backend.handleTimeout(probeCtx)
+  check("timed-out probe result carries exitCode -1", timeoutResults.length === 1
+    && timeoutResults[0].exitCode === -1 && timeoutResults[0].timedOut === true,
+    JSON.stringify(timeoutResults))
+}
+check("probe -1 never-answered maps to missing by default — Panel verify gate must not trust it",
+  Model.pythonProbeOutcome(-1, "", false) === "missing"
+  && Model.pythonProbeOutcome(-1, "", true) === "missing")
 
 // Exit-code semantics the panel's handleProbe routes on (pythonProbeOutcome).
 check("probe 0 → present", Model.pythonProbeOutcome(0, "", true) === "present")
