@@ -64,6 +64,24 @@ class Config:
         cls.write()
 
     @classmethod
+    def iter_app_records(cls):
+        """Yield (section_key, config_dict) for every `app.<md5>` record,
+        skipping the `app.<md5>.update_manager` sibling sections.
+
+        The section key is the md5 of the AppImage path, so this is the
+        way to enumerate every integrated app regardless of the (mutable)
+        desktop files. list_installed uses it to recover integrated apps
+        whose .desktop was clobbered by the app itself. Cheap: reuses
+        refresh() to re-read from disk."""
+        cls.refresh()
+        for section in cls.parser.sections():
+            if not section.startswith('app.'):
+                continue
+            if section.endswith('.update_manager'):
+                continue
+            yield section, dict(cls.parser[section])
+
+    @classmethod
     def set_app_config(cls, el, data: dict):
         cls.refresh()
         h = cls.get_app_hash(el)
