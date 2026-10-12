@@ -23,6 +23,7 @@ from helpers import (FakeXDGTestCase, FixtureHTTPServer, download_fixture)
 from omarchy_appimage import cli, net, utils
 from omarchy_appimage import settings as appimage_settings
 from omarchy_appimage.ini_config import Config
+from omarchy_appimage.provider import AppImageListElement, InstalledStatus
 
 
 class InProcessCliMixin:
@@ -898,6 +899,144 @@ class UpdateFlowTests(InProcessCliMixin, FakeXDGTestCase):
         payload = json.loads(
             self.run_cli('--list-installed', '--json').stdout)
         self.assertEqual(len(payload['installed']), 2)
+
+
+class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
+    """--integrate <github release download URL>: download, verify the
+    asset's sha256 digest via the GitHub API (mandatory), integrate, and
+    auto-prepopulate the per-app GithubUpdater source from the URL.
+
+    Hermetic: the GitHub API and the download are patched at the net
+    seam; the fixture bytes are a real extractable AppImage so the full
+    install_file path (metadata extraction -> desktop/icon) runs."""
+
+    URL = ('https://github.com/neovim/neovim/releases/download/'
+           'v4.5.6/nvim-4.5.6-linux-x86_64.AppImage')
+
+    def setUp(self):
+        super().setUp()
+        self.fixture = download_fixture()
+        if self.fixture is None:
+            self.skipTest('fixture download unavailable')
+        with open(self.fixture, 'rb') as f:
+            self.body = f.read()
+
+    def _patch_download_and_api(self, digest_suffix: str = None):
+        """Patch the GitHub API response and the download to a hermetic
+        in-memory copy of the fixture."""
+        asset_digest = (digest_suffix
+                        if digest_suffix is not None
+                        else hashlib.sha256(self.body).hexdigest())
+        release = {
+            'tag_name': 'v4.5.6', 'draft': False, 'prerelease': False,
+            'assets': [{
+                'name': 'nvim-4.5.6-linux-x86_64.AppImage',
+                'size': len(self.body),
+                'digest': 'sha256:' + asset_digest,
+            }],
+        }
+        api = mock.patch.object(net, 'fetch_json', return_value=release)
+        api.start()
+        self.addCleanup(api.stop)
+
+        def _fake_download(url, dest):
+            Path(dest).write_bytes(self.body)
+            return len(self.body)
+        dl = mock.patch.object(net, 'download_to_file',
+                               side_effect=_fake_download)
+        dl.start()
+        self.addCleanup(dl.stop)
+
+    def _integrate(self, url=URL, extra_args=()):
+        return self.run_cmd(cli.cmd_integrate, [url, '--yes', '--json',
+                                                *extra_args])
+
+    # ------------------------------------------------------------ parsing
+
+    def test_github_release_url_data_parses(self):
+        d = cli._github_release_url_data(self.URL)
+        self.assertEqual(d, {
+            'owner': 'neovim', 'repo': 'neovim',
+            'tag': 'v4.5.6', 'filename': 'nvim-4.5.6-linux-x86_64.AppImage',
+        })
+
+    def test_github_release_url_data_rejects_non_github(self):
+        self.assertIsNone(cli._github_release_url_data(
+            'https://example.com/a/b/releases/download/v1/x.AppImage'))
+        self.assertIsNone(cli._github_release_url_data(
+            'https://github.com/a/b/releases/tag/v1/x.AppImage'))
+        self.assertIsNone(cli._github_release_url_data('not a url'))
+
+    # ------------------------------------------------------- auto source
+
+    def test_auto_set_github_source_derives_glob(self):
+        el = AppImageListElement(name='X', description='', provider='P',
+                                 installed_status=InstalledStatus.INSTALLED,
+                                 file_path=os.path.join(self.sandbox, 'x'))
+        cli._auto_set_github_source(el, {
+            'owner': 'neovim', 'repo': 'neovim', 'tag': 'v4.5.6',
+            'filename': 'nvim-4.5.6-linux-x86_64.AppImage'})
+        cfg = Config.get_app_update_config(el)
+        self.assertEqual(cfg['manager'], 'GithubUpdater')
+        self.assertEqual(cfg['repo'], 'neovim/neovim')
+        self.assertEqual(cfg['repo_filename'], 'nvim-*-linux-x86_64.AppImage')
+        self.assertEqual(cfg['allow_prereleases'], 'false')
+
+    def test_auto_set_github_source_does_not_clobber(self):
+        el = AppImageListElement(name='X', description='', provider='P',
+                                 installed_status=InstalledStatus.INSTALLED,
+                                 file_path=os.path.join(self.sandbox, 'x'))
+        Config.set_app_update_config(el, 'StaticFileUpdater',
+                                     {'url': 'https://x/f.appimage'})
+        cli._auto_set_github_source(el, {
+            'owner': 'a', 'repo': 'b', 'tag': 'v1', 'filename': 'b.appimage'})
+        cfg = Config.get_app_update_config(el)
+        self.assertEqual(cfg['manager'], 'StaticFileUpdater')
+
+    def test_auto_set_github_source_keeps_exact_name_when_no_version(self):
+        el = AppImageListElement(name='X', description='', provider='P',
+                                 installed_status=InstalledStatus.INSTALLED,
+                                 file_path=os.path.join(self.sandbox, 'x'))
+        cli._auto_set_github_source(el, {
+            'owner': 'a', 'repo': 'b', 'tag': 'v1',
+            'filename': 'arch.AppImage'})
+        cfg = Config.get_app_update_config(el)
+        self.assertEqual(cfg['repo_filename'], 'arch.AppImage')
+
+    # --------------------------------------------------------- integrate
+
+    def test_integrate_from_url_installs_and_auto_sources(self):
+        self._patch_download_and_api()
+        out, err, code = self._integrate()
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload['result'], 'integrated')
+
+        # the AppImage landed in the managed folder
+        managed = os.path.join(self.managed_dir, 'neovim.appimage')
+        self.assertTrue(os.path.isfile(managed))
+
+        # the auto GithubUpdater source is stored
+        el = cli.appimage_provider.list_installed()[0]
+        cfg = Config.get_app_update_config(el)
+        self.assertEqual(cfg['manager'], 'GithubUpdater')
+        self.assertEqual(cfg['repo'], 'neovim/neovim')
+        self.assertEqual(cfg['repo_filename'], 'nvim-*-linux-x86_64.AppImage')
+
+    def test_integrate_from_url_refuses_missing_digest(self):
+        # an asset with no sha256 digest is refused (same contract as
+        # GithubUpdater.download) before any byte is spent
+        self._patch_download_and_api(digest_suffix='')
+        out, err, code = self._integrate()
+        self.assertEqual(code, 1)
+        self.assertIn('no sha256 digest', err)
+
+    def test_integrate_url_rejects_non_github_host(self):
+        # no download attempted, no install
+        out, err, code = self._integrate(
+            url='https://example.com/a/b/releases/download/v1/x.AppImage')
+        self.assertEqual(code, 1)
+        self.assertIn('GitHub release download', err)
 
 
 if __name__ == '__main__':

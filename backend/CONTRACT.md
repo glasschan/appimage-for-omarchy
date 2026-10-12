@@ -60,6 +60,21 @@ file (GearLever's `move-appimage-on-integration` default).
   desktop name (GearLever behaviour). `--replace` overwrites the existing
   installation in place instead.
 
+`<path>` may also be a **GitHub release download URL** of the form
+`https://github.com/<owner>/<repo>/releases/download/<tag>/<file>`:
+
+1. the release asset is downloaded and its `sha256:` digest (fetched from
+   the GitHub API for `<tag>`) is **verified before install** — a missing
+   or malformed digest refuses, matching the `--update` authenticity
+   policy; a URL otherwise than those GitHub release download URLs is
+   refused with a clear error;
+2. after a successful install the per-app `GithubUpdater` source is
+   auto-populated in `apps.ini` — `repo=<owner>/<repo>`,
+   `repo_filename=<file>` with the version (tag minus a leading `v`)
+   rewritten to a `*` glob so future releases still match,
+   `allow_prereleases=false`. An existing per-app source is **never
+   overwritten** (a manual `--set-update-source` choice wins).
+
 ### `--remove <target> [--yes] [--delete] [--json]`
 
 Removes an integrated app. `<target>` is resolved in this order:
