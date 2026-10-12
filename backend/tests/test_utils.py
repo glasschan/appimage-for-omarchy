@@ -110,9 +110,9 @@ class RunCommandOutputBoundTests(unittest.TestCase):
         self.assertEqual(result.stdout, b'1\n')
 
     def test_chatty_child_output_is_truncated_at_cap(self):
-        # the child writes past the cap (30 KB > 1 KiB) but still fits in
-        # the pipe buffer after the reader stops: it exits cleanly and
-        # the captured output is truncated to the cap, no hang
+        # the child writes past the cap (30 KB > 1 KiB); the pipe keeps
+        # being drained past the cap, the child exits cleanly and the
+        # captured output is truncated to the cap, no hang
         code = 'import sys; sys.stdout.write("a" * 30000)'
         result = utils.run_command([sys.executable, '-c', code],
                                    check=False, max_output_bytes=1024)
@@ -126,14 +126,17 @@ class RunCommandOutputBoundTests(unittest.TestCase):
                                    check=False, max_output_bytes=1024)
         self.assertEqual(len(result.stderr), 1024)
 
-    def test_child_blocked_on_full_pipe_is_killed_by_timeout(self):
-        # 5 MB against a 1 KiB cap: the reader stops, the child blocks on
-        # write() forever, the timeout reaps it (the memory bound)
-        code = 'import sys; sys.stdout.write("a" * (5 * 1024 * 1024))'
+    def test_endless_writer_is_reaped_by_timeout(self):
+        # an unbounded producer never blocks on the pipe (it is always
+        # drained past the cap), so the timeout is what reaps it, and
+        # the retained output stays capped the whole time
+        code = ('import sys\n'
+                'while True:\n'
+                '    sys.stdout.write("a" * 65536)')
         start = time.monotonic()
         with self.assertRaises(subprocess.TimeoutExpired):
             utils.run_command([sys.executable, '-c', code],
-                              timeout=3, max_output_bytes=1024)
+                              timeout=2, max_output_bytes=1024)
         self.assertLess(time.monotonic() - start, 30)
 
     def test_called_process_error_contract_kept(self):

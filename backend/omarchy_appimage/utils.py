@@ -68,27 +68,32 @@ def run_command(command: list, cwd: str = None, check: bool = True,
     """Run a command with argument lists only (no shell), stdout/stderr
     captured; raises CalledProcessError on failure when check=True.
 
-    Each output stream is capped at `max_output_bytes`: the reader stops
-    once the cap is reached and the captured bytes are truncated there
-    (truncated output is acceptable; a still-writing child simply blocks
-    on its full pipe until the timeout fires). `stdin` may be an open
-    file object (bsdtar reads the squashfs stream from one)."""
+    Each output stream is capped at `max_output_bytes`: only the first
+    cap bytes are retained, while the pipe keeps being drained (and the
+    excess discarded) so a chatty child never deadlocks on a full pipe,
+    whatever the pipe size. Unbounded producers are reaped by `timeout`.
+    `stdin` may be an open file object (bsdtar reads the squashfs stream
+    from one)."""
     logging.debug('Running %s', command)
     proc = subprocess.Popen(command, cwd=cwd, stdin=stdin,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
 
     def _drain(stream) -> bytes:
-        # read at most cap + 1 per stream, then stop reading
-        chunks = []
-        remaining = max_output_bytes + 1
-        while remaining > 0:
-            chunk = stream.read(min(1 << 16, remaining))
-            if not chunk:
+        # Keep reading until EOF, but retain only the first
+        # max_output_bytes. Reading past the cap without storing the
+        # excess is what bounds memory: a chatty child is drained (so it
+        # never deadlocks on a full pipe, whatever the pipe size) and
+        # simply runs until it finishes or the timeout reaps it.
+        kept = bytearray()
+        scratch = bytearray(1 << 16)
+        while True:
+            n = stream.readinto(scratch)
+            if not n:
                 break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b''.join(chunks)[:max_output_bytes]
+            if len(kept) < max_output_bytes:
+                kept += scratch[:min(n, max_output_bytes - len(kept))]
+        return bytes(kept)
 
     holders = {'stdout': [], 'stderr': []}
 
