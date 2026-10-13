@@ -1031,12 +1031,178 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
         self.assertEqual(code, 1)
         self.assertIn('no sha256 digest', err)
 
-    def test_integrate_url_rejects_non_github_host(self):
-        # no download attempted, no install
-        out, err, code = self._integrate(
-            url='https://example.com/a/b/releases/download/v1/x.AppImage')
-        self.assertEqual(code, 1)
-        self.assertIn('GitHub release download', err)
+    def test_integrate_url_falls_back_to_static_on_lookup_failure(self):
+        # a /releases/download/ URL on an unknown host classifies as a
+        # Forgejo release; when its release API has no metadata the pasted
+        # URL is installed as a plain static source instead of erroring.
+        url = 'https://example.com/a/b/releases/download/v1/x.AppImage'
+        api = mock.patch.object(net, 'fetch_json',
+                                side_effect=net.NetworkError('404'))
+        api.start()
+        self.addCleanup(api.stop)
+
+        def _fake_download(u, dest):
+            Path(dest).write_bytes(self.body)
+            return len(self.body)
+        dl = mock.patch.object(net, 'download_to_file',
+                               side_effect=_fake_download)
+        dl.start()
+        self.addCleanup(dl.stop)
+
+        out, err, code = self._integrate(url=url)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)['result'], 'integrated')
+        el = cli.appimage_provider.list_installed()[0]
+        cfg = Config.get_app_update_config(el)
+        self.assertEqual(cfg['manager'], 'StaticFileUpdater')
+        self.assertEqual(cfg['url'], url)
+
+
+class UrlMultiSourceIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
+    """--integrate <url> for the non-GitHub source table (zsync, GitLab,
+    Codeberg, Forgejo, plain https) — hermetic: every egress crosses a
+    patched net seam, the fixture bytes are a real extractable AppImage so
+    the full install path runs."""
+
+    ZSYNC_URL = 'https://dl.example.org/MyApp.AppImage.zsync'
+    GITLAB_URL = ('https://gitlab.com/owner/repo/-/releases/v1.2.3/downloads/'
+                  'MyApp-1.2.3.AppImage')
+    CODEBERG_URL = ('https://codeberg.org/owner/repo/releases/download/'
+                    'v1.2.3/MyApp-1.2.3.AppImage')
+    FORGEJO_URL = ('https://forgejo.example.org/owner/repo/releases/download/'
+                   'v1.2.3/MyApp-1.2.3.AppImage')
+    STATIC_URL = 'https://dl.example.org/MyApp.AppImage'
+
+    def setUp(self):
+        super().setUp()
+        self.fixture = download_fixture()
+        if self.fixture is None:
+            self.skipTest('fixture download unavailable')
+        with open(self.fixture, 'rb') as f:
+            self.body = f.read()
+        self.downloads = []
+
+    def _patch_download(self):
+        def _fake_download(url, dest):
+            self.downloads.append(url)
+            Path(dest).write_bytes(self.body)
+            return len(self.body)
+        dl = mock.patch.object(net, 'download_to_file',
+                               side_effect=_fake_download)
+        dl.start()
+        self.addCleanup(dl.stop)
+
+    def _integrate(self, url):
+        return self.run_cmd(cli.cmd_integrate, [url, '--yes', '--json'])
+
+    def _assert_installed(self, out, err, code):
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)['result'], 'integrated')
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.managed_dir, 'neovim.appimage')))
+
+    def _installed_config(self):
+        el = cli.appimage_provider.list_installed()[0]
+        return Config.get_app_update_config(el)
+
+    def _zsync_control(self, target_url):
+        return (f'URL: {target_url}\n'
+                f'SHA-1: {hashlib.sha1(self.body).hexdigest()}\n\n'
+                'zsync: 0.6.2\n')
+
+    def test_zsync_url_installs_and_sets_static_source(self):
+        target = 'https://dl.example.org/MyApp-1.2.3.AppImage'
+        self._patch_download()
+        with mock.patch.object(net, 'fetch_text',
+                               return_value=self._zsync_control(target)):
+            out, err, code = self._integrate(self.ZSYNC_URL)
+        self._assert_installed(out, err, code)
+        # the control file's target URL was downloaded, not the .zsync
+        self.assertEqual(self.downloads, [target])
+        cfg = self._installed_config()
+        self.assertEqual(cfg['manager'], 'StaticFileUpdater')
+        self.assertEqual(cfg['url'], self.ZSYNC_URL)
+
+    def test_gitlab_url_installs_and_sets_gitlab_source(self):
+        release = [{
+            'tag_name': 'v1.2.3',
+            'assets': {'links': [{
+                'name': 'MyApp-1.2.3.AppImage',
+                'direct_asset_url': self.GITLAB_URL,
+            }]},
+        }]
+        self._patch_download()
+        with mock.patch.object(net, 'fetch_json', return_value=release):
+            out, err, code = self._integrate(self.GITLAB_URL)
+        self._assert_installed(out, err, code)
+        cfg = self._installed_config()
+        self.assertEqual(cfg['manager'], 'GitlabUpdater')
+        self.assertEqual(cfg['repo_url'], 'https://gitlab.com/owner/repo')
+        self.assertEqual(cfg['repo_filename'], 'MyApp-*.AppImage')
+
+    def test_codeberg_url_installs_and_sets_codeberg_source(self):
+        releases = [{
+            'tag_name': 'v1.2.3',
+            'assets': [{
+                'name': 'MyApp-1.2.3.AppImage', 'size': len(self.body),
+                'browser_download_url': self.CODEBERG_URL,
+            }],
+        }]
+        self._patch_download()
+        with mock.patch.object(net, 'fetch_json', return_value=releases):
+            out, err, code = self._integrate(self.CODEBERG_URL)
+        self._assert_installed(out, err, code)
+        cfg = self._installed_config()
+        self.assertEqual(cfg['manager'], 'CodebergUpdater')
+        self.assertEqual(cfg['repo'], 'owner/repo')
+        self.assertEqual(cfg['repo_filename'], 'MyApp-*.AppImage')
+        self.assertEqual(cfg['allow_prereleases'], 'false')
+
+    def test_forgejo_url_installs_and_sets_forgejo_source(self):
+        release = {
+            'tag_name': 'v1.2.3',
+            'assets': [{
+                'name': 'MyApp-1.2.3.AppImage', 'size': len(self.body),
+                'browser_download_url': self.FORGEJO_URL,
+            }],
+        }
+        self._patch_download()
+        with mock.patch.object(net, 'fetch_json', return_value=release):
+            out, err, code = self._integrate(self.FORGEJO_URL)
+        self._assert_installed(out, err, code)
+        cfg = self._installed_config()
+        self.assertEqual(cfg['manager'], 'ForgejoUpdater')
+        self.assertEqual(cfg['repo_url'],
+                         'https://forgejo.example.org/owner/repo')
+        self.assertEqual(cfg['repo_filename'], 'MyApp-*.AppImage')
+        self.assertEqual(cfg['allow_prereleases'], 'false')
+
+    def test_plain_https_url_installs_as_static_source(self):
+        self._patch_download()
+        out, err, code = self._integrate(self.STATIC_URL)
+        self._assert_installed(out, err, code)
+        self.assertEqual(self.downloads, [self.STATIC_URL])
+        cfg = self._installed_config()
+        self.assertEqual(cfg['manager'], 'StaticFileUpdater')
+        self.assertEqual(cfg['url'], self.STATIC_URL)
+
+    def test_existing_source_is_not_overwritten(self):
+        # first integrate records a static source; drop the managed file
+        # (leaving the per-app config) and integrate again through a
+        # .zsync URL — the stored source must stay untouched
+        self._patch_download()
+        out, err, code = self._integrate(self.STATIC_URL)
+        self._assert_installed(out, err, code)
+        os.remove(os.path.join(self.managed_dir, 'neovim.appimage'))
+
+        target = 'https://dl.example.org/MyApp-1.2.3.AppImage'
+        with mock.patch.object(net, 'fetch_text',
+                               return_value=self._zsync_control(target)):
+            out, err, code = self._integrate(self.ZSYNC_URL)
+        self._assert_installed(out, err, code)
+        cfg = self._installed_config()
+        self.assertEqual(cfg['manager'], 'StaticFileUpdater')
+        self.assertEqual(cfg['url'], self.STATIC_URL)
 
 
 if __name__ == '__main__':

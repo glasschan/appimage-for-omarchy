@@ -11,14 +11,16 @@
 # Contract: with --json, stdout carries ONLY the JSON document; every
 # human-readable line and all logging goes to stderr (PRD §8).
 
+import fnmatch
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import sys
 import tempfile
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from . import constants, net, settings
 from .ini_config import Config
@@ -41,10 +43,16 @@ Manage AppImages (integrate / list / update / remove) for {constants.APP_NAME}.
 Commands:
   --integrate <path|url> Integrate an AppImage (extracts .desktop and
                            icon, moves the file into the managed folder).
-                           A GitHub release download URL
-                           (github.com/<o>/<r>/releases/download/<tag>/<f>)
-                           is downloaded, sha256-verified from the release
-                           metadata, and auto-wired to a GithubUpdater source
+                           A URL is downloaded and, when possible, its
+                           publisher digest is verified: a GitHub release
+                           download URL (github.com/<o>/<r>/releases/
+                           download/<tag>/<f>) requires the asset's sha256
+                           digest; a .zsync URL is checked against the
+                           control file's SHA-1. GitLab / Codeberg /
+                           Forgejo release URLs and plain https URLs are
+                           installed with reduced assurance (AppImage
+                           magic + advertised size) and wired to the
+                           matching update source
   --list-installed         List integrated apps
   --remove <target>        Trash an AppImage, its .desktop file and its
                            icon; <target> may be the AppImage path, the
@@ -216,16 +224,16 @@ def _is_url(value: str) -> bool:
     return value.startswith(('http://', 'https://'))
 
 
-def _github_release_url_data(url: str):
-    """Parse a GitHub release download URL into
-    {'owner','repo','tag','filename'}, or None if it isn't one.
+def _release_download_url_data(url: str):
+    """Parse any host's release download URL into
+    {'host','owner','repo','tag','filename'}, or None if it isn't one.
 
-    Shape: https://github.com/<owner>/<repo>/releases/download/<tag>/<file>"""
+    Shape: <scheme>://<host>/<owner>/<repo>/releases/download/<tag>/<file>"""
     try:
         parts = urlsplit(url)
     except ValueError:
         return None
-    if parts.scheme not in ('http', 'https') or parts.netloc != 'github.com':
+    if parts.scheme not in ('http', 'https'):
         return None
     paths = parts.path.split('/')
     if len(paths) < 7 or paths[3] != 'releases' or paths[4] != 'download':
@@ -234,7 +242,70 @@ def _github_release_url_data(url: str):
                                   unquote(paths[5]), paths[6])
     if not owner or not repo or not tag or not filename:
         return None
-    return {'owner': owner, 'repo': repo, 'tag': tag, 'filename': filename}
+    return {'host': parts.netloc, 'owner': owner, 'repo': repo,
+            'tag': tag, 'filename': filename}
+
+
+def _github_release_url_data(url: str):
+    """Parse a GitHub release download URL into
+    {'owner','repo','tag','filename'}, or None if it isn't one.
+
+    Shape: https://github.com/<owner>/<repo>/releases/download/<tag>/<file>"""
+    data = _release_download_url_data(url)
+    if not data or data['host'] != 'github.com':
+        return None
+    return {k: data[k] for k in ('owner', 'repo', 'tag', 'filename')}
+
+
+def _classify_integrate_url(url: str):
+    """Route a pasted --integrate URL to its download/verify path
+    (first match wins — a deliberate, documented deviation from the
+    strict digest rule used by --update; see CONTRACT.md):
+
+    1. github.com /releases/download/  -> ('github',  <github src>)   sha256 mandatory
+    2. any host, path ends in .zsync   -> ('zsync',   {'url': url})   SHA-1 when present
+    3. host gitlab.com                 -> ('gitlab',  {'repo_url','repo','filename'})
+    4. host codeberg.org               -> ('codeberg',{'repo','filename'})
+    5. other host /releases/download/  -> ('forgejo', {'repo_url','repo','filename'})
+    6. anything else                   -> ('static',  {'url': url})
+
+    Cases 3-5 look the release up through the host's API; a failed lookup
+    falls back to case 6 in _fetch_integrate_artifact."""
+    github = _github_release_url_data(url)
+    if github:
+        return 'github', github
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return 'static', {'url': url}
+    if parts.scheme not in ('http', 'https'):
+        return 'static', {'url': url}
+
+    if parts.path.endswith('.zsync'):
+        return 'zsync', {'url': url}
+
+    paths = parts.path.split('/')
+    owner = paths[1] if len(paths) > 1 else ''
+    repo = paths[2] if len(paths) > 2 else ''
+    filename = unquote(paths[-1])
+
+    if parts.netloc == 'gitlab.com' and owner and repo:
+        return 'gitlab', {'repo_url': f'https://gitlab.com/{owner}/{repo}',
+                          'repo': f'{owner}/{repo}', 'filename': filename}
+
+    if parts.netloc == 'codeberg.org' and owner and repo:
+        return 'codeberg', {'repo': f'{owner}/{repo}', 'filename': filename}
+
+    forgejo = _release_download_url_data(url)
+    if forgejo:
+        return 'forgejo', {
+            'repo_url': f'https://{forgejo["host"]}/{forgejo["owner"]}/'
+                        f'{forgejo["repo"]}',
+            'repo': f'{forgejo["owner"]}/{forgejo["repo"]}',
+            'filename': forgejo['filename']}
+
+    return 'static', {'url': url}
 
 
 def _download_and_verify_github(url: str, src: dict, dest_dir: str) -> str:
@@ -279,6 +350,23 @@ def _download_and_verify_github(url: str, src: dict, dest_dir: str) -> str:
     return dest
 
 
+def _glob_for_version(filename: str, version: str) -> str:
+    """`filename` with the release `version` (tag minus a leading 'v')
+    substituted by `*`, so a future release still matches. When the
+    version isn't part of the name the exact filename is kept."""
+    version = version or ''
+    if version[:1] in ('v', 'V'):
+        version = version[1:]
+    if version:
+        return filename.replace(version, '*', 1)
+    return filename
+
+
+def _update_source_chosen(el) -> bool:
+    """True when the user already chose an update source (never clobber)."""
+    return bool(Config.get_app_update_config(el).get('manager'))
+
+
 def _auto_set_github_source(el, src: dict):
     """Prepopulate the per-app GithubUpdater config from the install URL,
     unless the user already chose a source (never clobber a choice).
@@ -287,22 +375,215 @@ def _auto_set_github_source(el, src: dict):
     (tag minus a leading 'v') with `*`, so a future release with a bumped
     version still matches. If the version isn't in the name, the exact
     filename is kept and the user can refine it in the panel."""
-    if Config.get_app_update_config(el).get('manager'):
+    if _update_source_chosen(el):
         return
-
-    version = src['tag']
-    if version[:1] in ('v', 'V'):
-        version = version[1:]
-    pattern = src['filename']
-    if version:
-        pattern = pattern.replace(version, '*', 1)
 
     Config.set_app_update_config(el, 'GithubUpdater', {
         'repo': f'{src["owner"]}/{src["repo"]}',
-        'repo_filename': pattern,
+        'repo_filename': _glob_for_version(src['filename'], src['tag']),
         'allow_prereleases': 'false',
     })
     logging.info('auto-configured GithubUpdater source for %s', el.name)
+
+
+def _auto_set_static_source(el, url: str):
+    """Auto-populate a StaticFileUpdater source (a plain URL or .zsync)."""
+    if _update_source_chosen(el):
+        return
+    Config.set_app_update_config(el, 'StaticFileUpdater', {'url': url})
+    logging.info('auto-configured StaticFileUpdater source for %s', el.name)
+
+
+def _auto_set_gitlab_source(el, repo_url: str, pattern: str):
+    if _update_source_chosen(el):
+        return
+    Config.set_app_update_config(el, 'GitlabUpdater', {
+        'repo_url': repo_url,
+        'repo_filename': pattern,
+    })
+    logging.info('auto-configured GitlabUpdater source for %s', el.name)
+
+
+def _auto_set_codeberg_source(el, repo: str, pattern: str):
+    if _update_source_chosen(el):
+        return
+    Config.set_app_update_config(el, 'CodebergUpdater', {
+        'repo': repo,
+        'repo_filename': pattern,
+        'allow_prereleases': 'false',
+    })
+    logging.info('auto-configured CodebergUpdater source for %s', el.name)
+
+
+def _auto_set_forgejo_source(el, repo_url: str, pattern: str):
+    if _update_source_chosen(el):
+        return
+    Config.set_app_update_config(el, 'ForgejoUpdater', {
+        'repo_url': repo_url,
+        'repo_filename': pattern,
+        'allow_prereleases': 'false',
+    })
+    logging.info('auto-configured ForgejoUpdater source for %s', el.name)
+
+
+def _auto_set_source(el, kind: str, info: dict):
+    """Apply the auto-source matching a classified URL (no-op when the
+    user already chose one)."""
+    if kind == 'github':
+        _auto_set_github_source(el, info)
+    elif kind == 'gitlab':
+        _auto_set_gitlab_source(el, info['repo_url'], info['pattern'])
+    elif kind == 'codeberg':
+        _auto_set_codeberg_source(el, info['repo'], info['pattern'])
+    elif kind == 'forgejo':
+        _auto_set_forgejo_source(el, info['repo_url'], info['pattern'])
+    else:  # 'zsync' / 'static': the exact URL the user pasted
+        _auto_set_static_source(el, info['url'])
+
+
+def _verify_reduced_assurance(dest: str, expected_size: int = None):
+    """Post-download guard for sources that expose no publisher digest: the
+    artifact must still be an AppImage and, when a size was advertised
+    (release-API `size`; HTTP `Content-Length` is already enforced by
+    net.download_to_file), exactly that many bytes. Logs that assurance
+    was reduced — this relaxation applies only to --integrate <url>, never
+    to --update."""
+    if not appimage_provider.can_install_file(dest):
+        raise OperationError('downloaded file is not an AppImage')
+    actual = os.path.getsize(dest)
+    if expected_size is not None and actual != expected_size:
+        raise OperationError(
+            'downloaded file size mismatch (expected '
+            f'{expected_size} bytes, got {actual})')
+    logging.warning(
+        '%s: no publisher digest available; verified only the AppImage '
+        'magic bytes%s', dest,
+        ' and the advertised size' if expected_size is not None else '')
+
+
+def _download_static(url: str, dest_dir: str, expected_size: int = None) -> str:
+    """Download `url` verbatim and apply the reduced-assurance checks."""
+    dest = os.path.join(dest_dir, 'download.appimage')
+    net.download_to_file(url, dest)
+    _verify_reduced_assurance(dest, expected_size)
+    return dest
+
+
+def _fetch_zsync_control(zsync_url: str) -> tuple:
+    """(target_url, sha1_or_None) from a .zsync control file, mirroring
+    StaticFileUpdater._fetch_zsync: the target is the absolute `URL:` line
+    when present, else the .zsync name with the suffix stripped; sha1 is
+    the control file's `SHA-1:` line when it carries one."""
+    zsync = net.fetch_text(zsync_url)
+    header = zsync.split('\n\n', 1)[0]
+    match = re.search(r'URL:\s*(\S+)', header)
+    if match:
+        target = match.group(1)
+        if target.startswith(('https://', 'http://')):
+            resolved = target
+        else:
+            parts = urlsplit(zsync_url)
+            path = posixpath.join(posixpath.dirname(parts.path), target)
+            resolved = urlunsplit(parts._replace(path=path, query='',
+                                                 fragment=''))
+    else:
+        resolved = re.sub(r'\.zsync$', '', zsync_url)
+    sha = re.search(r'SHA-1:\s*([0-9a-f]{40})', header)
+    return resolved, (sha.group(1) if sha else None)
+
+
+def _download_and_verify_zsync(zsync_url: str, dest_dir: str) -> str:
+    """Download the artifact a .zsync control file points at. The control
+    file's SHA-1 is verified when present (a publisher digest — never
+    weakened); otherwise the reduced-assurance checks apply."""
+    target, expected_sha1 = _fetch_zsync_control(zsync_url)
+    if not target:
+        raise OperationError(
+            f'{zsync_url}: zsync control file points at no download URL')
+    dest = os.path.join(dest_dir, 'download.appimage')
+    net.download_to_file(target, dest)
+    if expected_sha1:
+        actual = get_file_hash(dest, alg='sha1')
+        if actual != expected_sha1:
+            raise OperationError(
+                'Downloaded AppImage failed the zsync SHA-1 check '
+                f'(expected {expected_sha1}, got {actual})')
+        if not appimage_provider.can_install_file(dest):
+            raise OperationError('downloaded file is not an AppImage')
+        return dest
+    _verify_reduced_assurance(dest)
+    return dest
+
+
+def _release_api_url(kind: str, info: dict) -> str:
+    """The release-list API endpoint for the gitlab/codeberg/forgejo
+    cases, mirroring the matching updater's request shape."""
+    if kind == 'gitlab':
+        return ('https://gitlab.com/api/v4/projects/'
+                f'{quote(info["repo"], safe="")}/releases')
+    if kind == 'codeberg':
+        return (f'https://codeberg.org/api/v1/repos/{info["repo"]}'
+                '/releases?pre-release=exclude&draft=exclude')
+    host = info['repo_url'][len('https://'):].split('/', 1)[0]
+    return f'https://{host}/api/v1/repos/{info["repo"]}/releases/latest'
+
+
+def _lookup_release_asset(kind: str, info: dict):
+    """Look the release asset up through the host's release API.
+
+    Returns {'url','tag','size','filename'} or None — a network/404 error
+    or a release without a matching asset makes --integrate fall back to a
+    static install of the pasted URL."""
+    try:
+        data = net.fetch_json(_release_api_url(kind, info))
+    except net.NetworkError as e:
+        logging.error('%s release lookup failed: %s', kind, e)
+        return None
+
+    if kind == 'gitlab':
+        release = data[0] if data else None
+        assets = release.get('assets', {}).get('links', []) if release else []
+        url_key, size_key = 'direct_asset_url', None
+    else:
+        release = data[0] if isinstance(data, list) and data else data
+        assets = release.get('assets', []) if isinstance(release, dict) else []
+        url_key, size_key = 'browser_download_url', 'size'
+    if not release:
+        return None
+
+    tag = release.get('tag_name')
+    pattern = _glob_for_version(info['filename'], tag)
+    asset = next((a for a in assets
+                  if fnmatch.fnmatch(a.get('name', ''), pattern)), None)
+    if not asset or not asset.get(url_key):
+        return None
+    return {'url': asset[url_key], 'tag': tag, 'filename': info['filename'],
+            'size': asset.get(size_key) if size_key else None}
+
+
+def _fetch_integrate_artifact(kind: str, info: dict, raw_url: str,
+                              dest_dir: str):
+    """Fetch the artifact for a classified URL, returning
+    (file_path, kind, info) — `kind`/`info` are updated on the case 3-5
+    fallback to a static install and carry the `pattern` computed from the
+    release tag for the auto-source step."""
+    if kind == 'github':
+        return _download_and_verify_github(raw_url, info, dest_dir), kind, info
+    if kind == 'zsync':
+        return _download_and_verify_zsync(raw_url, dest_dir), kind, info
+    if kind in ('gitlab', 'codeberg', 'forgejo'):
+        asset = _lookup_release_asset(kind, info)
+        if asset is None:
+            logging.warning('%s: no release metadata for %s; installing the '
+                            'pasted URL as a static source', kind, raw_url)
+            return (_download_static(raw_url, dest_dir), 'static',
+                    {'url': raw_url})
+        dest = _download_static(asset['url'], dest_dir, asset['size'])
+        info = dict(info,
+                    pattern=_glob_for_version(info['filename'], asset['tag']))
+        return dest, kind, info
+    # case 6: a plain URL
+    return _download_static(raw_url, dest_dir), 'static', {'url': raw_url}
 
 
 def cmd_integrate(args: list) -> int:
@@ -322,22 +603,17 @@ def cmd_integrate(args: list) -> int:
         args, ['--json', '--yes', '-y', '--replace', '--keep-both'])
     target_arg = positional[0] if positional else None
 
-    url_source = None
+    url_kind = None
+    url_info = None
     tmp_cleanup = None
     if _is_url(target_arg or ''):
-        url_source = _github_release_url_data(target_arg)
-        if not url_source:
-            raise OperationError(
-                'URL install currently only supports GitHub release '
-                'download URLs of the form '
-                'https://github.com/<owner>/<repo>/releases/download/'
-                '<tag>/<file>')
+        url_kind, url_info = _classify_integrate_url(target_arg)
         tmp_cleanup = tempfile.mkdtemp(prefix='omarchy-integrate-')
 
     try:
-        if url_source:
-            file_path = _download_and_verify_github(
-                target_arg, url_source, tmp_cleanup)
+        if url_kind:
+            file_path, url_kind, url_info = _fetch_integrate_artifact(
+                url_kind, url_info, target_arg, tmp_cleanup)
         else:
             file_path = _get_file_from_args(positional)
 
@@ -393,9 +669,9 @@ def cmd_integrate(args: list) -> int:
 
         appimage_provider.install_file(list_element)
 
-        # prepopulate the per-app GithubUpdater source from the install URL
-        if url_source:
-            _auto_set_github_source(list_element, url_source)
+        # prepopulate the per-app update source from the install URL
+        if url_kind:
+            _auto_set_source(list_element, url_kind, url_info)
 
         # the installed desktop entry may carry a suffixed name (keep-both
         # logic); report the name as it was actually installed

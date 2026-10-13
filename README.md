@@ -5,8 +5,9 @@
 [![CI](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml/badge.svg)](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml)
 
 Manage AppImages from the Omarchy bar: integrate new ones into your app
-menu, see what is installed (and running), launch, update, and remove
-them — all in a native Quickshell panel. No daemon, no extra runtime: the
+menu — from a local file or straight from a release URL — see what is
+installed (and running), launch, update, and remove them — all in a
+native Quickshell panel. No daemon, no extra runtime: the
 panel is plain QML and the backend is a Python-stdlib CLI that runs only
 when an action needs it.
 
@@ -54,7 +55,9 @@ DNS-rebinding-safe dialing, validated redirects), hard byte caps and
 absolute whole-operation deadlines on responses; downloaded updates are
 installed only after verification against a mandatory cryptographic
 digest (GitHub sha256 asset digest, zsync SHA-1 control-file line) —
-sources that expose no digest refuse to install; the trust boundaries
+sources that expose no digest refuse to *update*; an AppImage integrated
+directly from a URL is the one exception (reduced assurance: AppImage
+magic bytes + advertised size); the trust boundaries
 cannot be disabled from the environment; installs are atomic (a planted
 symlink at a destination is replaced, not written through), uninstalls
 only remove paths provably bound to the app, extraction is quota-limited
@@ -114,6 +117,7 @@ The QML layer talks to `backend/main.py` over a stable JSON contract
 ```sh
 python3 backend/main.py --list-installed --json
 python3 backend/main.py --integrate /path/to/App.AppImage --yes --json
+python3 backend/main.py --integrate https://github.com/<owner>/<repo>/releases/download/<tag>/<file> --yes --json
 python3 backend/main.py --remove <desktop-id> --yes --json
 python3 backend/main.py --list-updates --json
 python3 backend/main.py --update <desktop-id> --yes --json
@@ -130,6 +134,30 @@ stderr); `--json` requires `--yes` for integrate/remove/update.
 `--get-update-source` reads a configured source back — the configured
 manager + config, or `no-source` — which is what the panel's source
 editor pre-fills from when it opens.
+
+### Install from a URL
+
+`--integrate` also takes an https URL — the panel's Integrate field takes
+the same value, so you can paste a link instead of a path. The URL is
+classified (first match wins) and routed to a download/verify path:
+
+- **GitHub release download URL** → the asset's `sha256` digest from the
+  GitHub API is required and verified before install;
+- any URL ending in **`.zsync`** → the control file's `SHA-1` line is
+  verified when present;
+- **GitLab / Codeberg / Forgejo release URL** → the release is looked up
+  through the host's API (falling back to a plain static install if that
+  lookup fails);
+- anything else → the URL is downloaded and installed as a static source.
+
+When the source publishes no digest, the artifact is accepted with reduced
+assurance — it must pass the AppImage magic-byte check and match the
+advertised size (release-API size or Content-Length) — and a warning is
+logged. `--update` never relaxes in this way.
+
+After a successful install the matching update source is auto-configured
+from the URL (GitHub / static / GitLab / Codeberg / Forgejo), unless you
+already chose one — a manual `--set-update-source` always wins.
 
 ### Update sources
 

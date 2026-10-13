@@ -60,20 +60,39 @@ file (GearLever's `move-appimage-on-integration` default).
   desktop name (GearLever behaviour). `--replace` overwrites the existing
   installation in place instead.
 
-`<path>` may also be a **GitHub release download URL** of the form
-`https://github.com/<owner>/<repo>/releases/download/<tag>/<file>`:
+`<path>` may also be an **https URL**. The URL is classified (first match
+wins) and routed to a download/verify path; after a successful install the
+matching per-app update source is auto-populated in `apps.ini` (an existing
+source is **never overwritten** — a manual `--set-update-source` choice
+wins):
 
-1. the release asset is downloaded and its `sha256:` digest (fetched from
-   the GitHub API for `<tag>`) is **verified before install** — a missing
-   or malformed digest refuses, matching the `--update` authenticity
-   policy; a URL otherwise than those GitHub release download URLs is
-   refused with a clear error;
-2. after a successful install the per-app `GithubUpdater` source is
-   auto-populated in `apps.ini` — `repo=<owner>/<repo>`,
-   `repo_filename=<file>` with the version (tag minus a leading `v`)
-   rewritten to a `*` glob so future releases still match,
-   `allow_prereleases=false`. An existing per-app source is **never
-   overwritten** (a manual `--set-update-source` choice wins).
+| # | URL form | Download | Digest | Auto-source |
+|---|---|---|---|---|
+| 1 | `github.com/<o>/<r>/releases/download/<tag>/<f>` | asset | `sha256:` **required** (GitHub API) | `GithubUpdater {repo, repo_filename, allow_prereleases=false}` |
+| 2 | any host, path ends `.zsync` | control file's target | `SHA-1:` from the control file when present | `StaticFileUpdater {url: <the .zsync url>}` |
+| 3 | host `gitlab.com` | GitLab release API asset | none (reduced) | `GitlabUpdater {repo_url, repo_filename}` |
+| 4 | host `codeberg.org` | Gitea API on codeberg.org | none (reduced) | `CodebergUpdater {repo, repo_filename, allow_prereleases=false}` |
+| 5 | other host, `/releases/download/<tag>/<f>` | Gitea API at that host | none (reduced) | `ForgejoUpdater {repo_url, repo_filename, allow_prereleases=false}` |
+| 6 | anything else (plain https URL) | the pasted URL | none (reduced) | `StaticFileUpdater {url: <the pasted url>}` |
+
+`repo_filename` is the asset filename with the release's version (tag minus
+a leading `v`) rewritten to a `*` glob, so a future release still matches;
+if the version isn't in the name the exact filename is kept (`GithubUpdater`
+case included).
+
+**Relaxed digest rule (deliberate deviation, `--integrate <url>` only).**
+For the verbs in this section a cryptographic digest is verified whenever
+the source publishes one — GitHub `sha256:` (required) and a `.zsync`
+`SHA-1:` line are **not weakened** — but a URL is **never refused merely
+because no digest exists**. In that case the artifact is downloaded, then
+accepted only if it passes the AppImage magic-byte check and its byte count
+equals the advertised size when one is known (release-API `size`; an HTTP
+`Content-Length` short body already fails inside the transport), and a
+WARNING records that assurance was reduced. If the release-API lookup for
+cases 3–5 fails (404/network) the pasted URL is installed as a case-6
+static source instead of erroring. **`--update` and the update managers are
+unaffected**: they keep the strict mandatory-digest policy below, and the
+auto-populated cases 3–5 sources therefore still refuse to install updates.
 
 ### `--remove <target> [--yes] [--delete] [--json]`
 
