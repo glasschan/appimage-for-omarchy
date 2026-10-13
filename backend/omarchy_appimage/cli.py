@@ -14,13 +14,17 @@
 import json
 import logging
 import os
+import re
+import shutil
 import sys
+import tempfile
+from urllib.parse import quote, unquote, urlsplit
 
 from . import constants, net, settings
 from .ini_config import Config
 from .provider import AppImageProvider, AppImageUpdateLogic, InternalError
 from .updaters import UpdateError, UpdateManagerChecker
-from .utils import run_command
+from .utils import get_file_hash, run_command
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -35,9 +39,12 @@ USAGE = f"""Usage: python3 main.py [OPTION...]
 Manage AppImages (integrate / list / update / remove) for {constants.APP_NAME}.
 
 Commands:
-  --integrate <path>       Integrate an AppImage file (extracts .desktop
-                           and icon, moves the file into the managed
-                           folder)
+  --integrate <path|url> Integrate an AppImage (extracts .desktop and
+                           icon, moves the file into the managed folder).
+                           A GitHub release download URL
+                           (github.com/<o>/<r>/releases/download/<tag>/<f>)
+                           is downloaded, sha256-verified from the release
+                           metadata, and auto-wired to a GithubUpdater source
   --list-installed         List integrated apps
   --remove <target>        Trash an AppImage, its .desktop file and its
                            icon; <target> may be the AppImage path, the
@@ -205,6 +212,99 @@ def _update_signature(manager) -> str:
 
 # ----------------------------------------------------------------- commands
 
+def _is_url(value: str) -> bool:
+    return value.startswith(('http://', 'https://'))
+
+
+def _github_release_url_data(url: str):
+    """Parse a GitHub release download URL into
+    {'owner','repo','tag','filename'}, or None if it isn't one.
+
+    Shape: https://github.com/<owner>/<repo>/releases/download/<tag>/<file>"""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if parts.scheme not in ('http', 'https') or parts.netloc != 'github.com':
+        return None
+    paths = parts.path.split('/')
+    if len(paths) < 7 or paths[3] != 'releases' or paths[4] != 'download':
+        return None
+    owner, repo, tag, filename = (paths[1], paths[2],
+                                  unquote(paths[5]), paths[6])
+    if not owner or not repo or not tag or not filename:
+        return None
+    return {'owner': owner, 'repo': repo, 'tag': tag, 'filename': filename}
+
+
+def _download_and_verify_github(url: str, src: dict, dest_dir: str) -> str:
+    """Download the GitHub release asset into `dest_dir`, verifying its
+    sha256 digest from the GitHub API (mandatory) and the AppImage magic.
+    Returns the downloaded file path; raises OperationError on any
+    verification failure (partial file is cleaned up via dest_dir)."""
+    api_url = ('https://api.github.com/repos/'
+               f'{src["owner"]}/{src["repo"]}/releases/tags/'
+               f'{quote(src["tag"], safe="")}')
+    try:
+        release = net.fetch_json(api_url)
+    except net.NetworkError as e:
+        raise OperationError(f'could not verify the release: {e}') from e
+
+    asset = next((a for a in release.get('assets', [])
+                  if a.get('name') == src['filename']), None)
+    if not asset:
+        raise OperationError(
+            f'asset {src["filename"]!r} not found in release '
+            f'{src["tag"]} of {src["owner"]}/{src["repo"]}')
+
+    # authenticity is mandatory (same contract as GithubUpdater.download):
+    # the release asset's sha256 digest — a digest is required, so a
+    # malicious or metadata-less asset is refused before any byte is spent
+    digest = asset.get('digest') or ''
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+        raise OperationError('GitHub release asset exposes no sha256 '
+                             'digest; refusing to install an unverified '
+                             'artifact')
+
+    dest = os.path.join(dest_dir, 'download.appimage')
+    net.download_to_file(url, dest)
+
+    expected = digest[len('sha256:'):]
+    actual = get_file_hash(dest, alg='sha256')
+    if actual != expected:
+        raise OperationError('Downloaded AppImage failed the sha256 digest '
+                             f'check (expected {expected}, got {actual})')
+    if not appimage_provider.can_install_file(dest):
+        raise OperationError('downloaded file is not an AppImage')
+    return dest
+
+
+def _auto_set_github_source(el, src: dict):
+    """Prepopulate the per-app GithubUpdater config from the install URL,
+    unless the user already chose a source (never clobber a choice).
+
+    The filename is turned into a glob by substituting the release version
+    (tag minus a leading 'v') with `*`, so a future release with a bumped
+    version still matches. If the version isn't in the name, the exact
+    filename is kept and the user can refine it in the panel."""
+    if Config.get_app_update_config(el).get('manager'):
+        return
+
+    version = src['tag']
+    if version[:1] in ('v', 'V'):
+        version = version[1:]
+    pattern = src['filename']
+    if version:
+        pattern = pattern.replace(version, '*', 1)
+
+    Config.set_app_update_config(el, 'GithubUpdater', {
+        'repo': f'{src["owner"]}/{src["repo"]}',
+        'repo_filename': pattern,
+        'allow_prereleases': 'false',
+    })
+    logging.info('auto-configured GithubUpdater source for %s', el.name)
+
+
 def cmd_integrate(args: list) -> int:
     json_output = '--json' in args
     assume_yes = ('-y' in args) or ('--yes' in args)
@@ -218,76 +318,104 @@ def cmd_integrate(args: list) -> int:
         })
         return EXIT_USAGE
 
-    file_path = _get_file_from_args(_remove_flag_value(
-        args, ['--json', '--yes', '-y', '--replace', '--keep-both']))
+    positional = _remove_flag_value(
+        args, ['--json', '--yes', '-y', '--replace', '--keep-both'])
+    target_arg = positional[0] if positional else None
 
-    list_element = appimage_provider.create_list_element_from_file(file_path)
-    if appimage_provider.is_installed(list_element):
-        message = 'This AppImage is already integrated'
+    url_source = None
+    tmp_cleanup = None
+    if _is_url(target_arg or ''):
+        url_source = _github_release_url_data(target_arg)
+        if not url_source:
+            raise OperationError(
+                'URL install currently only supports GitHub release '
+                'download URLs of the form '
+                'https://github.com/<owner>/<repo>/releases/download/'
+                '<tag>/<file>')
+        tmp_cleanup = tempfile.mkdtemp(prefix='omarchy-integrate-')
+
+    try:
+        if url_source:
+            file_path = _download_and_verify_github(
+                target_arg, url_source, tmp_cleanup)
+        else:
+            file_path = _get_file_from_args(positional)
+
+        list_element = appimage_provider.create_list_element_from_file(file_path)
+        if appimage_provider.is_installed(list_element):
+            message = 'This AppImage is already integrated'
+            if json_output:
+                _print_json({
+                    'schema_version': constants.JSON_SCHEMA_VERSION,
+                    'result': 'already-integrated',
+                    'app': _make_app_json(list_element),
+                })
+            else:
+                print(message)
+            return EXIT_OK
+
+        list_element.update_logic = AppImageUpdateLogic.KEEP
+        appimage_provider.refresh_data(list_element)
+
+        # Another version of the same app is detected either by display name
+        # or by the original (un-suffixed) name recorded in X-AppImage-Name —
+        # GearLever's CLI only compares names, which never matches apps that
+        # were integrated with the "Name (version)" keep-both suffix.
+        already_installed = None
+        for a in appimage_provider.list_installed():
+            original_name = ''
+            if a.desktop_entry:
+                original_name = a.desktop_entry.get('X-AppImage-Name', '') or ''
+            if a.name == list_element.name or original_name == list_element.name:
+                already_installed = a
+                break
+
+        if replace:
+            list_element.update_logic = AppImageUpdateLogic.REPLACE
+            list_element.updating_from = already_installed
+        elif not assume_yes:
+            print(f'Name:        {list_element.name}')
+            print(f'Version:     {list_element.version or "Not specified"}')
+            print(f'Description: {list_element.description or "None"}')
+            ans = _ask('\nDo you really want to integrate this AppImage? (y/N)',
+                       ['y', 'Y', 'n', 'N'])
+            if ans.lower() != 'y':
+                return EXIT_OK
+
+            if already_installed:
+                ans = _ask('\nAnother version of this app is already '
+                           'integrated.\nHow do you want to proceed? '
+                           '((K)eep both/(R)eplace):',
+                           ['k', 'r', 'K', 'R'])
+                if ans.lower() == 'r':
+                    list_element.update_logic = AppImageUpdateLogic.REPLACE
+                    list_element.updating_from = already_installed
+
+        appimage_provider.install_file(list_element)
+
+        # prepopulate the per-app GithubUpdater source from the install URL
+        if url_source:
+            _auto_set_github_source(list_element, url_source)
+
+        # the installed desktop entry may carry a suffixed name (keep-both
+        # logic); report the name as it was actually installed
+        if list_element.desktop_entry:
+            list_element.name = list_element.desktop_entry.getName()
+
+        message = f'{list_element.file_path} was integrated successfully'
         if json_output:
             _print_json({
                 'schema_version': constants.JSON_SCHEMA_VERSION,
-                'result': 'already-integrated',
+                'result': 'integrated',
+                'message': message,
                 'app': _make_app_json(list_element),
             })
         else:
             print(message)
         return EXIT_OK
-
-    list_element.update_logic = AppImageUpdateLogic.KEEP
-    appimage_provider.refresh_data(list_element)
-
-    # Another version of the same app is detected either by display name
-    # or by the original (un-suffixed) name recorded in X-AppImage-Name —
-    # GearLever's CLI only compares names, which never matches apps that
-    # were integrated with the "Name (version)" keep-both suffix.
-    already_installed = None
-    for a in appimage_provider.list_installed():
-        original_name = ''
-        if a.desktop_entry:
-            original_name = a.desktop_entry.get('X-AppImage-Name', '') or ''
-        if a.name == list_element.name or original_name == list_element.name:
-            already_installed = a
-            break
-
-    if replace:
-        list_element.update_logic = AppImageUpdateLogic.REPLACE
-        list_element.updating_from = already_installed
-    elif not assume_yes:
-        print(f'Name:        {list_element.name}')
-        print(f'Version:     {list_element.version or "Not specified"}')
-        print(f'Description: {list_element.description or "None"}')
-        ans = _ask('\nDo you really want to integrate this AppImage? (y/N)',
-                   ['y', 'Y', 'n', 'N'])
-        if ans.lower() != 'y':
-            return EXIT_OK
-
-        if already_installed:
-            ans = _ask('\nAnother version of this app is already integrated.\n'
-                       'How do you want to proceed? ((K)eep both/(R)eplace):',
-                       ['k', 'r', 'K', 'R'])
-            if ans.lower() == 'r':
-                list_element.update_logic = AppImageUpdateLogic.REPLACE
-                list_element.updating_from = already_installed
-
-    appimage_provider.install_file(list_element)
-
-    # the installed desktop entry may carry a suffixed name (keep-both
-    # logic); report the name as it was actually installed
-    if list_element.desktop_entry:
-        list_element.name = list_element.desktop_entry.getName()
-
-    message = f'{list_element.file_path} was integrated successfully'
-    if json_output:
-        _print_json({
-            'schema_version': constants.JSON_SCHEMA_VERSION,
-            'result': 'integrated',
-            'message': message,
-            'app': _make_app_json(list_element),
-        })
-    else:
-        print(message)
-    return EXIT_OK
+    finally:
+        if tmp_cleanup:
+            shutil.rmtree(tmp_cleanup, ignore_errors=True)
 
 
 def cmd_list_installed(args: list) -> int:

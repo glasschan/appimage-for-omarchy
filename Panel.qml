@@ -550,8 +550,13 @@ Panel {
     Model.setBusy("integrate", true)
     Model.setStatus(strings.integrateWorking)
     syncFromModel()
+    // A GitHub release URL install downloads the whole AppImage first;
+    // give it the same long budget as --update so the watchdog doesn't
+    // reap a big transfer. Local paths keep the fast extract budget.
+    var timeout = /^https?:\/\//i.test(trimmed)
+      ? updateTimeoutMs : integrateTimeoutMs
     callBackend(["--integrate", trimmed, "--yes", "--json"],
-        { timeoutMs: integrateTimeoutMs }, function(result) {
+        { timeoutMs: timeout }, function(result) {
       Model.setBusy("integrate", false)
       if (result.ok) {
         var action = Model.parseActionJson(result.stdout)
