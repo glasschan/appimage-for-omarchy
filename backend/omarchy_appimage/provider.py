@@ -144,7 +144,10 @@ class AppImageProvider():
     desktop_exec_codes = ['%f', '%F', '%u', '%U', '%i', '%c', '%k']
 
     def __init__(self):
-        pass
+        # Desktop entries this provider instance has repaired; survives
+        # across list_installed() calls (the panel polls) so a desktop
+        # that keeps clobbering itself isn't re-written on every call.
+        self._repaired_desktop_paths = set()
 
     @property
     def user_desktop_files_path(self) -> str:
@@ -163,6 +166,16 @@ class AppImageProvider():
         if not os.path.exists(self.user_desktop_files_path):
             return output
 
+        # desktop_file_path -> recorded install config, scanned once. The
+        # desktop entry is mutable (apps like VS Code forks rewrite their
+        # own .desktop on first launch), so list here is desktop-driven but
+        # can fall back to the paths recorded at install time in apps.ini.
+        desktop_to_config = {}
+        for _section_key, rec in Config.iter_app_records():
+            dp = rec.get('desktop_file_path', '')
+            if dp and dp not in desktop_to_config:
+                desktop_to_config[dp] = rec
+
         for file_name in os.listdir(self.user_desktop_files_path):
             desktop_path = os.path.join(self.user_desktop_files_path,
                                         file_name)
@@ -178,46 +191,100 @@ class AppImageProvider():
                 exec_location = entry.getTryExec()
                 exec_command_data = extract_terminal_arguments(entry.getExec())
                 exec_arguments = ' '.join(exec_command_data['arguments'])
+                recovered = False
 
-                if os.path.isfile(exec_location):
-                    exec_in_default_folder = os.path.isfile(os.path.join(
-                        default_folder_path, os.path.basename(exec_location)))
-                    exec_in_folder = True if manage_from_outside \
-                        else exec_in_default_folder
-                    app_version = self._get_app_version(
-                        None, desktop_entry=entry, return_hash=False)
-                    file_size = os.stat(exec_location).st_size
-
-                    if exec_in_folder and self.can_install_file(exec_location):
-                        list_element = AppImageListElement(
-                            name=entry.getName(),
-                            desktop_file_path=desktop_path,
-                            description=entry.getComment(),
-                            version=(app_version or None),
-                            installed_status=InstalledStatus.INSTALLED,
-                            file_path=exec_location,
-                            provider=self.name,
-                            desktop_entry=entry,
-                            trusted=True,
-                            external_folder=(not exec_in_default_folder),
-                            exec_arguments=exec_arguments,
-                            env_variables=exec_command_data['env_vars'],
-                            size=file_size,
-                        )
-                        list_element.architecture = None
-                        output.append(list_element)
+                if not os.path.isfile(exec_location):
+                    # Exec/TryExec point at a path that is gone — typically a
+                    # mount-time binary whose /tmp/.mount_* dir was removed
+                    # after the app quit. Recover from the record made at
+                    # install time if it still resolves.
+                    recorded = desktop_to_config.get(desktop_path)
+                    recorded_appimage = (recorded or {}).get(
+                        'appimage_path', '')
+                    if (recorded_appimage
+                            and os.path.isfile(recorded_appimage)
+                            and self.can_install_file(recorded_appimage)):
+                        recovered = True
+                        exec_location = recorded_appimage
+                        default_args = (recorded or {}).get(
+                            'default_exec_arguments', '') or ''
+                        if default_args.strip():
+                            exec_arguments = ' '.join(
+                                shlex.split(default_args))
+                        # env vars from the clobbered entry are unreliable;
+                        # the repaired entry below restores the standard ones
+                        exec_command_data['env_vars'] = []
                     else:
-                        logging.debug('%s skipped because %s is not a '
-                                      'supported file type',
+                        logging.debug('%s skipped because %s does not exist',
                                       desktop_path, exec_location)
+                        continue
+
+                exec_in_default_folder = os.path.isfile(os.path.join(
+                    default_folder_path, os.path.basename(exec_location)))
+                exec_in_folder = True if manage_from_outside \
+                    else exec_in_default_folder
+                app_version = self._get_app_version(
+                    None, desktop_entry=entry, return_hash=False)
+                file_size = os.stat(exec_location).st_size
+
+                if exec_in_folder and self.can_install_file(exec_location):
+                    list_element = AppImageListElement(
+                        name=entry.getName(),
+                        desktop_file_path=desktop_path,
+                        description=entry.getComment(),
+                        version=(app_version or None),
+                        installed_status=InstalledStatus.INSTALLED,
+                        file_path=exec_location,
+                        provider=self.name,
+                        desktop_entry=entry,
+                        trusted=True,
+                        external_folder=(not exec_in_default_folder),
+                        exec_arguments=exec_arguments,
+                        env_variables=exec_command_data['env_vars'],
+                        size=file_size,
+                    )
+                    list_element.architecture = None
+                    output.append(list_element)
+                    if recovered:
+                        self._repair_clobbered_desktop(desktop_path,
+                                                       recorded)
                 else:
-                    logging.debug('%s skipped because %s does not exist',
+                    logging.debug('%s skipped because %s is not a '
+                                  'supported file type',
                                   desktop_path, exec_location)
 
             except Exception as e:
                 logging.warning('%s: %s', desktop_path, e)
 
         return output
+
+    def _repair_clobbered_desktop(self, desktop_path: str, recorded: dict):
+        """Point a clobbered .desktop's Exec/TryExec/Icon back at the
+        recorded install paths, preserving every other field.
+
+        Only called from list_installed() when the apps.ini fallback
+        matched, and exactly once per desktop path per provider instance,
+        so the panel/CLI never spin on the disk for an entry that keeps
+        self-clobbering while it runs."""
+        if desktop_path in self._repaired_desktop_paths:
+            return
+        try:
+            entry = DesktopEntry(path=desktop_path)
+        except Exception as e:
+            logging.warning('repair: could not read %s: %s', desktop_path, e)
+            return
+
+        appimage = recorded.get('appimage_path', '')
+        icon = recorded.get('icon_path') or 'applications-other'
+        default_args = recorded.get('default_exec_arguments', '') or ''
+        args = shlex.split(default_args) if default_args.strip() else []
+        entry.TryExec = appimage
+        entry.Exec = shlex.join(
+            ['env', 'DESKTOPINTEGRATION=1', appimage, *args])
+        entry.Icon = icon
+        entry.write_file(desktop_path)
+        self._repaired_desktop_paths.add(desktop_path)
+        logging.info('repaired clobbered desktop entry: %s', desktop_path)
 
     def is_installed(self, el: AppImageListElement) -> bool:
         if el.file_path and os.path.exists(self._get_appimages_default_destination_path()):

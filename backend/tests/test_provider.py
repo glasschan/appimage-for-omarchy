@@ -200,5 +200,105 @@ class ProvenanceRecordingTests(FakeXDGTestCase):
         self.assertEqual(list(sig.parameters), ['src', 'dest', 'mode'])
 
 
+class ClobberedDesktopRecoveryTests(FakeXDGTestCase):
+    """An integrated app's .desktop gets clobbered by the app itself
+    (VS Code forks rewrite Exec/TryExec to a mount-time path that is gone
+    after the app quits). list_installed() must recover it from apps.ini
+    and repair the .desktop in place."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider = AppImageProvider()
+
+    def _install_with_record(self, desktop_name='fakeapp',
+                             app_name='Fake App') -> tuple:
+        appimage, desktop, icon = self.install_fake_app(
+            desktop_name, app_name)
+        # mimic install_file's provenance record in apps.ini
+        el = _make_el(appimage, desktop_path=desktop)
+        Config.set_app_config(el, {
+            'appimage_path': appimage,
+            'desktop_file_path': desktop,
+            'icon_path': icon,
+            'default_exec_arguments': '',
+        })
+        return appimage, desktop, icon
+
+    @staticmethod
+    def _clobber(desktop: str, mount='/tmp/.mount_zzzz/zcode'):
+        with open(desktop, 'w') as f:
+            f.write(f'''[Desktop Entry]
+Name=ZCode
+Exec={mount} --no-sandbox
+TryExec={mount}
+Icon=/tmp/.mount_zzzz/zcode.png
+Type=Application
+Terminal=false
+''')
+
+    def test_recovery_when_tryexec_is_dead(self):
+        appimage, desktop, _icon = self._install_with_record()
+        self._clobber(desktop)
+
+        listed = self.provider.list_installed()
+
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0].file_path, appimage)
+
+    def test_repair_restores_tryexec_exec_icon(self):
+        _appimage, desktop, icon = self._install_with_record()
+        self._clobber(desktop)
+
+        self.provider.list_installed()
+
+        entry = DesktopEntry(path=desktop)
+        self.assertEqual(entry.getTryExec(), _appimage)
+        self.assertTrue(entry.getExec().startswith(
+            f'env DESKTOPINTEGRATION=1 {_appimage}'))
+        self.assertEqual(entry.getIcon(), icon)
+
+    def test_repair_preserves_user_metadata(self):
+        _appimage, desktop, _icon = self._install_with_record(app_name='ZCode')
+        # clobbered entry carries its own Name/Comment/Categories
+        with open(desktop, 'w') as f:
+            f.write('''[Desktop Entry]
+Name=ZCode
+Comment=A hacked-in editor
+Categories=Development;IDE;
+Exec=/tmp/.mount_zzzz/zcode
+TryExec=/tmp/.mount_zzzz/zcode
+Icon=/tmp/.mount_zzzz/zcode.png
+Type=Application
+''')
+
+        self.provider.list_installed()
+
+        entry = DesktopEntry(path=desktop)
+        self.assertEqual(entry.getName(), 'ZCode')
+        self.assertEqual(entry.getComment(), 'A hacked-in editor')
+        self.assertEqual(entry.get('Categories'), 'Development;IDE;')
+
+    def test_repair_is_idempotent_within_process(self):
+        _appimage, desktop, _icon = self._install_with_record()
+        self._clobber(desktop)
+
+        self.provider.list_installed()
+        mtime_first = os.stat(desktop).st_mtime_ns
+        self.provider.list_installed()
+        mtime_second = os.stat(desktop).st_mtime_ns
+        self.assertEqual(mtime_first, mtime_second)
+
+    def test_recovery_skipped_when_recorded_appimage_missing(self):
+        appimage, desktop, _icon = self._install_with_record()
+        os.unlink(appimage)
+        self._clobber(desktop)
+
+        listed = self.provider.list_installed()
+        self.assertEqual(listed, [])
+        # desktop is NOT rewritten (no recovery happened)
+        with open(desktop) as f:
+            self.assertIn('/tmp/.mount_zzzz', f.read())
+
+
 if __name__ == '__main__':
     unittest.main()
