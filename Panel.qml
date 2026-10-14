@@ -783,6 +783,10 @@ Panel {
     sourceEditManager = item.manager
     rebuildSourceEditValues()
     sourceEditId = item.id
+    // Switching rows empties the previous row's Repeater model, which
+    // Loader-destroys its fields (see closeSourceEditor for why the count
+    // must be zeroed by hand).
+    sourceFieldFocusCount = 0
     // Coarse reveal: the editor may sit below the fold of a long list.
     Qt.callLater(function() {
       if (root.sourceEditId !== "" && listFlick) {
@@ -2250,7 +2254,13 @@ Panel {
                         }
 
                         Repeater {
+                          // The model is global (root.sourceEditManager), so
+                          // without the row-visibility gate every other row's
+                          // hidden editor card would instantiate the same
+                          // editable inputs — no field may exist while its
+                          // card is hidden (see the field templates note).
                           model: {
+                            if (root.sourceEditId !== rowOuter.modelData.id) return []
                             var mgr = Model.managersByName()[root.sourceEditManager]
                             return mgr ? mgr.fields : []
                           }
