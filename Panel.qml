@@ -228,14 +228,15 @@ Panel {
   }
 
   // True while any editor inside the panel should own raw keys instead of
-  // the key catcher's shortcuts (see the keyCatcher binding below).
-  readonly property bool formEditing: pickerField.activeFocus
+  // the key catcher's shortcuts (see the keyCatcher binding below). The
+  // picker and settings fields are Loader-created (see the field templates
+  // at the bottom of this file), so guard on the loaded items.
+  readonly property bool formEditing: (pickerFieldLoader.item
+      ? pickerFieldLoader.item.activeFocus : false)
     || sourceFieldFocusCount > 0
     || root.sourceDropdownOpen
-    || (intervalField.field.contentItem
-        ? intervalField.field.contentItem.activeFocus : false)
-    || (delayField.field.contentItem
-        ? delayField.field.contentItem.activeFocus : false)
+    || (settingsNumbersLoader.item
+        ? settingsNumbersLoader.item.anyFieldFocused : false)
 
   // ---- lifecycle -----------------------------------------------------------
 
@@ -574,7 +575,6 @@ Panel {
       syncFromModel()
       pickerOpen = false
       pickerPath = ""
-      pickerField.text = ""
       refresh()
     })
   }
@@ -1648,18 +1648,11 @@ Panel {
                 width: parent.width
                 spacing: Style.spacing.xs
 
-                TextField {
-                  id: pickerField
-                  placeholderText: root.strings.pickerPlaceholder
-                  foreground: root.foreground
-                  accent: Color.accent
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
-                  enabled: !root.busyIntegrate
+                Loader {
+                  id: pickerFieldLoader
+                  active: root.pickerOpen
                   width: parent.width - pickerGoButton.width - Style.spacing.xs
-                  onTextChanged: root.pickerPath = text
-                  onAccepted: root.integratePath(text)
+                  sourceComponent: pickerFieldComp
                 }
 
                 Button {
@@ -1787,35 +1780,11 @@ Panel {
                 }
               }
 
-              Row {
+              Loader {
+                id: settingsNumbersLoader
+                active: root.settingsOpen
                 width: parent.width
-                spacing: Style.spacing.sm
-
-                NumberField {
-                  id: intervalField
-                  label: root.strings.checkIntervalMinutes
-                  value: root.editInterval
-                  from: 15
-                  to: 10080
-                  enabled: !root.settingsBusy
-                  foreground: root.foreground
-                  accent: Color.accent
-                  fontFamily: root.fontFamily
-                  onModified: function(v) { root.editInterval = v }
-                }
-
-                NumberField {
-                  id: delayField
-                  label: root.strings.firstCheckDelayMinutes
-                  value: root.editDelay
-                  from: 0
-                  to: 1440
-                  enabled: !root.settingsBusy
-                  foreground: root.foreground
-                  accent: Color.accent
-                  fontFamily: root.fontFamily
-                  onModified: function(v) { root.editDelay = v }
-                }
+                sourceComponent: settingsNumbersComp
               }
 
               Text {
@@ -2382,6 +2351,71 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         onToggled: root.setSourceValue(fieldKey,
           root.sourceEditValues[fieldKey] === "true" ? "false" : "true")
+      }
+    }
+  }
+
+  // Integrate-picker URL field (F2) and the settings cadence fields (F8):
+  // Loader-created so no editable text input exists while its card is
+  // hidden — Qt 6.12 retrieves foreign clipboard text for live editable
+  // inputs on every clipboard change, and a hidden field must never give
+  // a clipboard provider a way into the shared shell process. Text is
+  // seeded from root.pickerPath on creation; typing writes it back.
+  Component {
+    id: pickerFieldComp
+
+    TextField {
+      width: parent ? parent.width : 0
+      placeholderText: root.strings.pickerPlaceholder
+      foreground: root.foreground
+      accent: Color.accent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
+      enabled: !root.busyIntegrate
+      Component.onCompleted: text = root.pickerPath
+      onTextChanged: root.pickerPath = text
+      onAccepted: root.integratePath(text)
+    }
+  }
+
+  Component {
+    id: settingsNumbersComp
+
+    Row {
+      width: parent ? parent.width : 0
+      spacing: Style.spacing.sm
+
+      readonly property bool anyFieldFocused:
+        (intervalField.field.contentItem
+         ? intervalField.field.contentItem.activeFocus : false)
+        || (delayField.field.contentItem
+            ? delayField.field.contentItem.activeFocus : false)
+
+      NumberField {
+        id: intervalField
+        label: root.strings.checkIntervalMinutes
+        value: root.editInterval
+        from: 15
+        to: 10080
+        enabled: !root.settingsBusy
+        foreground: root.foreground
+        accent: Color.accent
+        fontFamily: root.fontFamily
+        onModified: function(v) { root.editInterval = v }
+      }
+
+      NumberField {
+        id: delayField
+        label: root.strings.firstCheckDelayMinutes
+        value: root.editDelay
+        from: 0
+        to: 1440
+        enabled: !root.settingsBusy
+        foreground: root.foreground
+        accent: Color.accent
+        fontFamily: root.fontFamily
+        onModified: function(v) { root.editDelay = v }
       }
     }
   }
