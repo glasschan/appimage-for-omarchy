@@ -7,7 +7,8 @@
 #
 # Gates in this script:
 #   1  backend invariant greps (os.environ / urllib egress / atomic copy /
-#      bounded subprocess / QML collector wiring / shell-source constancy)
+#      bounded subprocess / QML collector wiring / shell-source constancy /
+#      no editable native text input — round-3 finding, marketplace #11415)
 # The former gate 2 (shellcheck on the bundled install/uninstall scripts)
 # and gate 3 (install.sh deploy smoke test) died with those scripts: the
 # marketplace requires plugins to install via `omarchy plugin add`, which
@@ -125,7 +126,7 @@ for path in sorted(PKG.glob('*.py')):
 # for these flat blocks. Comments (// and /* */) and string literals are
 # stripped first so braces or onRead: inside them cannot fool the scan;
 # newlines are preserved so reported line numbers stay the original ones.
-def strip_comments_and_strings(text):
+def strip_comments_and_strings(text, keep_strings=False):
     out = []
     i, n = 0, len(text)
     state = 'code'
@@ -140,7 +141,7 @@ def strip_comments_and_strings(text):
                 out.append('  ')
             elif c in '"\'`':
                 state, i = {'"': 'dq', "'": 'sq', '`': 'bt'}[c], i + 1
-                out.append(' ')
+                out.append(' ' if not keep_strings else c)
             else:
                 out.append(c)
                 i += 1
@@ -158,14 +159,14 @@ def strip_comments_and_strings(text):
                 i += 1
         else:  # dq / sq / bt string literal
             if c == '\\' and i + 1 < n:
-                out.append('  ')
+                out.append('  ' if not keep_strings else c + nxt)
                 i += 2
             elif c == {'dq': '"', 'sq': "'", 'bt': '`'}[state]:
                 state = 'code'
-                out.append(' ')
+                out.append(' ' if not keep_strings else c)
                 i += 1
             else:
-                out.append('\n' if c == '\n' else ' ')
+                out.append('\n' if c == '\n' else (' ' if not keep_strings else c))
                 i += 1
     return ''.join(out)
 
@@ -259,12 +260,69 @@ for path in sorted(ROOT.glob('lib/*.js')) + QML:
                         'source — the presented string must be constant; '
                         'environment values only as expansion/argv data')
 
+# Rule 8: no editable native text input (marketplace #11415, round 3).
+# Qt 6.12 automatically retrieves foreign clipboard text on every clipboard
+# change for any QQuickTextInput with readOnly: false — no paste action, no
+# aggregate byte limit, no overall deadline — so a clipboard provider can
+# stall or exhaust the shared shell while an editable input is alive, even
+# inside an open card. readOnly is the only switch for that hook
+# (omarchy#15083). Plugin-wide contract:
+#   - `TextField {` / `TextInput {` / `TextEdit {` instantiations exist
+#     ONLY as SafeTextField.qml's own readOnly root (text entry goes
+#     through SafeTextField everywhere else);
+#   - that root stays permanently `readOnly: true`;
+#   - its clipboard helper stays bounded (timeout + text/plain only);
+#   - every NumberField instance flips the shell SpinBox's inner TextInput
+#     readOnly via `field.editable = false`.
+safe_root_seen = False
+for path in QML:
+    text = strip_comments_and_strings(path.read_text(encoding='utf-8'))
+    is_safe_field = path.name == 'SafeTextField.qml'
+    for m in re.finditer(r'\b(TextField|TextInput|TextEdit)\s*\{', text):
+        if is_safe_field and m.group(1) == 'TextField' and not safe_root_seen:
+            safe_root_seen = True
+            continue  # SafeTextField's own readOnly root declaration
+        err('qml-no-editable-input', path, text.count('\n', 0, m.start()) + 1,
+            f'native {m.group(1)} instantiation — text entry must go '
+            'through SafeTextField (Qt 6.12 clipboard hook arms on every '
+            'readOnly: false QQuickTextInput, marketplace #11415 round 3)')
+    if is_safe_field:
+        if not re.search(r'^\s*readOnly:\s*true\s*$', text, re.M):
+            err('qml-no-editable-input', path, None,
+                'SafeTextField root lost its permanent `readOnly: true` — '
+                'that flag is the only switch for the Qt 6.12 clipboard '
+                'hook and must never be bound or cleared')
+        # argv literals live inside strings, so this check needs the
+        # comments-stripped, strings-preserved text.
+        live = strip_comments_and_strings(
+            path.read_text(encoding='utf-8'), keep_strings=True)
+        if not re.search(r'"/usr/bin/timeout"', live) \
+                or not re.search(r'"/usr/bin/wl-paste", "--no-newline", '
+                                 '"--type", "text/plain"', live):
+            err('qml-no-editable-input', path, None,
+                'SafeTextField clipboard helper must stay bounded and '
+                'fail-closed: /usr/bin/timeout around /usr/bin/wl-paste '
+                '--no-newline --type text/plain')
+if not QML:
+    err('qml-no-editable-input', ROOT, None, 'no root QML files found')
+number_fields = len(re.findall(r'\bNumberField\s*\{', '\n'.join(
+    strip_comments_and_strings(p.read_text(encoding='utf-8')) for p in QML)))
+editable_offs = sum(len(re.findall(r'field\.editable\s*=\s*false',
+                                   strip_comments_and_strings(
+                                       p.read_text(encoding='utf-8'))))
+                    for p in QML)
+if number_fields != editable_offs:
+    err('qml-no-editable-input', ROOT, None,
+        f'{number_fields} NumberField instance(s) but {editable_offs} '
+        '`field.editable = false` wire(s) — every NumberField must flip '
+        'the shell SpinBox contentItem to readOnly')
+
 if errors:
     print(f'gate 1: {len(errors)} backend invariant violation(s)')
     sys.exit(1)
 print('gate 1: backend invariants OK '
       '(env boundary, egress, atomic install, bounded subprocess, '
-      'QML collectors, shell-source constancy)')
+      'QML collectors, shell-source constancy, no editable native input)')
 PY
 then
   printf 'PASS: gate 1 — backend invariant greps\n'

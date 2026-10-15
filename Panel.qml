@@ -2318,10 +2318,17 @@ Panel {
   // Bool values are "true"/"false" strings so the Save argv passes them
   // through verbatim; the focus count tells the key catcher when a field
   // is typing (see formEditing).
+  //
+  // Text entry goes through SafeTextField (round 3 of review #11415): no
+  // native editable input may exist even while its card is open — the
+  // Qt 6.12 clipboard hook arms on every readOnly: false QQuickTextInput.
+  // `value` mirrors sourceEditValues; `edited` writes it back storage-only
+  // (setSourceValue never reassigns the object, so the value binding never
+  // re-evaluates mid-typing — same contract the old text binding had).
   Component {
     id: sourceStringFieldComp
 
-    TextField {
+    SafeTextField {
       property string fieldKey: ""
       placeholderText: Model.fieldLabel(fieldKey)
       foreground: root.foreground
@@ -2331,8 +2338,8 @@ Panel {
       implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
       width: parent ? parent.width : 0
       enabled: !root.sourceBusy
-      text: root.sourceEditValues[fieldKey] || ""
-      onTextChanged: root.setSourceValue(fieldKey, text)
+      value: root.sourceEditValues[fieldKey] || ""
+      onEdited: function(v) { root.setSourceValue(fieldKey, v) }
       onActiveFocusChanged: root.sourceFieldFocusCount = activeFocus ? root.sourceFieldFocusCount + 1 : Math.max(0, root.sourceFieldFocusCount - 1)
     }
   }
@@ -2366,15 +2373,18 @@ Panel {
   }
 
   // Integrate-picker URL field (F2) and the settings cadence fields (F8):
-  // Loader-created so no editable text input exists while its card is
-  // hidden — Qt 6.12 retrieves foreign clipboard text for live editable
-  // inputs on every clipboard change, and a hidden field must never give
-  // a clipboard provider a way into the shared shell process. Text is
-  // seeded from root.pickerPath on creation; typing writes it back.
+  // Loader-created so no text input exists while its card is hidden
+  // (defense in depth — see the SafeTextField note above for the round-3
+  // rule: no native editable input may exist even while the card is open,
+  // so the field type itself carries the guarantee; the Loader gates keep
+  // dead instances from piling up at all). The picker field is a
+  // SafeTextField: `value` mirrors pickerPath, `edited` writes it back,
+  // Enter integrates the current path — behavior identical to the old
+  // native field, seeding included (the value binding seeds on creation).
   Component {
     id: pickerFieldComp
 
-    TextField {
+    SafeTextField {
       width: parent ? parent.width : 0
       placeholderText: root.strings.pickerPlaceholder
       foreground: root.foreground
@@ -2383,9 +2393,9 @@ Panel {
       font.pixelSize: Style.font.bodySmall
       implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
       enabled: !root.busyIntegrate
-      Component.onCompleted: text = root.pickerPath
-      onTextChanged: root.pickerPath = text
-      onAccepted: root.integratePath(text)
+      value: root.pickerPath
+      onEdited: function(v) { root.pickerPath = v }
+      onAccepted: root.integratePath(root.pickerPath)
     }
   }
 
@@ -2412,6 +2422,11 @@ Panel {
         foreground: root.foreground
         accent: Color.accent
         fontFamily: root.fontFamily
+        // Round 3 of review #11415: the SpinBox contentItem is a native
+        // TextInput that arms the Qt 6.12 clipboard hook while editable.
+        // editable: false is the one switch that flips it readOnly —
+        // value changes go through the spin buttons only.
+        Component.onCompleted: field.editable = false
         onModified: function(v) { root.editInterval = v }
       }
 
@@ -2425,6 +2440,7 @@ Panel {
         foreground: root.foreground
         accent: Color.accent
         fontFamily: root.fontFamily
+        Component.onCompleted: field.editable = false
         onModified: function(v) { root.editDelay = v }
       }
     }

@@ -194,6 +194,7 @@ compatible INI); global settings in `…/settings.json` —
 manifest.json     Omarchy plugin manifest (bar-widget + panel + service)
 BarWidget.qml     Bar entry: icon + count badge, summons the panel
 Panel.qml         Main panel (list, picker, update rows, settings card, states, Escape via PanelKeyCatcher)
+SafeTextField.qml Clipboard-safe text field (permanently readOnly + key-driven editing + bounded fail-closed wl-paste) — every text entry goes through it
 Service.qml       Background update checker (scheduled --fetch-updates sweeps)
 ThemeIcon.qml     Theme-colored tabler icon (runtime currentColor tint)
 lib/Model.js      Shared state store (items cache, counts, busy flags, JSON mapping)
