@@ -7,9 +7,25 @@
 #   1. pure-Python squashfs reader (squashfs.py) — works for gzip, xz and
 #      zstd images without any external tool (PRD §7.3 wanted bsdtar, but
 #      libarchive has no squashfs reader; verified with libarchive 3.8);
-#   2. fallback: `unsquashfs -o <offset>` when installed;
-#   3. fallback: `bsdtar` reading the squashfs stream at the offset
+#   2. DwarFS payloads (the newer VHSgunzo/uruntime runtime, e.g.
+#      ProtonPlus / Goverlay): the external `dwarfsextract` with
+#      GearLever's restrictive pattern set. A DwarFS payload is NOT a
+#      squashfs image, so the stdlib reader and the unsquashfs/bsdtar
+#      fallbacks below can never read one — that is why this branch is
+#      reached before them (a DwarFS image does not even pay for the
+#      stdlib attempt): feeding DwarFS bytes to unsquashfs only burns
+#      time and produces the wrong diagnosis;
+#   3. fallback: `unsquashfs -o <offset>` when installed;
+#   4. fallback: `bsdtar` reading the squashfs stream at the offset
 #      (kept for the day libarchive grows squashfs support).
+#
+# The DwarFS branch is ported from GearLever's _extract_appimage
+# (`dwarfsck` probe + `dwarfsextract --pattern=...`), with two
+# deliberate differences: the probe that decides "is this DwarFS" is
+# done here in pure Python (see _find_dwarfs_payload) so the image is
+# understood without the tools installed, and the tools are optional —
+# when they are missing the image still fails closed with a message
+# that names the format and where to get them.
 #
 # Marketplace security-review hardening: the external fallbacks fail
 # closed — the listing is quota-checked before extraction, the extracted
@@ -325,13 +341,219 @@ def _sanitize_extracted(root: str):
                     _bust(f'(more than {MAX_EXTRACT_BYTES} bytes)')
 
 
+# ---------------------------------------------------------------- DwarFS
+#
+# DwarFS is the filesystem used by the VHSgunzo/uruntime runtime (a
+# growing share of modern AppImages: ProtonPlus, Goverlay, ...). It is
+# not a SquashFS image, so none of the code below can read it: it needs
+# the tools that ship with dwarfs itself — dwarfsck to probe an image
+# and dwarfsextract to read it — exactly like GearLever's
+# _extract_appimage. They are NOT in the Arch repositories (AUR only:
+# `dwarfs`, `dwarfs-bin`), so everything here has to stay optional.
+
+_DWARFS_MAGIC = b'DWARFS'
+
+# One dwarfs section header (dwarfs' section_layout.h), 64 bytes:
+#   0x00  6  magic 'DWARFS'
+#   0x06  2  version (major, minor; v2.5 observed)
+#   0x08 32  SHA-512/256 of the section data
+#   0x28  8  XXH3-64 of the section data
+#   0x30  4  section number          (u32 LE)
+#   0x34  2  section type            (u16 LE)
+#   0x36  2  compression id          (u16 LE)
+#   0x38  8  length of the data that follows this header (u64 LE)
+_DWARFS_HEADER_SIZE = 64
+_DWARFS_LENGTH_AT = 0x38
+
+# Compression ids (dwarfs' compression.h): 0 NONE ... 7 RICEPP.
+_DWARFS_COMPRESSION = ('none', 'lzma', 'zstd', 'lz4', 'lz4hc', 'brotli',
+                       'flac', 'ricepp')
+
+# GearLever's extract patterns: only the desktop entry, the icons and
+# the .DirIcon are ever written to disk. The aggregate quotas and
+# _sanitize_extracted still run afterwards as a backstop, so even a
+# pathological image cannot flood the filesystem or plant an escaping
+# symlink through this path.
+_DWARFS_PATTERNS = ('**.desktop', '**.png', '**.svg', '.DirIcon')
+
+# Appended when a DwarFS image could not be read. dwarfs is not packaged
+# for Arch (AUR only: `dwarfs`, `dwarfs-bin`), so the hint has to name
+# the format and say where the tools come from — "unsupported
+# compression" alone sends users hunting for the wrong fix.
+_DWARFS_TOOLS_HINT = (
+    'The image payload looks like DwarFS (the newer uruntime runtime '
+    'format), which this plugin can only read with the external '
+    'dwarfsck/dwarfsextract tools; they are not in the Arch repositories, '
+    'so install them from the AUR (`dwarfs` or `dwarfs-bin`) and try '
+    'again.')
+
+def _read_at(path: str, offset: int, size: int) -> bytes:
+    """`size` bytes at `offset`, or b'' when the file is shorter or
+    unreadable."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(offset)
+            return f.read(size)
+    except OSError as e:
+        logging.debug('read at %d in %s failed: %s', offset, path, e)
+        return b''
+
+
+def _parse_dwarfs_section_header(raw: bytes) -> Optional[dict]:
+    """Structural parse of one 64-byte DwarFS section header, or None
+    when `raw` cannot be one.
+
+    The enumerations are deliberately NOT validated (only the magic and
+    the length are): a future dwarfs release may add a section type or a
+    compression id, and rejecting it here would only lose the DwarFS
+    fast path — the squashfs fallback chain still runs, so nothing is
+    ever extracted from the wrong place. The false-positive bite is
+    taken by the pair-of-headers check in _find_dwarfs_payload."""
+    if len(raw) < _DWARFS_HEADER_SIZE or raw[:6] != _DWARFS_MAGIC:
+        return None
+    section = struct.unpack_from('<I', raw, 0x30)[0]
+    section_type, compression = struct.unpack_from('<HH', raw, 0x34)
+    length = struct.unpack_from('<Q', raw, _DWARFS_LENGTH_AT)[0]
+    return {
+        'version': f'{raw[6]}.{raw[7]}',
+        'section': section,
+        'section_type': section_type,
+        'compression': compression,
+        'length': length,
+    }
+
+
+def _dwarfs_compression_name(compression: int) -> str:
+    try:
+        return _DWARFS_COMPRESSION[compression]
+    except IndexError:
+        return f'unknown({compression})'
+
+
+def _find_dwarfs_payload(appimage_path: str) -> Optional[dict]:
+    """Detect a DwarFS payload at the AppImage's ELF boundary.
+
+    The check is anchored at elf.get_squashfs_offset() (the end of the
+    ELF section-header table, which for the uruntime runtime is exactly
+    where the payload starts) and confirmed the way `dwarfsck -O auto`
+    walks an image: the section header that follows *this* section's
+    data must be a valid header too.
+
+    Anchoring is what keeps the runtime's own strings out of the result:
+    the uruntime binary carries the DWARFS_* environment variable names
+    in its .rodata (measured: 14 'DWARFS' hits before the payload in
+    goverlay-1.9.4) and even a 'hsqs' immediate in its .text, so a plain
+    magic scan of the file reports garbage. Only a header pair at the
+    boundary counts; anything else falls through to the squashfs chain
+    with the tools untouched.
+
+    Returns the first section header (plus its offset), or None."""
+    try:
+        offset = elf.get_squashfs_offset(appimage_path)
+        size = os.path.getsize(appimage_path)
+    except (OSError, ValueError, struct.error) as e:
+        logging.debug('dwarfs probe skipped for %s: %s', appimage_path, e)
+        return None
+
+    # the boundary must at least have room for one full section header
+    if offset < _DWARFS_HEADER_SIZE or offset + _DWARFS_HEADER_SIZE > size:
+        return None
+
+    first = _parse_dwarfs_section_header(
+        _read_at(appimage_path, offset, _DWARFS_HEADER_SIZE))
+    if first is None:
+        return None
+
+    # the next section header starts right after this section's data;
+    # an image-chosen length can never aim that read past EOF
+    next_offset = offset + _DWARFS_HEADER_SIZE + first['length']
+    if next_offset + _DWARFS_HEADER_SIZE > size:
+        return None
+    if _parse_dwarfs_section_header(
+            _read_at(appimage_path, next_offset,
+                     _DWARFS_HEADER_SIZE)) is None:
+        return None
+
+    first['offset'] = offset
+    return first
+
+
+def _extract_dwarfs(appimage_path: str) -> tuple:
+    """Read the metadata files out of a DwarFS payload with dwarfs' own
+    tools (GearLever's DwarFS branch).
+
+    Returns (source, extracted_dir), or (None, None) when nothing can be
+    read here — dwarfsextract is not installed, or the optional
+    `dwarfsck` probe rejected the image (it judges more strictly than
+    the header-pair check: hashes, section index) — the caller then
+    falls back to the squashfs extractors and one final error message
+    instead of failing outright.
+
+    Raises when the image is DwarFS, the tools are installed and they
+    still could not read it (truncated image, tools too old for the
+    format version)."""
+    if not shutil.which('dwarfsextract'):
+        # Nothing to extract with: fall back to the squashfs chain (it
+        # cannot read a DwarFS payload either, but it costs one fast
+        # failing call each and keeps the decision with one final
+        # message) and let the error name the missing tools.
+        logging.warning('dwarfs payload needs dwarfsck/dwarfsextract, '
+                        'which are not installed')
+        return None, None
+
+    extracted_dir = new_temp_dir('dwarfs-')
+    try:
+        if shutil.which('dwarfsck'):
+            try:
+                run_command(['dwarfsck', f'--input={appimage_path}', '-q',
+                             '-detail=0', '--no-check'], timeout=120)
+            except Exception as e:
+                logging.info('dwarfsck did not accept %s: %s', appimage_path,
+                             e)
+                return None, None
+
+        run_command(['dwarfsextract', f'--input={appimage_path}',
+                     f'--output={extracted_dir}']
+                    + [f'--pattern={pattern}' for pattern in _DWARFS_PATTERNS],
+                    timeout=600)
+        _sanitize_extracted(extracted_dir)
+        return _DirSource(extracted_dir), extracted_dir
+    except SquashfsError:
+        shutil.rmtree(extracted_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        logging.warning('dwarfsextract failed on %s: %s', appimage_path, e)
+        shutil.rmtree(extracted_dir, ignore_errors=True)
+        raise SquashfsError(
+            'Could not extract this DwarFS AppImage with '
+            'dwarfsck/dwarfsextract; the image may be truncated or '
+            'corrupt, or the installed dwarfs tools are too old for its '
+            'format version. ' + _DWARFS_TOOLS_HINT) from None
+
+
 def _open_source(appimage_path: str) -> tuple:
     """Return (source, extracted_dir_or_None). Raises on total failure."""
-    try:
-        return _VfsSource(appimage_path), None
-    except (SquashfsError, struct.error, ValueError) as e:
-        logging.info('stdlib squashfs reader failed (%s); trying external '
-                     'extractors', e)
+    dwarfs = _find_dwarfs_payload(appimage_path)
+
+    if dwarfs is None:
+        try:
+            return _VfsSource(appimage_path), None
+        except (SquashfsError, struct.error, ValueError) as e:
+            logging.info('stdlib squashfs reader failed (%s); trying '
+                         'external extractors', e)
+
+    if dwarfs is not None:
+        # A DwarFS payload is not a squashfs image: skip the stdlib
+        # reader entirely and go straight to dwarfs' own tools.
+        logging.info('dwarfs payload at offset %d (v%s, compression %s)',
+                     dwarfs['offset'], dwarfs['version'],
+                     _dwarfs_compression_name(dwarfs['compression']))
+        source, extracted_dir = _extract_dwarfs(appimage_path)
+        if source is not None:
+            return source, extracted_dir
+        # nothing left to try here: dwarfsextract is not installed, or
+        # dwarfsck rejected the image; the squashfs chain is then still
+        # worth one attempt, and one final message explains DwarFS
 
     extracted_dir = None
 
@@ -385,10 +607,11 @@ def _open_source(appimage_path: str) -> tuple:
             shutil.rmtree(extracted_dir, ignore_errors=True)
             extracted_dir = None
 
-    raise SquashfsError('Could not extract the AppImage with any available '
-                        'method (stdlib squashfs reader, unsquashfs, bsdtar); '
-                        'the image uses an unsupported compression or is '
-                        'not a type-2 AppImage')
+    raise SquashfsError(
+        'Could not extract the AppImage with any available method (stdlib '
+        'squashfs reader, unsquashfs, bsdtar); the image uses an '
+        'unsupported compression or is not a type-2 AppImage'
+        + ('. ' + _DWARFS_TOOLS_HINT if dwarfs is not None else ''))
 
 
 def _find_desktop_file(source) -> tuple:

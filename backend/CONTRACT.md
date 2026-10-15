@@ -14,12 +14,19 @@ python3 <plugin_dir>/backend/main.py [OPTION]...
 - Runtime: Python 3, **standard library only** (no third-party packages).
 - External tools: none required for AppImage handling. `unsquashfs` /
   `bsdtar` are used as optional fallbacks for exotic squashfs compressions;
+  `dwarfsck` / `dwarfsextract` are used to read the DwarFS payloads built
+  by the newer uruntime runtime (AUR-only on Arch: `dwarfs` /
+  `dwarfs-bin`; without them a DwarFS image fails with a message naming
+  the tools);
   `zstd` CLI is used only on Python < 3.14 for zstd-compressed AppImages;
   `update-desktop-database` and `ps` are called best-effort and failures are
   ignored. `notify-send` is used best-effort by `--fetch-updates` only
   (a missing binary just means no notification, never a failure).
 - The AppImage is **never executed** (metadata is read with a built-in
-  squashfs reader; updates download and re-integrate the new file).
+  squashfs reader — or, for DwarFS payloads, with `dwarfsextract`
+  restricted to the desktop entry and icon patterns; the extracted tree
+  is quota-limited and symlink-contained either way — updates download
+  and re-integrate the new file).
 - `OMARCHY_APPIMAGE_DEBUG=1` enables debug logging (stderr), including
   `--update` download progress.
 
@@ -47,9 +54,10 @@ string). `available_version` / `download_size` stay `null` here; only
 ### `--integrate <path> [--yes] [--replace] [--json]`
 
 Integrates an AppImage: extracts the `.desktop` entry + icon from the
-embedded squashfs, copies the AppImage to the managed folder (chmod 755),
-writes the desktop entry and icon, then **moves** (deletes) the original
-file (GearLever's `move-appimage-on-integration` default).
+embedded squashfs (or DwarFS) payload, copies the AppImage to the managed
+folder (chmod 755), writes the desktop entry and icon, then **moves**
+(deletes) the original file (GearLever's
+`move-appimage-on-integration` default).
 
 - `--yes` is **required** with `--json` (no interactive prompts), otherwise
   exit code 2.
@@ -364,7 +372,9 @@ Real example output:
 - **Extraction quotas** — external extractors list the image first and
   refuse to extract past 20 000 entries / 512 MiB (fail closed); the
   extracted tree is sanitized afterwards (symlinks escaping the temp root
-  are unlinked, quotas re-checked).
+  are unlinked, quotas re-checked). The DwarFS path (`dwarfsextract`)
+  is pattern-restricted up front (desktop entries, icons, `.DirIcon`
+  only) and goes through the same sanitizer and quotas.
 - **Bounded subprocess output** — helper commands' stdout/stderr are
   capped at 10 MiB per stream; past the cap the reader stops and the
   timeout reaps a still-writing child.

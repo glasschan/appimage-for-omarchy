@@ -44,6 +44,15 @@ misleading "python3 missing" hint.
   `ps` and `update-desktop-database` are best-effort and their absence is
   never an error (see [backend/CONTRACT.md](backend/CONTRACT.md)). The
   AppImage is never executed to read its metadata.
+- Optional: `dwarfsck` + `dwarfsextract` (the tools that ship with
+  [dwarfs](https://github.com/mhx/dwarfs)) are what makes AppImages built
+  with the newer
+  [uruntime](https://github.com/VHSgunzo/uruntime) DwarFS runtime
+  integrable (e.g. ProtonPlus, Goverlay). They are **not** in the Arch
+  repositories — install them from the AUR (`dwarfs` or `dwarfs-bin`).
+  Without them those images integrate with an error that names the
+  missing tools and where to get them; every squashfs-based AppImage is
+  unaffected either way.
 - AppImage detection accepts the type-1/type-2 magic bytes; magicless
   type-2 builds (modern images that omit the optional `AI\x02` magic) are
   still detected via the ELF header plus a squashfs magic at the

@@ -50,6 +50,9 @@ REQUIRED_SCENARIOS = [
      [{'symlink', 'escape'}, {'symlink', 'escaping'}], False),
     ('extraction bombs / listing quotas',
      [{'quota'}], False),
+    ('DwarFS payload extraction stays pattern-restricted and '
+     'quota-contained (dwarfsextract)',
+     [{'dwarf', 'pattern'}, {'dwarf', 'quota'}], False),
     ('icon path traversal is rejected',
      [{'traversal'}], False),
     ('non-regular destinations (FIFO) are refused',
