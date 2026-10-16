@@ -68,10 +68,13 @@ REQUIRED_SCENARIOS = [
     ('round 4: a colliding package cannot write outside the managed '
      'directories via embedded desktop Name / X-AppImage-Version',
      [{'collision', 'traversal'}], False),
-    ('rounds 4-5: external extraction only runs behind a superblock quota '
-     'preflight — filename-injected listing lines cannot waive quotas and '
-     'an unquota-checkable image is refused',
+    ('rounds 4-6: every extraction path (VFS + external) runs behind a '
+     'superblock quota preflight — filename-injected listing lines cannot '
+     'waive quotas and an unquota-checkable image is refused',
      [{'superblock'}], False),
+    ('round 6: block decompression is output-bounded and the superblock '
+     'block size is validated before anything reads a block',
+     [{'decompress', 'bound'}], False),
 ]
 
 

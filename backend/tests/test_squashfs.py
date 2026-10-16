@@ -4,11 +4,16 @@
 # this plugin; integration behaviour verified against GearLever upstream.
 # parts skip gracefully when the download is unavailable).
 
+import os
+import struct
+import tempfile
 import unittest
+import zlib
 
 from helpers import (NVIM_SQUASHFS_OFFSET, FakeXDGTestCase, download_fixture)
 
-from omarchy_appimage.squashfs import SquashfsReader, SquashfsError
+from omarchy_appimage.squashfs import (SQUASHFS_MAGIC, SquashfsReader,
+                                       SquashfsError)
 
 
 def _fixture_or_skip(test):
@@ -73,6 +78,69 @@ class SquashfsReaderTests(FakeXDGTestCase):
     def test_bad_magic_raises(self):
         with self.assertRaises(SquashfsError):
             SquashfsReader(self.fixture, 0)  # ELF header is not squashfs
+
+
+def _write_superblock(path, block_size=1 << 20, block_log=20, compression=1,
+                      inode_count=1):
+    """96-byte minimal superblock for parse-level tests (gzip)."""
+    sb = struct.pack('<IIIIIHHHHHHQQQQQQQQ',
+                     SQUASHFS_MAGIC, inode_count, 0, block_size, 0,
+                     compression, block_log, 0, 0, 4, 0,
+                     0, 0, 0, 0, 0, 0, 0, 0)
+    with open(path, 'wb') as f:
+        f.write(sb)
+
+
+class SuperblockValidationTests(unittest.TestCase):
+    """Round-6 review: superblock fields size every allocation and
+    decompression cap downstream — hostile values are refused at parse
+    time, before anything reads a block."""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(prefix='sb-', suffix='.img')
+        os.close(fd)
+        self.addCleanup(os.unlink, self.path)
+
+    def test_rejects_implausible_block_size(self):
+        _write_superblock(self.path, block_size=0x80000000, block_log=31)
+        with self.assertRaisesRegex(SquashfsError, 'implausible block size'):
+            SquashfsReader(self.path, 0)
+
+    def test_rejects_block_log_mismatch(self):
+        _write_superblock(self.path, block_size=1 << 20, block_log=19)
+        with self.assertRaisesRegex(SquashfsError, 'block_log'):
+            SquashfsReader(self.path, 0)
+
+    def test_decompress_bomb_is_bounded(self):
+        # a ~8 KB stored gzip frame that wants to expand to 8 MB: with
+        # block_size = 1 MiB the bounded decompressor must refuse, not
+        # allocate the full expansion
+        _write_superblock(self.path, block_size=1 << 20, block_log=20)
+        reader = SquashfsReader(self.path, 0)
+        self.addCleanup(reader.close)
+        bomb = zlib.compress(b'\x00' * 8_000_000)
+        with self.assertRaisesRegex(SquashfsError, 'expands beyond'):
+            reader._decompress(bomb, max_out=1 << 20)
+
+    def test_decompress_accepts_legal_block(self):
+        _write_superblock(self.path, block_size=1 << 20, block_log=20)
+        reader = SquashfsReader(self.path, 0)
+        self.addCleanup(reader.close)
+        self.assertEqual(reader._decompress(zlib.compress(b'A' * 4096),
+                                            max_out=1 << 20), b'A' * 4096)
+
+    def test_metadata_block_over_8k_refused(self):
+        # metadata blocks decompress to at most SQUASHFS_METADATA_SIZE per
+        # the spec — a frame that wants more is hostile
+        _write_superblock(self.path)
+        comp = zlib.compress(b'B' * 9000)
+        with open(self.path, 'ab') as f:
+            f.write(struct.pack('<H', len(comp)))
+            f.write(comp)
+        reader = SquashfsReader(self.path, 0)
+        self.addCleanup(reader.close)
+        with self.assertRaisesRegex(SquashfsError, 'expands beyond'):
+            reader._metadata_block(96, 0)
 
 
 if __name__ == '__main__':

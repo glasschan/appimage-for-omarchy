@@ -14,9 +14,11 @@
 # Unsupported images raise UnsupportedCompression and the caller can fall
 # back to external tools (see extractor.py).
 
+import io
 import os
 import struct
 import subprocess
+import tempfile
 import zlib
 import lzma
 import logging
@@ -31,6 +33,10 @@ COMP_LZ4 = 5
 COMP_ZSTD = 6
 
 SQUASHFS_METADATA_SIZE = 8192
+# Kernel PATH_MAX; squashfs symlink targets longer than this cannot resolve
+# anywhere, so they are malformed by construction (caps _read_inode's stream
+# span against attacker-inflated targets).
+SQUASHFS_MAX_SYMLINK_TARGET = 4096
 SQUASHFS_COMPRESSED_BIT_BLOCK = 1 << 24
 SQUASHFS_INVALID_FRAG = 0xFFFFFFFF
 
@@ -72,33 +78,52 @@ def _zstd_available():
 _ZSTD_MODE = None
 
 
-def _zstd_decompress(data: bytes) -> bytes:
+def _zstd_decompress(data: bytes, max_out: int) -> bytes:
     global _ZSTD_MODE
     if _ZSTD_MODE is None:
         _ZSTD_MODE = _zstd_available()
 
     if _ZSTD_MODE == 'stdlib':
         from compression import zstd
-        # SquashFS zstd frames are streamed without the content-size header;
-        # ZstdDecompressor.decompress() handles that.
-        return zstd.ZstdDecompressor().decompress(data)
+        # SquashFS zstd frames are streamed WITHOUT the content-size
+        # header, so needs_input stays False even on a fully-consumed
+        # legal frame — the output cap is the only reliable bound: a
+        # crafted frame can expand gigabytes from a few stored bytes,
+        # and the declared file-size slice only applies afterwards
+        # (round-6 review). Over-cap frames are refused, not truncated.
+        d = zstd.ZstdDecompressor()
+        out = d.decompress(data, max_length=max_out + 1)
+        if len(out) > max_out:
+            raise SquashfsError(
+                f'zstd block expands beyond {max_out} bytes — refusing')
+        return out
 
     if _ZSTD_MODE == 'cli':
         # CI invariant (scripts/ci/security-gates.sh): every raw
         # subprocess.run outside utils.py must carry a bounded timeout —
         # one squashfs block is at most a few MiB, so 120s (the same
-        # ceiling utils.run_command uses) is generous.
+        # ceiling utils.run_command uses) is generous. The child is also
+        # RLIMIT_FSIZE-capped at the output bound: it dies on SIGXFSZ
+        # instead of materializing a bomb (round-6 review).
+        import resource
+
+        def _cap_output():
+            resource.setrlimit(resource.RLIMIT_FSIZE,
+                               (max_out + 1, max_out + 1))
+
         try:
             result = subprocess.run(
                 ['zstd', '-d', '-c', '-q'],
                 input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=120)
+                timeout=120, preexec_fn=_cap_output)
         except subprocess.TimeoutExpired as exc:
             raise SquashfsError(
                 f'zstd CLI timed out after {exc.timeout}s') from exc
         if result.returncode != 0:
+            # SIGXFSZ (-25) is the output cap doing its job
             raise SquashfsError(
-                'zstd CLI failed: ' + result.stderr.decode(errors='replace'))
+                'zstd CLI failed or exceeded the output bound: '
+                + result.stderr.decode(errors='replace'))
         return result.stdout
 
     raise UnsupportedCompression('zstd decompression not available '
@@ -160,6 +185,17 @@ class SquashfsReader:
                                 f'(magic=0x{self.magic:08x})')
         if self.s_major != 4:
             raise SquashfsError(f'unsupported squashfs version {self.s_major}')
+        # Round-6 review: block_size is an attacker-controlled field. The
+        # spec caps it at 1 MiB (power of two) and block_log must agree —
+        # anything else is a malformed/hostile image, and it is this field
+        # that sizes sparse-block allocations and every decompression cap
+        # below, so it is validated before anything reads a block.
+        if (self.block_size < 4096 or self.block_size > 1 << 20
+                or self.block_size & (self.block_size - 1)):
+            raise SquashfsError(f'implausible block size {self.block_size}')
+        if (1 << self.block_log) != self.block_size:
+            raise SquashfsError(f'block_log {self.block_log} does not match '
+                                f'block size {self.block_size}')
         if self.compression not in (COMP_GZIP, COMP_XZ, COMP_ZSTD):
             names = {COMP_LZMA: 'lzma', COMP_LZO: 'lzo', COMP_LZ4: 'lz4'}
             name = names.get(self.compression, str(self.compression))
@@ -196,14 +232,40 @@ class SquashfsReader:
             raise SquashfsError(f'short read at 0x{absolute:x}')
         return data
 
-    def _decompress(self, data: bytes) -> bytes:
-        if self.compression == COMP_GZIP:
-            return zlib.decompress(data)
-        if self.compression == COMP_XZ:
-            return lzma.decompress(data)
-        if self.compression == COMP_ZSTD:
-            return _zstd_decompress(data)
-        raise UnsupportedCompression(f'compression id {self.compression}')
+    def _decompress(self, data: bytes, max_out: int) -> bytes:
+        """Decompress one on-disk block, output-capped at `max_out`.
+
+        The stored size and the declared file size are both
+        attacker-controlled; an uncapped decompress turns a few stored
+        kilobytes into gigabytes of allocation before the declared-size
+        slice ever applies (round-6 review). Every caller passes the
+        legal uncompressed size for its block type (`block_size` for
+        data blocks, `SQUASHFS_METADATA_SIZE` for metadata); a block
+        that expands further is corrupt or hostile and is refused, not
+        truncated."""
+        bomb = (f'block expands beyond {max_out} bytes — refusing')
+        try:
+            if self.compression == COMP_GZIP:
+                d = zlib.decompressobj()
+                out = d.decompress(data, max_out + 1)
+                if len(out) > max_out or d.unconsumed_tail:
+                    raise SquashfsError(bomb)
+                if not d.eof:
+                    raise SquashfsError('truncated gzip block')
+                return out
+            if self.compression == COMP_XZ:
+                d = lzma.LZMADecompressor()
+                out = d.decompress(data, max_out + 1)
+                if len(out) > max_out or not d.eof:
+                    raise SquashfsError(bomb)
+                return out
+            if self.compression == COMP_ZSTD:
+                return _zstd_decompress(data, max_out)
+            raise UnsupportedCompression(f'compression id {self.compression}')
+        except SquashfsError:
+            raise
+        except Exception as e:  # zlib.error / lzma.LZMAError / zstd errors
+            raise SquashfsError(f'block decompression failed: {e}') from e
 
     def _metadata_block(self, table_start: int, block_offset: int):
         """Return (decompressed data, next block offset)."""
@@ -222,7 +284,7 @@ class SquashfsReader:
             stored = hdr
             raw = self._read_at(self.offset + table_start + block_offset + 2,
                                 stored)
-            data = self._decompress(raw)
+            data = self._decompress(raw, max_out=SQUASHFS_METADATA_SIZE)
 
         result = (data, block_offset + 2 + stored)
         self._meta_cache[key] = result
@@ -411,7 +473,8 @@ class SquashfsReader:
         else:
             stored = hdr
             data = self._decompress(
-                self._read_at(self.offset + block_offset + 2, stored))
+                self._read_at(self.offset + block_offset + 2, stored),
+                max_out=SQUASHFS_METADATA_SIZE)
         return data, None
 
     # ------------------------------------------------------------ public API
@@ -439,24 +502,42 @@ class SquashfsReader:
         out = bytearray()
         addr = inode.start_block  # byte offset from the squashfs start
         for size in inode.block_list:
+            stored = size & ~SQUASHFS_COMPRESSED_BIT_BLOCK
+            # the stored size is metadata too: an incompressible block is
+            # stored at exactly block_size, never larger (round-6 review)
+            if stored > self.block_size:
+                raise SquashfsError(
+                    f'{path!r}: block header {stored} bytes exceeds the '
+                    f'declared block size {self.block_size}')
+
             if size == 0:  # sparse block
                 out += b'\x00' * self.block_size
-                continue
-
-            if size & SQUASHFS_COMPRESSED_BIT_BLOCK:
-                stored = size & ~SQUASHFS_COMPRESSED_BIT_BLOCK
+            elif size & SQUASHFS_COMPRESSED_BIT_BLOCK:
                 out += self._read_at(self.offset + addr, stored)
             else:
-                stored = size
                 out += self._decompress(self._read_at(self.offset + addr,
-                                                      stored))
+                                                      stored),
+                                        max_out=self.block_size)
             addr += stored
+
+            # a hostile block list must not accumulate past the declared
+            # size — the final slice only bounds what is RETURNED, never
+            # what was allocated (round-6 review)
+            if len(out) > max_size:
+                raise SquashfsError(f'{path!r}: block list overruns the '
+                                    f'declared file size '
+                                    f'({inode.file_size} bytes)')
 
         if inode.fragment != SQUASHFS_INVALID_FRAG:
             table = self._fragment_table()
             if inode.fragment >= len(table):
                 raise SquashfsError(f'bad fragment index {inode.fragment}')
             frag_start, frag_size = table[inode.fragment]
+            stored = frag_size & ~SQUASHFS_COMPRESSED_BIT_BLOCK
+            if stored > self.block_size:
+                raise SquashfsError(
+                    f'{path!r}: fragment header {stored} bytes exceeds the '
+                    f'declared block size {self.block_size}')
 
             if frag_size & SQUASHFS_COMPRESSED_BIT_BLOCK:
                 stored = frag_size & ~SQUASHFS_COMPRESSED_BIT_BLOCK
@@ -464,9 +545,13 @@ class SquashfsReader:
             else:
                 stored = frag_size
                 frag = self._decompress(
-                    self._read_at(self.offset + frag_start, stored))
+                    self._read_at(self.offset + frag_start, stored),
+                    max_out=self.block_size)
 
             tail = inode.file_size - len(out)
+            if tail < 0:
+                raise SquashfsError(f'{path!r}: blocks already exceed the '
+                                    f'declared file size')
             out += frag[inode.offset:inode.offset + tail]
 
         return bytes(out[:inode.file_size])

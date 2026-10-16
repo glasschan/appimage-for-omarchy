@@ -334,6 +334,21 @@ class SuperblockQuotaTests(unittest.TestCase):
         with self.assertRaisesRegex(SquashfsError, 'quota'):
             self._open_source(path, reader)
 
+    def test_vfs_path_gated_by_superblock_quota(self):
+        # round-6: the stdlib VFS reader used to return BEFORE the quota
+        # preflight — every path now passes the same gate first
+        path = self._garbage_appimage()
+        vfs = mock.Mock()
+        with mock.patch.object(extractor, '_superblock_quota',
+                               return_value=(extractor.MAX_EXTRACT_FILES + 1,
+                                             0)), \
+                mock.patch.object(extractor, '_VfsSource', vfs), \
+                mock.patch.object(extractor.elf, 'get_squashfs_offset',
+                                  return_value=0):
+            with self.assertRaisesRegex(SquashfsError, 'quota'):
+                extractor._open_source(path)
+        vfs.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

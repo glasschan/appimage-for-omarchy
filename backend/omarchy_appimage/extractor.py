@@ -331,18 +331,13 @@ def _sanitize_extracted(root: str):
 
 def _open_source(appimage_path: str) -> tuple:
     """Return (source, extracted_dir_or_None). Raises on total failure."""
-    try:
-        return _VfsSource(appimage_path), None
-    except (SquashfsError, struct.error, ValueError) as e:
-        logging.info('stdlib squashfs reader failed (%s); trying external '
-                     'extractors', e)
-
-    # Quota preflight from the superblock BEFORE any external tool runs:
-    # binary filesystem metadata that entry names cannot influence. Both
-    # extractors share one verdict — a bomb is refused once, here, and an
-    # unreadable superblock means the image cannot be quota-checked at
-    # all, so extraction is refused outright (round-4/5 review: listing
-    # lines were spoofable and pre-4.6 listings had no sizes).
+    # Quota preflight from the superblock BEFORE anything reads the image:
+    # binary filesystem metadata that entry names cannot influence, and
+    # ONE verdict shared by every path — the stdlib VFS reader included
+    # (round-6 review: the VFS path used to return before the preflight
+    # and decompress attacker-controlled blocks with no global bound).
+    # An unreadable superblock means the image cannot be quota-checked at
+    # all, so extraction is refused outright.
     try:
         offset = elf.get_squashfs_offset(appimage_path)
         _enforce_quotas(*_superblock_quota(appimage_path, offset))
@@ -353,6 +348,12 @@ def _open_source(appimage_path: str) -> tuple:
         # malformations): same total-failure verdict as before
         logging.info('quota preflight impossible (%s)', e)
         raise SquashfsError(_CANNOT_EXTRACT) from e
+
+    try:
+        return _VfsSource(appimage_path), None
+    except (SquashfsError, struct.error, ValueError) as e:
+        logging.info('stdlib squashfs reader failed (%s); trying external '
+                     'extractors', e)
 
     extracted_dir = None
 
