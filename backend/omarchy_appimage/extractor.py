@@ -43,10 +43,11 @@ MAX_ICON_BYTES = 8 * 1024 * 1024
 MAX_EXTRACT_FILES = 20_000
 MAX_EXTRACT_BYTES = 512 * 1024 * 1024
 
-# Listing output bound: a 20k-entry listing with long paths can outgrow
-# run_command's default 10 MiB cap, and a truncated listing must never
-# be the reason a pre-extraction quota check silently passes.
-_LISTING_OUTPUT_BYTES = 64 * 1024 * 1024
+# Shared total-failure verdict for _open_source.
+_CANNOT_EXTRACT = ('Could not extract the AppImage with any available '
+                   'method (stdlib squashfs reader, unsquashfs, bsdtar); '
+                   'the image uses an unsupported compression or is '
+                   'not a type-2 AppImage')
 
 # The desktop entry's Icon value is untrusted: name-based icon candidates
 # are only built for this strict shape (no separators, no traversal).
@@ -233,39 +234,42 @@ class ExtractedAppImage:
     md5: str = ''
 
 
-def _listing_totals(output: str, size_token: int) -> tuple:
-    """(entry_count, regular_file_bytes) over a listing.
+def _superblock_quota(appimage_path: str, offset: int) -> tuple:
+    """(inode_count, uncompressed_total_bytes) from the squashfs
+    superblock.
 
-    Both `unsquashfs -ls` and `tar -tv` start entry lines with a 10-char
-    mode string; the byte size sits at a tool-specific column (index
-    `size_token`). Header/non-entry lines don't match and are ignored;
-    the byte quota sums regular files only (symlinks count as entries,
-    their targets are unreadable through _DirSource anyway)."""
-    files = 0
-    total_bytes = 0
-    for line in output.splitlines():
-        tokens = line.split()
-        if len(tokens) <= size_token:
-            continue
-        mode = tokens[0]
-        if len(mode) != 10 or mode[0] not in '-bcdlps':
-            continue
-        if mode[0] == 'd':
-            continue
-        files += 1
-        if mode[0] == '-' and tokens[size_token].isdigit():
-            total_bytes += int(tokens[size_token])
-    return files, total_bytes
+    The superblock is binary filesystem metadata — unlike `unsquashfs
+    -ls` output it never echoes entry names, so crafted filenames cannot
+    inject fake records or bend the quota inputs (round-5 review:
+    filename-embedded newlines spoofed the line-based listing parse).
+    inode_count covers every inode type (dirs and symlinks included),
+    bytes_used_total is the full uncompressed size — both are exact
+    upper bounds for what extraction can produce.
+
+    Raises SquashfsError when the superblock cannot be read: an external
+    extractor must never run without a quota-checkable preflight."""
+    reader = None
+    try:
+        reader = SquashfsReader(appimage_path, offset)
+        return reader.inode_count, reader.bytes_used_total
+    except Exception as e:
+        raise SquashfsError(
+            'cannot preflight extraction quotas from the squashfs '
+            f'superblock ({e}); refusing to extract without bounds') from e
+    finally:
+        if reader is not None:
+            reader.close()
 
 
 def _enforce_quotas(files: int, total_bytes: int):
-    """Fail closed when the listing already shows an extraction bomb."""
+    """Fail closed when the superblock already shows an extraction
+    bomb."""
     if files > MAX_EXTRACT_FILES:
-        raise SquashfsError(f'extraction quota exceeded: listing shows '
-                            f'{files} entries (max {MAX_EXTRACT_FILES})')
+        raise SquashfsError(f'extraction quota exceeded: superblock shows '
+                            f'{files} inodes (max {MAX_EXTRACT_FILES})')
     if total_bytes > MAX_EXTRACT_BYTES:
-        raise SquashfsError(f'extraction quota exceeded: listing shows '
-                            f'{total_bytes} bytes '
+        raise SquashfsError(f'extraction quota exceeded: superblock shows '
+                            f'{total_bytes} uncompressed bytes '
                             f'(max {MAX_EXTRACT_BYTES})')
 
 
@@ -333,37 +337,33 @@ def _open_source(appimage_path: str) -> tuple:
         logging.info('stdlib squashfs reader failed (%s); trying external '
                      'extractors', e)
 
+    # Quota preflight from the superblock BEFORE any external tool runs:
+    # binary filesystem metadata that entry names cannot influence. Both
+    # extractors share one verdict — a bomb is refused once, here, and an
+    # unreadable superblock means the image cannot be quota-checked at
+    # all, so extraction is refused outright (round-4/5 review: listing
+    # lines were spoofable and pre-4.6 listings had no sizes).
+    try:
+        offset = elf.get_squashfs_offset(appimage_path)
+        _enforce_quotas(*_superblock_quota(appimage_path, offset))
+    except SquashfsError:
+        raise
+    except (struct.error, ValueError, OSError) as e:
+        # cannot even locate/read the image (not a type-2 AppImage, ELF
+        # malformations): same total-failure verdict as before
+        logging.info('quota preflight impossible (%s)', e)
+        raise SquashfsError(_CANNOT_EXTRACT) from e
+
     extracted_dir = None
 
     if shutil.which('unsquashfs'):
         extracted_dir = new_temp_dir('unsquashfs-')
         try:
-            offset = elf.get_squashfs_offset(appimage_path)
-            # fail closed: quota-check the listing before extracting
-            listing = run_command(['unsquashfs', '-ls', '-o', str(offset),
-                                   appimage_path], timeout=120,
-                                  max_output_bytes=_LISTING_OUTPUT_BYTES)
-            files, total_bytes = _listing_totals(
-                listing.stdout.decode('utf-8', errors='replace'), 2)
-            if files == 0:
-                # Fail closed (round-4 review): squashfs-tools < 4.6 emits
-                # `unsquashfs -ls` as bare paths, which parses to zero
-                # entries — a silent (0, 0) would waive the preflight and
-                # extract the whole image before any quota check. A listing
-                # we cannot quota-check is a tool we must not use: raise a
-                # plain error so the generic handler falls through to the
-                # next extractor instead of extracting unbounded.
-                raise RuntimeError('unsquashfs listing shows no entries — '
-                                   'format not quota-checkable')
-            _enforce_quotas(files, total_bytes)
             run_command(['unsquashfs', '-no-progress', '-f',
                          '-o', str(offset), '-d', extracted_dir,
                          appimage_path], timeout=600)
             _sanitize_extracted(extracted_dir)
             return _DirSource(extracted_dir), extracted_dir
-        except SquashfsError:
-            shutil.rmtree(extracted_dir, ignore_errors=True)
-            raise
         except Exception as e:
             logging.warning('unsquashfs failed: %s', e)
             shutil.rmtree(extracted_dir, ignore_errors=True)
@@ -372,39 +372,18 @@ def _open_source(appimage_path: str) -> tuple:
     if shutil.which('bsdtar'):
         extracted_dir = new_temp_dir('bsdtar-')
         try:
-            offset = elf.get_squashfs_offset(appimage_path)
-            with open(appimage_path, 'rb') as f:
-                f.seek(offset)
-                listing = run_command(['bsdtar', '-tvf', '-'], stdin=f,
-                                      timeout=120,
-                                      max_output_bytes=_LISTING_OUTPUT_BYTES)
-            files, total_bytes = _listing_totals(
-                listing.stdout.decode('utf-8', errors='replace'), 4)
-            if files == 0:
-                # Same fail-closed contract as the unsquashfs branch: a
-                # listing with no quota-checkable entries must never waive
-                # the preflight and unroll the whole image.
-                raise RuntimeError('bsdtar listing shows no entries — '
-                                   'format not quota-checkable')
-            _enforce_quotas(files, total_bytes)
             with open(appimage_path, 'rb') as f:
                 f.seek(offset)
                 run_command(['bsdtar', '-x', '-C', extracted_dir, '-f', '-'],
                             stdin=f, timeout=600)
             _sanitize_extracted(extracted_dir)
             return _DirSource(extracted_dir), extracted_dir
-        except SquashfsError:
-            shutil.rmtree(extracted_dir, ignore_errors=True)
-            raise
         except Exception as e:
             logging.warning('bsdtar failed: %s', e)
             shutil.rmtree(extracted_dir, ignore_errors=True)
             extracted_dir = None
 
-    raise SquashfsError('Could not extract the AppImage with any available '
-                        'method (stdlib squashfs reader, unsquashfs, bsdtar); '
-                        'the image uses an unsupported compression or is '
-                        'not a type-2 AppImage')
+    raise SquashfsError(_CANNOT_EXTRACT)
 
 
 def _find_desktop_file(source) -> tuple:

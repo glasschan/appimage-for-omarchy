@@ -7,7 +7,6 @@
 import os
 import shutil
 import stat
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -239,106 +238,10 @@ class SanitizeExtractedTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.root))
 
 
-class ListingQuotaTests(unittest.TestCase):
-    UNSQUASHFS_LS = '''\
-Parallel unsquashfs: Using 8 processors
-4 inodes (6 blocks) to write
-
-drwxr-xr-x root/root          46 2023-11-15 08:00 usr
--rw-r--r-- root/root        1234 2023-11-15 08:00 usr/bin/app
-lrwxrwxrwx root/root          12 2023-11-15 08:00 .DirIcon
-'''
-    BSDAR_TVF = '''\
--rw-r--r--  0 root     root      1234 Jan 01  2023 usr/bin/app
-drwxr-xr-x  0 root     root         0 Jan 01  2023 usr
-lrwxr-xr-x  0 root     root        12 Jan 01  2023 .DirIcon -> ok.png
-'''
-
-    def test_parses_unsquashfs_listing(self):
-        files, total = extractor._listing_totals(self.UNSQUASHFS_LS, 2)
-        self.assertEqual(files, 2)          # regular file + symlink
-        self.assertEqual(total, 1234)
-
-    def test_parses_bsdtar_listing(self):
-        files, total = extractor._listing_totals(self.BSDAR_TVF, 4)
-        self.assertEqual(files, 2)
-        self.assertEqual(total, 1234)
-
-    # squashfs-tools < 4.6: `unsquashfs -ls` emits bare paths, which
-    # parses to (0, 0) — the caller must refuse, never extract unbounded
-    # (round-4 review)
-    UNSQUASHFS_LS_PRE46 = '''\
-Parallel unsquashfs: Using 8 processors
-4 inodes (6 blocks) to write
-
-usr
-usr/bin
-usr/bin/app
-.DestIcon
-'''
-
-    def test_pre46_listing_parses_to_zero(self):
-        self.assertEqual(
-            extractor._listing_totals(self.UNSQUASHFS_LS_PRE46, 2), (0, 0))
-
-    def _fake_run_command(self, listing_sink):
-        """run_command stub: listings answer with `listing_sink`'s stdout,
-        extraction commands are recorded and never really run."""
-        calls = []
-
-        def fake(command, **kwargs):
-            if '-ls' in command:
-                return mock.Mock(returncode=0,
-                                 stdout=listing_sink['unsquashfs'].encode(),
-                                 stderr=b'')
-            if '-tvf' in command:
-                return mock.Mock(returncode=0,
-                                 stdout=listing_sink['bsdtar'].encode(),
-                                 stderr=b'')
-            calls.append(command)
-            return mock.Mock(returncode=0, stdout=b'', stderr=b'')
-
-        return fake, calls
-
-    def _open_source_with_listings(self, unsquashfs_listing, bsdtar_listing):
-        path = self._garbage_appimage()
-        fake, calls = self._fake_run_command(
-            {'unsquashfs': unsquashfs_listing, 'bsdtar': bsdtar_listing})
-        with mock.patch.object(extractor.elf, 'get_squashfs_offset',
-                               return_value=0), \
-                mock.patch.object(extractor.shutil, 'which',
-                                  return_value='/usr/bin/tool'), \
-                mock.patch.object(extractor, 'run_command',
-                                  side_effect=fake):
-            source, extracted_dir = extractor._open_source(path)
-        if extracted_dir:
-            self.addCleanup(shutil.rmtree, extracted_dir,
-                            ignore_errors=True)
-        return source, extracted_dir, calls
-
-    def test_zero_entry_listing_falls_through_to_next_extractor(self):
-        # pre-4.6 unsquashfs listing: refuse THAT tool unbounded, but the
-        # quota-checkable bsdtar fallback takes over and extraction runs
-        source, extracted_dir, calls = self._open_source_with_listings(
-            self.UNSQUASHFS_LS_PRE46, self.BSDAR_TVF)
-        self.assertIsNotNone(extracted_dir)
-        self.assertEqual([c[0] for c in calls], ['bsdtar'])
-
-    def test_zero_entry_listing_everywhere_refuses_completely(self):
-        # no tool produces a quota-checkable listing: nothing may extract
-        path = self._garbage_appimage()
-        fake, calls = self._fake_run_command(
-            {'unsquashfs': self.UNSQUASHFS_LS_PRE46,
-             'bsdtar': 'usr\nusr/bin\n'})
-        with mock.patch.object(extractor.elf, 'get_squashfs_offset',
-                               return_value=0), \
-                mock.patch.object(extractor.shutil, 'which',
-                                  return_value='/usr/bin/tool'), \
-                mock.patch.object(extractor, 'run_command',
-                                  side_effect=fake):
-            with self.assertRaisesRegex(SquashfsError, 'Could not extract'):
-                extractor._open_source(path)
-        self.assertEqual(calls, [])
+class SuperblockQuotaTests(unittest.TestCase):
+    """Rounds 4-5: the external-extraction quota preflight reads the
+    squashfs superblock (binary metadata, immune to entry-name injection)
+    and any image that cannot be quota-checked is refused outright."""
 
     def test_quota_enforcement_raises(self):
         with self.assertRaisesRegex(SquashfsError, 'quota'):
@@ -357,53 +260,79 @@ usr/bin/app
         self.addCleanup(os.unlink, path)
         return path
 
-    def test_listing_failure_means_no_extraction(self):
-        # fail closed: when the pre-extraction listing cannot be
-        # produced, no extraction command may ever run
-        path = self._garbage_appimage()
+    def _fake_reader(self, inode_count=3, bytes_used_total=1000,
+                     error=None):
+        reader = mock.Mock()
+        reader.inode_count = inode_count
+        reader.bytes_used_total = bytes_used_total
+        if error is not None:
+            return mock.Mock(side_effect=error)
+        return mock.Mock(return_value=reader)
+
+    def _open_source(self, path, reader_mock):
+        # the stdlib reader fails first (as it does for images the
+        # external extractors exist for), then the superblock preflight
+        # and the external tools take over
         calls = []
 
         def fake_run_command(command, **kwargs):
             calls.append(command)
-            if '-ls' in command or '-tvf' in command:
-                raise subprocess.CalledProcessError(1, command)
             return mock.Mock(returncode=0, stdout=b'', stderr=b'')
 
-        with mock.patch.object(extractor.elf, 'get_squashfs_offset',
-                               return_value=0), \
-                mock.patch.object(extractor.shutil, 'which',
-                                  return_value='/usr/bin/tool'), \
-                mock.patch.object(extractor, 'run_command',
-                                  side_effect=fake_run_command):
-            with self.assertRaisesRegex(SquashfsError, 'Could not extract'):
-                extractor._open_source(path)
-        self.assertTrue(calls)
-        # only listing commands were tried, never an extraction
-        self.assertTrue(all('-ls' in c or '-tvf' in c for c in calls))
-
-    def test_quota_exceeded_on_listing_refuses_extraction(self):
-        path = self._garbage_appimage()
-        calls = []
-        bomb = ''.join(f'-rw-r--r-- root/root  {i} 2023-01-01 00:00 f{i}\n'
-                       for i in range(4))
-
-        def fake_run_command(command, **kwargs):
-            calls.append(command)
-            return mock.Mock(returncode=0,
-                             stdout=bomb.encode(), stderr=b'')
-
-        with mock.patch.object(extractor.elf, 'get_squashfs_offset',
-                               return_value=0), \
+        with mock.patch.object(extractor, '_VfsSource',
+                               side_effect=SquashfsError('stdlib failed')), \
+                mock.patch.object(extractor.elf, 'get_squashfs_offset',
+                                  return_value=0), \
                 mock.patch.object(extractor.shutil, 'which',
                                   return_value='/usr/bin/unsquashfs'), \
                 mock.patch.object(extractor, 'run_command',
                                   side_effect=fake_run_command), \
-                mock.patch.object(extractor, 'MAX_EXTRACT_FILES', 2):
-            with self.assertRaisesRegex(SquashfsError, 'quota'):
+                mock.patch.object(extractor, 'SquashfsReader', reader_mock):
+            result = extractor._open_source(path), calls
+        return result
+
+    def test_unreadable_superblock_refuses_external_extraction(self):
+        # fail closed: a superblock we cannot read means the image cannot
+        # be quota-checked — no extraction command may ever run
+        path = self._garbage_appimage()
+        reader = self._fake_reader(error=SquashfsError('bad magic'))
+        with self.assertRaisesRegex(SquashfsError, 'superblock'):
+            self._open_source(path, reader)
+
+    def test_non_elf_refuses_without_extraction_commands(self):
+        # the offset lookup fails on real (unmocked) garbage: the
+        # total-failure verdict fires before any command could run
+        path = self._garbage_appimage()
+        calls = []
+
+        def fake_run_command(command, **kwargs):
+            calls.append(command)
+            return mock.Mock(returncode=0, stdout=b'', stderr=b'')
+
+        with mock.patch.object(extractor.shutil, 'which',
+                               return_value='/usr/bin/unsquashfs'), \
+                mock.patch.object(extractor, 'run_command',
+                                  side_effect=fake_run_command):
+            with self.assertRaisesRegex(SquashfsError, 'Could not extract'):
                 extractor._open_source(path)
-        # the listing ran, the extraction never did
-        self.assertEqual([c for c in calls if '-ls' not in c
-                          and '-tvf' not in c], [])
+        self.assertEqual(calls, [])
+
+    def test_superblock_preflight_passes_through_to_extraction(self):
+        path = self._garbage_appimage()
+        source, calls = self._open_source(
+            path, self._fake_reader(inode_count=3, bytes_used_total=1000))
+        self.assertIsNotNone(source)
+        # exactly one command ran — the extraction; no listing preflight
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], 'unsquashfs')
+        self.assertNotIn('-ls', calls[0])
+
+    def test_superblock_quota_exceeded_refuses_extraction(self):
+        path = self._garbage_appimage()
+        reader = self._fake_reader(
+            bytes_used_total=extractor.MAX_EXTRACT_BYTES + 1)
+        with self.assertRaisesRegex(SquashfsError, 'quota'):
+            self._open_source(path, reader)
 
 
 if __name__ == '__main__':

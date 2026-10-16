@@ -147,9 +147,13 @@ class SquashfsReader:
         (self.magic, self.inode_count, _mkfs, self.block_size,
          self.fragment_count, self.compression, self.block_log,
          _flags, _no_ids, self.s_major, self.s_minor, self.root_inode_ref,
-         _bytes_used, _id_table, _xattr, self.inode_table_start,
+         bytes_used, _id_table, _xattr, self.inode_table_start,
          self.directory_table_start, self.fragment_table_start,
          _lookup_table) = struct.unpack('<IIIIIHHHHHHQQQQQQQQ', sb[:0x60])
+        # Total uncompressed size of the filesystem (superblock metadata,
+        # never influenced by entry names): the extraction byte quota
+        # reads this before any external extractor runs.
+        self.bytes_used_total = bytes_used
 
         if self.magic != SQUASHFS_MAGIC:
             raise SquashfsError('not a little-endian squashfs image '

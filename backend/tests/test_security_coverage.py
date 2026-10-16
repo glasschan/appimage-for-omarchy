@@ -68,9 +68,10 @@ REQUIRED_SCENARIOS = [
     ('round 4: a colliding package cannot write outside the managed '
      'directories via embedded desktop Name / X-AppImage-Version',
      [{'collision', 'traversal'}], False),
-    ('round 4: a listing that parses to zero entries refuses unbounded '
-     'extraction',
-     [{'zero', 'listing'}], False),
+    ('rounds 4-5: external extraction only runs behind a superblock quota '
+     'preflight — filename-injected listing lines cannot waive quotas and '
+     'an unquota-checkable image is refused',
+     [{'superblock'}], False),
 ]
 
 
