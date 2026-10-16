@@ -46,6 +46,54 @@ class InternalError(Exception):
         self.message = message
 
 
+def _resolve_install_names(source_basename: str, desktop_name, version: str,
+                           existing_names) -> tuple:
+    """Install filename + desktop/icon prefix for a new app, with
+    GearLever's conflict suffixing (never overwrite an existing app).
+
+    `desktop_name` (the embedded desktop entry's Name) and `version`
+    (X-AppImage-Version) are attacker-controlled embedded fields. Both are
+    passed through remove_special_chars() BEFORE any collision reuse, so
+    every candidate that reaches os.path.join() is a single flat filename:
+    no separator and no '..' component can ever survive, and a colliding
+    package cannot write outside the managed directories (round-4 review).
+
+    Non-collision shape is unchanged from upstream: sanitized
+    `name.appimage`; collision candidates are `name.appimage_v0_11_3` /
+    `name.appimage_N` plus a trailing `.appimage`."""
+    appimage_filename = 'gearlever_' + os.path.splitext(source_basename)[0]
+
+    if desktop_name is not None:
+        appimage_filename = desktop_name.lower().replace(' ', '_')
+
+    # (GearLever's 'exec-as-name-for-terminal-apps' setting defaults
+    # to false, so the extension is always appended here)
+    appimage_filename = f'{appimage_filename}.appimage'
+
+    # NOTE: like upstream, app_name_without_ext still contains the
+    # extension at this point — but it is sanitized and lowercased ONCE
+    # here, before the collision loop can ever rebuild from it.
+    app_name_without_ext = remove_special_chars(appimage_filename).lower()
+    appimage_filename = app_name_without_ext
+
+    i = 0
+
+    # if there is already an app with the same name,
+    # we try not to overwrite
+    while appimage_filename in existing_names:
+        if i == 0 and version:
+            appimage_filename = (app_name_without_ext + '_'
+                                 + remove_special_chars(
+                                     version.replace('.', '_')))
+        else:
+            appimage_filename = app_name_without_ext + f'_{i}'
+
+        appimage_filename = appimage_filename + '.appimage'
+        i += 1
+
+    return appimage_filename, os.path.splitext(appimage_filename)[0]
+
+
 def _atomic_install(src: str, dest: str, mode: int):
     """Descriptor-safe install of `src` at `dest` (marketplace review).
 
@@ -386,38 +434,17 @@ class AppImageProvider():
                 el.updating_from.desktop_file_path)
             prefixed_filename = os.path.splitext(desktop_file_path)[0]
         else:
-            source_basename = os.path.basename(el.file_path)
-            appimage_filename = 'gearlever_' + os.path.splitext(source_basename)[0]
-
-            if extracted_appimage.desktop_entry:
-                appimage_filename = extracted_appimage.desktop_entry.getName()
-                appimage_filename = appimage_filename.lower().replace(' ', '_')
-
-            # (GearLever's 'exec-as-name-for-terminal-apps' setting defaults
-            # to false, so the extension is always appended here)
-            appimage_filename = f'{appimage_filename}.appimage'
-
-            # NOTE: like upstream, app_name_without_ext still contains the
-            # extension at this point
-            app_name_without_ext = appimage_filename
-            appimage_filename = remove_special_chars(appimage_filename).lower()
-
-            i = 0
-            files_in_dest_dir = os.listdir(appimages_destination_path)
-
-            # if there is already an app with the same name,
-            # we try not to overwrite
-            while appimage_filename in files_in_dest_dir:
-                if i == 0 and version:
-                    appimage_filename = (app_name_without_ext + '_'
-                                         + version.replace('.', '_'))
-                else:
-                    appimage_filename = app_name_without_ext + f'_{i}'
-
-                appimage_filename = appimage_filename + '.appimage'
-                i += 1
-
-            prefixed_filename = os.path.splitext(appimage_filename)[0]
+            # Naming and conflict resolution live in a pure helper so the
+            # sanitization contract is unit-testable without an extraction
+            # (round-4 review: desktop Name and X-AppImage-Version are
+            # embedded, attacker-controlled fields).
+            desktop_name = (extracted_appimage.desktop_entry.getName()
+                            if extracted_appimage.desktop_entry else None)
+            appimage_filename, prefixed_filename = _resolve_install_names(
+                source_basename=os.path.basename(el.file_path),
+                desktop_name=desktop_name,
+                version=version,
+                existing_names=os.listdir(appimages_destination_path))
 
         dest_appimage_file = os.path.join(appimages_destination_path,
                                           appimage_filename)

@@ -300,5 +300,70 @@ Type=Application
             self.assertIn('/tmp/.mount_zzzz', f.read())
 
 
+class ResolveInstallNamesTests(unittest.TestCase):
+    """Round-4 review: collision candidates are rebuilt from embedded,
+    attacker-controlled desktop fields (Name, X-AppImage-Version). Every
+    candidate must be a single flat filename — basename-safe, no
+    separators — or a colliding package writes outside the managed
+    directories (including ~/.config/autostart)."""
+
+    HOSTILE_NAME = '../../.config/autostart/evil'
+    HOSTILE_VERSION = '1.0/../../../.config/autostart/evil'
+
+    def test_plain_name_unchanged(self):
+        self.assertEqual(
+            provider_module._resolve_install_names(
+                'something.AppImage', 'Neovim', 'v0.11.3', []),
+            ('neovim.appimage', 'neovim'))
+
+    def test_gearlever_fallback_and_numeric_suffixes(self):
+        self.assertEqual(
+            provider_module._resolve_install_names(
+                'tool.AppImage', None, '', []),
+            ('gearlever_tool.appimage', 'gearlever_tool'))
+        self.assertEqual(
+            provider_module._resolve_install_names(
+                'tool.AppImage', None, '', ['gearlever_tool.appimage']),
+            ('gearlever_tool.appimage_0.appimage', 'gearlever_tool.appimage_0'))
+
+    def test_version_suffix_shape_preserved(self):
+        # benign data: the collision suffix shape is exactly upstream's
+        self.assertEqual(
+            provider_module._resolve_install_names(
+                'x.AppImage', 'Neovim', 'v0.11.3', ['neovim.appimage']),
+            ('neovim.appimage_v0_11_3.appimage', 'neovim.appimage_v0_11_3'))
+
+    def test_collision_desktop_name_traversal_stays_inside(self):
+        # the sanitized hostile name takes the first slot; the collision
+        # suffix path must still produce a flat, separator-free filename
+        first = provider_module.remove_special_chars(
+            self.HOSTILE_NAME.lower().replace(' ', '_') + '.appimage').lower()
+        name, prefix = provider_module._resolve_install_names(
+            'x.AppImage', self.HOSTILE_NAME, '', [first])
+        self.assertNotEqual(name, first)  # actually took the suffix path
+        self.assertTrue(name.startswith(first[:-len('.appimage')]
+                                        + '.appimage_'))
+        self.assertTrue(name.endswith('_0.appimage'))
+        self.assertEqual(os.path.basename(name), name)
+        self.assertEqual(os.path.basename(prefix), prefix)
+        self.assertNotIn('/', name)
+        self.assertNotIn('/', prefix)
+
+    def test_collision_version_traversal_stays_inside(self):
+        # X-AppImage-Version is embedded too: its separators must never
+        # reach the destination path on the collision path. (The sanitized
+        # stem may still END in the payload's letters — flatness is the
+        # invariant, not the spelling: a flat candidate lands inside the
+        # managed directory whatever it reads.)
+        name, prefix = provider_module._resolve_install_names(
+            'x.AppImage', 'Evil App', self.HOSTILE_VERSION,
+            ['evil_app.appimage'])
+        self.assertEqual(os.path.basename(name), name)
+        self.assertNotIn('/', name)
+        self.assertNotIn(os.sep, name)
+        self.assertEqual(os.path.basename(prefix), prefix)
+        self.assertNotIn('/', prefix)
+
+
 if __name__ == '__main__':
     unittest.main()

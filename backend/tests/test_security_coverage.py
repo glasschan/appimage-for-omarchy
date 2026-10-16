@@ -65,6 +65,12 @@ REQUIRED_SCENARIOS = [
     ('shell source stays constant under hostile runtime dir (round 3: '
      'XDG_RUNTIME_DIR must never be interpolated into the presented command)',
      [{'hostile', 'constant'}], True),
+    ('round 4: a colliding package cannot write outside the managed '
+     'directories via embedded desktop Name / X-AppImage-Version',
+     [{'collision', 'traversal'}], False),
+    ('round 4: a listing that parses to zero entries refuses unbounded '
+     'extraction',
+     [{'zero', 'listing'}], False),
 ]
 
 

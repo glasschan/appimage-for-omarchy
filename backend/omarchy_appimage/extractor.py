@@ -345,6 +345,16 @@ def _open_source(appimage_path: str) -> tuple:
                                   max_output_bytes=_LISTING_OUTPUT_BYTES)
             files, total_bytes = _listing_totals(
                 listing.stdout.decode('utf-8', errors='replace'), 2)
+            if files == 0:
+                # Fail closed (round-4 review): squashfs-tools < 4.6 emits
+                # `unsquashfs -ls` as bare paths, which parses to zero
+                # entries — a silent (0, 0) would waive the preflight and
+                # extract the whole image before any quota check. A listing
+                # we cannot quota-check is a tool we must not use: raise a
+                # plain error so the generic handler falls through to the
+                # next extractor instead of extracting unbounded.
+                raise RuntimeError('unsquashfs listing shows no entries — '
+                                   'format not quota-checkable')
             _enforce_quotas(files, total_bytes)
             run_command(['unsquashfs', '-no-progress', '-f',
                          '-o', str(offset), '-d', extracted_dir,
@@ -370,6 +380,12 @@ def _open_source(appimage_path: str) -> tuple:
                                       max_output_bytes=_LISTING_OUTPUT_BYTES)
             files, total_bytes = _listing_totals(
                 listing.stdout.decode('utf-8', errors='replace'), 4)
+            if files == 0:
+                # Same fail-closed contract as the unsquashfs branch: a
+                # listing with no quota-checkable entries must never waive
+                # the preflight and unroll the whole image.
+                raise RuntimeError('bsdtar listing shows no entries — '
+                                   'format not quota-checkable')
             _enforce_quotas(files, total_bytes)
             with open(appimage_path, 'rb') as f:
                 f.seek(offset)

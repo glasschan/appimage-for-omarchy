@@ -264,6 +264,82 @@ lrwxr-xr-x  0 root     root        12 Jan 01  2023 .DirIcon -> ok.png
         self.assertEqual(files, 2)
         self.assertEqual(total, 1234)
 
+    # squashfs-tools < 4.6: `unsquashfs -ls` emits bare paths, which
+    # parses to (0, 0) — the caller must refuse, never extract unbounded
+    # (round-4 review)
+    UNSQUASHFS_LS_PRE46 = '''\
+Parallel unsquashfs: Using 8 processors
+4 inodes (6 blocks) to write
+
+usr
+usr/bin
+usr/bin/app
+.DestIcon
+'''
+
+    def test_pre46_listing_parses_to_zero(self):
+        self.assertEqual(
+            extractor._listing_totals(self.UNSQUASHFS_LS_PRE46, 2), (0, 0))
+
+    def _fake_run_command(self, listing_sink):
+        """run_command stub: listings answer with `listing_sink`'s stdout,
+        extraction commands are recorded and never really run."""
+        calls = []
+
+        def fake(command, **kwargs):
+            if '-ls' in command:
+                return mock.Mock(returncode=0,
+                                 stdout=listing_sink['unsquashfs'].encode(),
+                                 stderr=b'')
+            if '-tvf' in command:
+                return mock.Mock(returncode=0,
+                                 stdout=listing_sink['bsdtar'].encode(),
+                                 stderr=b'')
+            calls.append(command)
+            return mock.Mock(returncode=0, stdout=b'', stderr=b'')
+
+        return fake, calls
+
+    def _open_source_with_listings(self, unsquashfs_listing, bsdtar_listing):
+        path = self._garbage_appimage()
+        fake, calls = self._fake_run_command(
+            {'unsquashfs': unsquashfs_listing, 'bsdtar': bsdtar_listing})
+        with mock.patch.object(extractor.elf, 'get_squashfs_offset',
+                               return_value=0), \
+                mock.patch.object(extractor.shutil, 'which',
+                                  return_value='/usr/bin/tool'), \
+                mock.patch.object(extractor, 'run_command',
+                                  side_effect=fake):
+            source, extracted_dir = extractor._open_source(path)
+        if extracted_dir:
+            self.addCleanup(shutil.rmtree, extracted_dir,
+                            ignore_errors=True)
+        return source, extracted_dir, calls
+
+    def test_zero_entry_listing_falls_through_to_next_extractor(self):
+        # pre-4.6 unsquashfs listing: refuse THAT tool unbounded, but the
+        # quota-checkable bsdtar fallback takes over and extraction runs
+        source, extracted_dir, calls = self._open_source_with_listings(
+            self.UNSQUASHFS_LS_PRE46, self.BSDAR_TVF)
+        self.assertIsNotNone(extracted_dir)
+        self.assertEqual([c[0] for c in calls], ['bsdtar'])
+
+    def test_zero_entry_listing_everywhere_refuses_completely(self):
+        # no tool produces a quota-checkable listing: nothing may extract
+        path = self._garbage_appimage()
+        fake, calls = self._fake_run_command(
+            {'unsquashfs': self.UNSQUASHFS_LS_PRE46,
+             'bsdtar': 'usr\nusr/bin\n'})
+        with mock.patch.object(extractor.elf, 'get_squashfs_offset',
+                               return_value=0), \
+                mock.patch.object(extractor.shutil, 'which',
+                                  return_value='/usr/bin/tool'), \
+                mock.patch.object(extractor, 'run_command',
+                                  side_effect=fake):
+            with self.assertRaisesRegex(SquashfsError, 'Could not extract'):
+                extractor._open_source(path)
+        self.assertEqual(calls, [])
+
     def test_quota_enforcement_raises(self):
         with self.assertRaisesRegex(SquashfsError, 'quota'):
             extractor._enforce_quotas(extractor.MAX_EXTRACT_FILES + 1, 0)
