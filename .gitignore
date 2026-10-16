@@ -35,6 +35,6 @@ Thumbs.db
 .directory
 
 # Local-only dev files (not shipped to users; keep off the remote)
-design/
-panel.png
+# NOTE: design/cover.html + panel.png ARE tracked — they are the cover
+# pipeline sources (see AGENTS.md preview pipeline).
 docs/MARKETPLACE.md
