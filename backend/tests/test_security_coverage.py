@@ -75,6 +75,14 @@ REQUIRED_SCENARIOS = [
     ('round 6: block decompression is output-bounded and the superblock '
      'block size is validated before anything reads a block',
      [{'decompress', 'bound'}], False),
+    ('round 7: a directory listing accumulation is capped',
+     [{'listing'}], False),
+    ('round 7: the fragment table accumulation is capped',
+     [{'fragment'}], False),
+    ('round 7: an inode metadata span is capped',
+     [{'span'}], False),
+    ('round 7: the metadata/stream caches are bounded',
+     [{'cache'}], False),
 ]
 
 
