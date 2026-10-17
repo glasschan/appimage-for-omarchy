@@ -9,6 +9,7 @@ import struct
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 from helpers import (NVIM_SQUASHFS_OFFSET, FakeXDGTestCase, download_fixture)
 
@@ -141,6 +142,87 @@ class SuperblockValidationTests(unittest.TestCase):
         self.addCleanup(reader.close)
         with self.assertRaisesRegex(SquashfsError, 'expands beyond'):
             reader._metadata_block(96, 0)
+
+
+class AccumulationBoundTests(unittest.TestCase):
+    """Round-7 review: directory listings, fragment tables, inode spans
+    and the block caches are all driven by untrusted metadata fields —
+    each accumulation gets an explicit ceiling."""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(prefix='acc-', suffix='.img')
+        os.close(fd)
+        self.addCleanup(os.unlink, self.path)
+        _write_superblock(self.path)
+        self.reader = SquashfsReader(self.path, 0)
+        self.addCleanup(self.reader.close)
+
+    def _dir_inode(self, file_size):
+        from omarchy_appimage.squashfs import _Inode
+        node = _Inode()
+        node.type = 1  # DIR
+        node.file_size = file_size
+        node.offset = 0
+        node.start_block = 0
+        return node
+
+    def test_dir_listing_over_cap_refused(self):
+        from omarchy_appimage.squashfs import SQUASHFS_MAX_DIR_LISTING_BYTES
+        node = self._dir_inode(SQUASHFS_MAX_DIR_LISTING_BYTES + 4)
+        with self.assertRaisesRegex(SquashfsError, 'directory listing'):
+            self.reader._read_dir(node)
+
+    def test_dir_listing_within_cap_parses_empty(self):
+        node = self._dir_inode(3)  # 3-byte listing header, no entries
+        self.assertEqual(self.reader._read_dir(node), [])
+
+    def test_fragment_count_over_cap_refused(self):
+        from omarchy_appimage.squashfs import SQUASHFS_MAX_FRAGMENT_COUNT
+        self.reader.fragment_count = SQUASHFS_MAX_FRAGMENT_COUNT + 1
+        with self.assertRaisesRegex(SquashfsError, 'fragment table'):
+            self.reader._fragment_table()
+
+    def test_inode_span_over_cap_refused(self):
+        from omarchy_appimage.squashfs import SQUASHFS_MAX_INODE_SPAN
+        # a symlink whose declared target inflates the span past the cap:
+        # the ref must be refused before _stream decompresses the chain
+        node = mock.Mock()
+        node.type = 3  # SYMLINK
+        node.block_list = []
+        node.file_size = SQUASHFS_MAX_INODE_SPAN * 16
+        stream = mock.Mock(return_value=(b'\x00' * 64, 0))
+        with mock.patch.object(self.reader, '_parse_inode',
+                               return_value=node), \
+                mock.patch.object(self.reader, '_stream', stream):
+            with self.assertRaisesRegex(SquashfsError, 'inode spans'):
+                self.reader._read_inode(0)
+        self.assertEqual(stream.call_count, 1)  # first window only
+
+    def test_meta_cache_is_bounded(self):
+        from omarchy_appimage.squashfs import SQUASHFS_MAX_CACHED_META_BLOCKS
+        # many distinct uncompressed metadata blocks at ascending offsets:
+        # each 4-byte stored payload, hdr | 0x8000
+        blob = b''.join(struct.pack('<HHHH', 0x8000 | 4, 1, 1, 1)
+                        for _ in range(SQUASHFS_MAX_CACHED_META_BLOCKS + 500))
+        with open(self.path, 'ab') as f:
+            f.write(blob)
+        table_start = 96
+        for bo in range(0, (SQUASHFS_MAX_CACHED_META_BLOCKS + 500) * 8, 8):
+            self.reader._metadata_block(table_start, bo)
+        self.assertLessEqual(len(self.reader._meta_cache),
+                             SQUASHFS_MAX_CACHED_META_BLOCKS)
+
+    def test_stream_cache_is_bounded(self):
+        from omarchy_appimage.squashfs import SQUASHFS_MAX_CACHED_STREAMS
+        blob = b''.join(struct.pack('<HHHH', 0x8000 | 4, 1, 1, 1)
+                        for _ in range(SQUASHFS_MAX_CACHED_STREAMS + 500))
+        with open(self.path, 'ab') as f:
+            f.write(blob)
+        table_start = 96
+        for bo in range(0, (SQUASHFS_MAX_CACHED_STREAMS + 500) * 8, 8):
+            self.reader._stream(table_start, bo, 4)
+        self.assertLessEqual(len(self.reader._stream_cache),
+                             SQUASHFS_MAX_CACHED_STREAMS)
 
 
 if __name__ == '__main__':

@@ -40,6 +40,15 @@ SQUASHFS_MAX_SYMLINK_TARGET = 4096
 SQUASHFS_COMPRESSED_BIT_BLOCK = 1 << 24
 SQUASHFS_INVALID_FRAG = 0xFFFFFFFF
 
+# Round-7 review: every accumulation below is driven by untrusted metadata
+# fields, so each gets an explicit ceiling. Legit AppImages sit orders of
+# magnitude under all of them.
+SQUASHFS_MAX_DIR_LISTING_BYTES = 1 << 20       # one directory's listing
+SQUASHFS_MAX_FRAGMENT_COUNT = 20_000           # matches the file quota
+SQUASHFS_MAX_INODE_SPAN = 256 * 1024           # metadata bytes per inode
+SQUASHFS_MAX_CACHED_META_BLOCKS = 2048         # ~16 MiB of cached blocks
+SQUASHFS_MAX_CACHED_STREAMS = 128              # ~9 MiB of cached streams
+
 # on-disk inode types (squashfs_fs.h, SquashFS 4.x)
 DIR = 1
 REG = 2
@@ -287,6 +296,10 @@ class SquashfsReader:
             data = self._decompress(raw, max_out=SQUASHFS_METADATA_SIZE)
 
         result = (data, block_offset + 2 + stored)
+        # round-7 review: the cache is keyed by attacker-reachable block
+        # offsets; a walk over a hostile image must not grow it forever
+        if len(self._meta_cache) > SQUASHFS_MAX_CACHED_META_BLOCKS:
+            self._meta_cache.clear()
         self._meta_cache[key] = result
         return result
 
@@ -308,6 +321,9 @@ class SquashfsReader:
             buf += data
             bo = nb
 
+        # same round-7 bound for the concatenated-stream cache
+        if len(self._stream_cache) > SQUASHFS_MAX_CACHED_STREAMS:
+            self._stream_cache.clear()
         self._stream_cache[key] = (buf, bo)
         return self._stream_cache[key]
 
@@ -331,6 +347,12 @@ class SquashfsReader:
             span = 16 + 8 + (4 if node.type == LSYMLINK else 0) + node.file_size
 
         if span and pos + span > len(buf):
+            if span > SQUASHFS_MAX_INODE_SPAN:
+                # symlink targets and block lists are the only span
+                # drivers; both have spec limits far below this
+                raise SquashfsError(
+                    f'inode spans {span} bytes of metadata (max '
+                    f'{SQUASHFS_MAX_INODE_SPAN}) — malformed or hostile')
             buf, _ = self._stream(self.inode_table_start, block_offset,
                                   pos + span)
             node = self._parse_inode(buf, pos)
@@ -357,6 +379,10 @@ class SquashfsReader:
             pos += 8
             if t == LSYMLINK:
                 pos += 4  # xattr id
+            if size > SQUASHFS_MAX_SYMLINK_TARGET:
+                raise SquashfsError(f'symlink target {size} bytes exceeds '
+                                    f'{SQUASHFS_MAX_SYMLINK_TARGET} — '
+                                    'malformed by construction')
             node.target = data[pos:pos + size].decode('utf-8', 'replace')
             node.file_size = size
         elif t in (REG, LREG):
@@ -399,6 +425,14 @@ class SquashfsReader:
         listing_size = inode.file_size - 3
         if listing_size <= 0:
             return []
+        # round-7 review: listing_size is a raw inode field; the chained
+        # metadata blocks below are decompressed into ONE buffer before
+        # parsing, so a hostile listing size must not reach _stream
+        if listing_size > SQUASHFS_MAX_DIR_LISTING_BYTES:
+            raise SquashfsError(
+                f'directory listing {listing_size} bytes '
+                f'(max {SQUASHFS_MAX_DIR_LISTING_BYTES}) — malformed or '
+                'hostile')
 
         buf, _ = self._stream(self.directory_table_start, inode.start_block,
                               inode.offset + listing_size)
@@ -444,6 +478,14 @@ class SquashfsReader:
     def _fragment_table(self):
         if self._fragment_cache is not None:
             return self._fragment_cache
+
+        # round-7 review: the entry list is built by materializing every
+        # fragment's metadata — the count is a superblock field and must
+        # not exceed the same quota as extracted files
+        if self.fragment_count > SQUASHFS_MAX_FRAGMENT_COUNT:
+            raise SquashfsError(
+                f'fragment table declares {self.fragment_count} entries '
+                f'(max {SQUASHFS_MAX_FRAGMENT_COUNT}) — malformed or hostile')
 
         entries = []
         per_block = SQUASHFS_METADATA_SIZE // 16  # 16 bytes per entry

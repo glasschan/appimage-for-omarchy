@@ -235,19 +235,21 @@ class ExtractedAppImage:
 
 
 def _superblock_quota(appimage_path: str, offset: int) -> tuple:
-    """(inode_count, uncompressed_total_bytes) from the squashfs
+    """(inode_count, stored_filesystem_bytes) from the squashfs
     superblock.
 
     The superblock is binary filesystem metadata — unlike `unsquashfs
     -ls` output it never echoes entry names, so crafted filenames cannot
     inject fake records or bend the quota inputs (round-5 review:
     filename-embedded newlines spoofed the line-based listing parse).
-    inode_count covers every inode type (dirs and symlinks included),
-    bytes_used_total is the full uncompressed size — both are exact
-    upper bounds for what extraction can produce.
+    inode_count bounds how many entries extraction can produce;
+    bytes_used_total is the STORED filesystem length — a sanity ceiling
+    on the image itself, not an uncompressed-size bound (round-7
+    review): uncompressed volume is bounded per-block by the decompress
+    caps and per-file by read_file's declared-size guards instead.
 
-    Raises SquashfsError when the superblock cannot be read: an external
-    extractor must never run without a quota-checkable preflight."""
+    Raises SquashfsError when the superblock cannot be read: extraction
+    must never run without a quota-checkable preflight."""
     reader = None
     try:
         reader = SquashfsReader(appimage_path, offset)
@@ -263,13 +265,15 @@ def _superblock_quota(appimage_path: str, offset: int) -> tuple:
 
 def _enforce_quotas(files: int, total_bytes: int):
     """Fail closed when the superblock already shows an extraction
-    bomb."""
+    bomb. total_bytes is the STORED filesystem length — a ceiling on the
+    image itself; uncompressed volume is bounded separately by the
+    per-block decompress caps and read_file's declared-size guards."""
     if files > MAX_EXTRACT_FILES:
         raise SquashfsError(f'extraction quota exceeded: superblock shows '
                             f'{files} inodes (max {MAX_EXTRACT_FILES})')
     if total_bytes > MAX_EXTRACT_BYTES:
-        raise SquashfsError(f'extraction quota exceeded: superblock shows '
-                            f'{total_bytes} uncompressed bytes '
+        raise SquashfsError(f'extraction quota exceeded: image stores '
+                            f'{total_bytes} bytes '
                             f'(max {MAX_EXTRACT_BYTES})')
 
 
