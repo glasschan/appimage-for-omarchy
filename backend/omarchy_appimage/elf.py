@@ -97,9 +97,17 @@ def get_elf_arch(path: str) -> str:
     return 'UNKNOWN'
 
 
+# Round-8 review: the section-name string table's size, every section's
+# sh_size, and the section names themselves are attacker-controlled
+# fields read straight from the file — all three are capped before they
+# can size an allocation.
+MAX_SECTION_NAME_TABLE = 1 << 20   # 1 MiB of section names is generous
+MAX_ELF_SECTION_NAME = 255         # kernel NAME_MAX; longer is malformed
+MAX_UPD_INFO_BYTES = 4096          # .upd_info holds one update URL
+
+
 def _read_sections(path: str):
     """Parse the ELF section table into [(name, sh_offset, sh_size), ...].
-
     Returns an empty list when the file is not an ELF or has no section
     table. Handles extended numbering (e_shnum == 0 with the real count in
     section 0's sh_size, e_shstrndx == SHN_XINDEX with the real index in
@@ -167,6 +175,8 @@ def _read_sections(path: str):
 
             # Resolve section names through the section-name string table.
             _, str_off, str_size, _ = entries[e_shstrndx]
+            if str_size > MAX_SECTION_NAME_TABLE:
+                return []
             f.seek(str_off)
             names = f.read(str_size)
 
@@ -177,6 +187,8 @@ def _read_sections(path: str):
                     continue
                 end = names.find(b'\x00', sh_name)
                 name = names[sh_name:end if end != -1 else len(names)]
+                if len(name) > MAX_ELF_SECTION_NAME:
+                    continue  # a hostile over-long name cannot be selected
                 sections.append((name.decode('utf-8', 'replace'),
                                  sh_offset, sh_size))
             return sections
@@ -199,7 +211,8 @@ def read_upd_info(path: str) -> str:
         try:
             with open(path, 'rb') as f:
                 f.seek(offset)
-                data = f.read(size)
+                # sh_size is untrusted; .upd_info holds one URL
+                data = f.read(min(size, MAX_UPD_INFO_BYTES))
         except OSError:
             return ''
         return data.split(b'\x00', 1)[0].decode('utf-8', 'replace').strip()

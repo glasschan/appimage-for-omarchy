@@ -203,6 +203,67 @@ class ElfSyntheticTests(unittest.TestCase):
         return path
 
 
+class SectionBoundsTests(unittest.TestCase):
+    """Round-8 review: the section-name string table's size and every
+    sh_size / section name are attacker-controlled — all capped before
+    they can size an allocation."""
+
+    def addCleanup_tmp(self, data):
+        import tempfile
+        fd, path = tempfile.mkstemp(prefix='elf-', suffix='.bin')
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def _patch_shstrtab_size(self, data, new_size):
+        """Point the .shstrtab section header's sh_size at `new_size`."""
+        import struct
+        shoff = struct.unpack_from('<Q', data, 0x28)[0]
+        _, _, shstrndx = struct.unpack_from('<HHH', data, 0x3A)
+        out = bytearray(data)
+        struct.pack_into('<Q', out,
+                         shoff + shstrndx * 64 + 0x20, new_size)
+        return bytes(out)
+
+    def test_huge_shstrtab_is_refused(self):
+        # round-8: a 1 GiB shstrtab sh_size must fail soft (no sections),
+        # never materialize the read
+        data = make_elf_with_sections({
+            '.upd_info': b'gh-releases-zsync|o|r|latest|f.zsync\x00',
+        })
+        hostile = self._patch_shstrtab_size(data, 0x40000000)
+        path = self.addCleanup_tmp(hostile)
+        self.assertEqual(elf._read_sections(path), [])
+        self.assertEqual(elf.read_upd_info(path), '')
+
+    def test_oversized_section_names_are_skipped(self):
+        # a 300-byte section name (no NUL inside) is malformed padding —
+        # it must not be retained, and the real .upd_info next to it must
+        # still be selected
+        long_name = 'x' * 300
+        data = make_elf_with_sections({
+            long_name: b'padding',
+            '.upd_info': b'gh-releases-zsync|o|r|latest|f.zsync\x00',
+        })
+        path = self.addCleanup_tmp(data)
+        names = [n for n, _, _ in elf._read_sections(path)]
+        self.assertNotIn(long_name, names)
+        self.assertIn('.upd_info', names)
+        self.assertEqual(
+            elf.read_upd_info(path),
+            'gh-releases-zsync|o|r|latest|f.zsync')
+
+    def test_upd_info_read_is_capped(self):
+        # a 100 KB .upd_info section is read through the 4 KiB cap: the
+        # returned string is truncated at the cap, never the full size
+        data = make_elf_with_sections({'.upd_info': b'a' * 100_000})
+        path = self.addCleanup_tmp(data)
+        result = elf.read_upd_info(path)
+        self.assertEqual(len(result), elf.MAX_UPD_INFO_BYTES)
+        self.assertEqual(result, 'a' * elf.MAX_UPD_INFO_BYTES)
+
+
 class ElfFixtureTests(FakeXDGTestCase):
     def test_offset_matches_gearlever_script(self):
         fixture = download_fixture()
