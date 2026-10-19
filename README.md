@@ -109,6 +109,20 @@ Then click the bar button, or:
 omarchy-shell shell summon io.github.glasschan.appimage '{}'
 ```
 
+### Development checks
+
+```sh
+bash scripts/ci/security-gates.sh      # backend invariant greps (CI + release)
+bash scripts/ci/qml-property-gate.sh    # local QML components expose every property we assign
+bash scripts/ci/qml-compile-check.sh    # compile every QML entry point (needs quickshell)
+```
+
+The last two guard a silent failure mode: assigning a QML property a type
+does not declare is a **compile error**, so the whole panel fails to load —
+and the shell swallows the load error, leaving a bar button that does
+nothing when pressed. `qml-compile-check.sh` needs Quickshell (it skips
+without it); `qml-property-gate.sh` is dependency-free and runs in CI.
+
 ## Backend CLI
 
 The QML layer talks to `backend/main.py` over a stable JSON contract
@@ -194,7 +208,7 @@ compatible INI); global settings in `…/settings.json` —
 manifest.json     Omarchy plugin manifest (bar-widget + panel + service)
 BarWidget.qml     Bar entry: icon + count badge, summons the panel
 Panel.qml         Main panel (list, picker, update rows, settings card, states, Escape via PanelKeyCatcher)
-SafeTextField.qml Clipboard-safe text field (permanently readOnly + key-driven editing + bounded fail-closed wl-paste) — every text entry goes through it
+SafeTextField.qml Clipboard-safe text field (permanently readOnly + key-driven editing + bounded fail-closed wl-paste) — every text entry goes through it; mirrors qs.Ui.TextField's `foreground`/`accent` theming
 Service.qml       Background update checker (scheduled --fetch-updates sweeps)
 ThemeIcon.qml     Theme-colored tabler icon (runtime currentColor tint)
 lib/Model.js      Shared state store (items cache, counts, busy flags, JSON mapping)

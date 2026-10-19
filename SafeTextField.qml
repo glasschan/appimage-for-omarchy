@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 
 // Clipboard-safe single-line text field for plugin forms (qs.Ui.TextField
 // drop-in with a value/edited pair instead of a text/onTextChanged pair).
@@ -40,6 +41,21 @@ TextField {
   // The QTBUG-149610 hook arms on readOnly: false only. Never bind, never
   // clear: this is the whole reason the type exists.
   readOnly: true
+
+  // Theme plumbing, mirroring qs.Ui.TextField so this field really is a
+  // drop-in for it: `foreground` paints the text, `accent` tints the
+  // selection. Panel.qml assigns both, and a QML assignment to a property
+  // the type does not declare is a COMPILE error (not a warning) — it takes
+  // the whole panel down, and the omarchy shell swallows the load error
+  // (shell.qml calls `errorString()` as a function), so the panel just
+  // never appears. Keep this list in sync with what the panel assigns.
+  property color foreground: Commons.Color.foreground
+  property color accent: Commons.Color.accent
+
+  color: root.foreground
+  selectionColor: Style.selectionFillFor(root.foreground, root.accent)
+  selectedTextColor: root.foreground
+  placeholderTextColor: Qt.darker(root.foreground, 1.6)
 
   // Model-facing value. Consumer-owned: bind it; the field only reads it.
   property string value: ""

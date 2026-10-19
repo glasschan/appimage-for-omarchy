@@ -64,6 +64,12 @@ jobs:
       - name: Security gates (backend invariants)
         run: bash scripts/ci/security-gates.sh
 
+      # Same shared gate as the CI `qml-gates` job: a QML assignment to a
+      # property a local component does not declare is a compile error that
+      # silently kills the panel, so a release must never ship past it.
+      - name: Local QML component property gate
+        run: bash scripts/ci/qml-property-gate.sh
+
       - name: Package the runtime file set
         env:
           VERSION: ${{ steps.version.outputs.version }}

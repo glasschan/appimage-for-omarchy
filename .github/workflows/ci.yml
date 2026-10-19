@@ -1,6 +1,6 @@
 # CI for "AppImage for Omarchy".
 #
-# Lean by design (PRD §2): four quick jobs on stock runners — no Omarchy,
+# Lean by design (PRD §2): five quick jobs on stock runners — no Omarchy,
 # no Quickshell. They cover exactly what the project itself accepts:
 #   backend          — the stdlib-only unittest suite (Python 3.14,
 #                      matches the dev machine; ResourceWarnings are errors;
@@ -10,6 +10,9 @@
 #   plugin-manifest  — manifest/repo hygiene + the PRD §2 < 1MB size budget
 #   security-gates   — gate 1 (backend invariant greps, the shared
 #                      scripts/ci/security-gates.sh)
+#   qml-gates        — local QML component property gate
+#                      (scripts/ci/qml-property-gate.sh); the runtime
+#                      compile check needs Quickshell and runs locally
 name: CI
 
 on:
@@ -166,3 +169,19 @@ jobs:
       # which has no repo-side scripts to check.
       - name: Backend invariant greps
         run: bash scripts/ci/security-gates.sh
+
+  qml-gates:
+    name: QML property gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every property the plugin assigns to one of its own QML components
+      # must exist on that component: a QML assignment to a missing property
+      # is a COMPILE error, and the omarchy shell swallows the resulting load
+      # error, so the panel just never opens. This gate is the static half;
+      # scripts/ci/qml-compile-check.sh is the runtime half (needs
+      # quickshell, so it runs on the maintainer's machine, not here).
+      - name: Local QML component property gate
+        run: bash scripts/ci/qml-property-gate.sh
+
