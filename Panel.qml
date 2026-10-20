@@ -26,11 +26,12 @@ import "lib/Backend.js" as Backend
 // F1 list (cache-first, the
 // store renders instantly and refreshes in the background), F2 integrate
 // (inline picker: Quickshell ships no file dialog, so a path field, a
-// Browse button and Downloads quick-picks stand in; every action previews
-// first through the offline --preview-integrate verb and installs only on
-// explicit confirm — #18, #19), F3 remove (two-click inline confirm,
-// keyed on desktop_id), F4 launch (detached exec of the AppImage path),
-// F5 bar badge (observer over the same Model store).
+// Browse button, Downloads quick-picks and drop-to-integrate stand in;
+// every action previews first through the offline --preview-integrate
+// verb and installs only on explicit confirm — #18, #19, #21), F3 remove
+// (two-click inline confirm, keyed on desktop_id), F4 launch (detached
+// exec of the AppImage path), F5 bar badge (observer over the same Model
+// store).
 //
 // M2 wiring: F6 check updates (--list-updates with a long watchdog; the
   // offline error document surfaces its own message), F7 one-click update
@@ -164,6 +165,17 @@ Panel {
   property string previewInput: ""
   property var previewDoc: null
 
+  // Drop-to-integrate (#21): the bar widget converts its dropped URIs
+  // through Model.dropUriToPath and hands the usable path over in the
+  // summon payload; open() parks it here and tryConsumePendingDrop runs it
+  // once the store is idle (the panel's own DropArea path checks the same
+  // guard live and reports a busy drop with a status line instead). The
+  // panel window DropArea never queues — this pending pair is transport
+  // for a gesture that happened before the panel existed. Closing the
+  // panel cancels a still-pending drop (onOpenedChanged).
+  property string pendingDropPath: ""
+  property int pendingDropIgnored: 0
+
   // desktop_id whose Remove button is armed for the second click (F3).
   property string confirmRemoveId: ""
 
@@ -260,6 +272,11 @@ Panel {
     updatingId = String(Model.state.busy.update || "")
     lastError = Model.state.lastError
     statusText = Model.state.status
+    // A bar-widget drop waits here for an idle store (see
+    // tryConsumePendingDrop): every busy flag flip announces itself
+    // through changed(), so the sync after the last in-flight call lands
+    // is the moment the pending preview can start.
+    tryConsumePendingDrop()
   }
 
   // True while any editor inside the panel should own raw keys instead of
@@ -278,6 +295,11 @@ Panel {
   function open(payloadJson) {
     Model.setMockMode(false)
     if (backendCommand.length > 0) Model.configureBackend(backendCommand)
+    // Bar-widget drop handoff (#21): the payload carries the file the user
+    // dropped on the bar icon (already converted and validated there).
+    // Parked, not run: the cache-first refresh below may occupy the shared
+    // backend process, and tryConsumePendingDrop waits that out.
+    readDropPayload(payloadJson)
     syncFromModel()
     // Settle the python3 state first: with it missing, refresh() below is
     // a no-op and the install card takes over the body instead.
@@ -293,6 +315,10 @@ Panel {
     Qt.callLater(function() {
       if (root.opened && keyCatcher) keyCatcher.forceActiveFocus()
     })
+    // Idle-store backstop: if nothing was in flight and nothing starts,
+    // no syncFromModel fires after the one above — consume the pending
+    // drop once more from the event loop (a no-op when already taken).
+    Qt.callLater(root.tryConsumePendingDrop)
   }
 
   // User-initiated close (Escape, outside click): tell the shell so its
@@ -1231,6 +1257,99 @@ Panel {
     if (field) field.forceActiveFocus()
   }
 
+  // ---- drop-to-integrate (#21) ------------------------------------------------
+  //
+  // Two entries, one flow. The panel window's DropArea (live drop) and the
+  // bar widget's summon-payload handoff both end in seedDropPreview, which
+  // is exactly the Downloads quick-pick mechanics plus openPicker(): seed
+  // the field, request the offline preview — a drop NEVER integrates
+  // directly, Confirm stays the only install path.
+
+  // True while the shared backend process or a picker-owning flow is busy —
+  // the same states during which Go/Browse/Downloads are disabled (#18/#19
+  // guards). A drop racing any of them is IGNORED with a status line,
+  // never queued: a field fill mid-call could only produce an answer the
+  // stale-drop logic would have to throw away (the same reasoning that
+  // disables Browse during a preview), and every flag here is
+  // watchdog-bounded, so "drop again" is always short-lived advice.
+  function dropBusy() {
+    return Model.isBusy() || root.busyPreview || root.settingsBusy || root.sourceBusy
+  }
+
+  // The shared handoff. openPicker() closes the settings/source cards and
+  // drops a stale preview first, so a drop works from any panel state and
+  // the card that appears is always computed from the dropped file. An
+  // ignored-extras report is a status (accent banner, 5 s auto-clear) set
+  // before the preview request so both notices coexist.
+  function seedDropPreview(path, ignored) {
+    openPicker()
+    root.pickerPath = path
+    if (ignored > 0) {
+      Model.setStatus(ignored === 1 ? strings.dropIgnoredOne
+        : Model.formatCount(ignored, strings.dropIgnoredMany))
+    }
+    root.requestPreview(path)
+  }
+
+  // Panel DropArea entry: convert the dropped URI list (typed result —
+  // see Model.dropUriToPath), report rejections as a status with the
+  // picker untouched, refuse busy races, otherwise run the flow.
+  function handleDropUris(uris) {
+    var conv = Model.dropUriToPath(uris)
+    if (!conv.ok) {
+      // reason "empty" means nothing usable was dropped at all — silent.
+      if (conv.reason === "not-file") Model.setStatus(strings.dropNotFile)
+      else if (conv.reason === "no-appimage") Model.setStatus(strings.dropNoAppImage)
+      syncFromModel()
+      return
+    }
+    if (dropBusy()) {
+      Model.setStatus(strings.dropBusy)
+      syncFromModel()
+      return
+    }
+    seedDropPreview(conv.path, conv.ignored)
+  }
+
+  // Summon-payload parser (bar-widget handoff). Only BarWidget's own drop
+  // handler writes this shape ({drop_path, drop_ignored}); every other
+  // summon payload ("{}", garbage) leaves the pending pair empty. The path
+  // is picker-field DATA exactly like a typed path — it reaches nothing
+  // but the preview flow, never a shell.
+  function readDropPayload(payloadJson) {
+    root.pendingDropPath = ""
+    root.pendingDropIgnored = 0
+    if (!payloadJson || payloadJson === "{}") return
+    var payload = null
+    try { payload = JSON.parse(String(payloadJson)) } catch (e) { payload = null }
+    if (!payload || typeof payload !== "object") return
+    var dropped = String(payload.drop_path || "").trim()
+    if (dropped === "") return
+    root.pendingDropPath = dropped
+    var extras = payload.drop_ignored
+    root.pendingDropIgnored = typeof extras === "number" && extras > 0
+      ? Math.round(extras) : 0
+  }
+
+  // Consume the parked bar-widget drop. Runs on every store sync (and once
+  // more from open() via callLater as the idle-store backstop): while any
+  // backend call is in flight the drop stays pending — a preview request
+  // started now would only die on the shared process's single-flight
+  // guard — and the sync after the last busy flag clears runs it. The
+  // wait is bounded (every busy flag is watchdog-released) and closing
+  // the panel cancels the drop outright (onOpenedChanged). Deferral here
+  // is transport, not queueing: the gesture happened before the panel
+  // existed, so ignoring it would kill the only reason the panel opened.
+  function tryConsumePendingDrop() {
+    if (root.pendingDropPath === "" || !root.opened) return
+    if (dropBusy()) return
+    var dropped = root.pendingDropPath
+    var ignored = root.pendingDropIgnored
+    root.pendingDropPath = ""
+    root.pendingDropIgnored = 0
+    seedDropPreview(dropped, ignored)
+  }
+
   Component.onCompleted: {
     syncFromModel()
     unsubscribe = Model.subscribe(syncFromModel)
@@ -1248,7 +1367,13 @@ Panel {
   // shell's lifetime. open() re-probes on every open, and a fresh Install
   // press re-arms recovery.
   onOpenedChanged: {
-    if (!root.opened) pythonSlowPoll.stop()
+    if (!root.opened) {
+      pythonSlowPoll.stop()
+      // A bar-widget drop not yet consumed dies with the panel: a later
+      // open must never surface a stale gesture as a fresh preview card.
+      root.pendingDropPath = ""
+      root.pendingDropIgnored = 0
+    }
   }
 
   Process {
@@ -2769,6 +2894,61 @@ Panel {
                 }
               }
             }
+          }
+        }
+      }
+    }
+
+    // ---- drop-to-integrate (#21): the whole window is a drop target -----
+    // Dropping an AppImage opens the picker seeded with the file and
+    // straight into the preview flow (handleDropUris — never an install).
+    // keys restricts the target to real file drags (text/uri-list), so a
+    // dragged web address never even lights the affordance — URL-text
+    // drops are out of scope by the spec. The veil + chip below are the
+    // hover affordance; theme-derived like every other surface here.
+    DropArea {
+      id: panelDropArea
+      anchors.fill: parent
+      enabled: root.opened
+      keys: ["text/uri-list"]
+      onDropped: function(drop) {
+        root.handleDropUris(drop.hasUrls ? drop.urls : [])
+      }
+    }
+
+    Rectangle {
+      anchors.fill: parent
+      visible: panelDropArea.containsDrag
+      color: Util.alpha(Color.accent, 0.10)
+
+      BorderSurface {
+        anchors.centerIn: parent
+        implicitWidth: dropChipRow.implicitWidth + Style.spacing.md * 2
+        implicitHeight: dropChipRow.implicitHeight + Style.spacing.sm * 2
+        color: Color.popups.background
+        borderSpec: Border.flat(Color.accent, Math.max(1, Style.normalBorderWidth))
+        radius: Style.cornerRadius
+
+        Row {
+          id: dropChipRow
+          anchors.centerIn: parent
+          spacing: Style.spacing.xs
+
+          ThemeIcon {
+            name: "cube-unfolded"
+            size: Style.font.icon
+            strokeWidth: 1.75
+            color: Color.accent
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          Text {
+            text: root.strings.dropHint
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            anchors.verticalCenter: parent.verticalCenter
           }
         }
       }

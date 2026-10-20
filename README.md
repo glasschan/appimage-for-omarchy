@@ -5,8 +5,8 @@
 [![CI](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml/badge.svg)](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml)
 
 Manage AppImages from the Omarchy bar: integrate new ones into your app
-menu — from a local file (through a Browse dialog or a pasted path) or
-straight from a release URL — see what is
+menu — from a local file (through a Browse dialog, a pasted path, or a
+drag-and-drop) or straight from a release URL — see what is
 installed (and running), launch, update, and remove them — all in a
 native Quickshell panel. No daemon, no extra runtime: the
 panel is plain QML and the backend is a Python-stdlib CLI that runs only
@@ -186,11 +186,25 @@ dialog failures surface as dismissible banners. The result documents
 `backend-failed` / `not-local` errors) are mapped defensively and
 pinned by `tests-js/parse-harness.mjs`.
 
+### Drop to integrate
+
+Dragging an AppImage file from a file manager onto the bar icon or onto
+the panel window opens the Integrate picker with that file already
+filled in and its preview card showing — the same confirm-before-install
+flow as every other route, so a drop never installs anything by itself.
+Only local AppImage files are accepted (a dragged web address is not a
+drop here); a selection without an AppImage reports itself as a status,
+and a multi-file drop uses the first AppImage and says how many others
+were ignored. Hovering a drag over either surface highlights it — the
+panel shows a veil with a "Drop to integrate" chip, the bar icon tints
+with the theme accent.
+
 ### Integrate: preview before install
 
 The panel's Integrate picker is not a one-press commit. Every route into
 it — a typed or pasted path/URL (Enter), the picker's **Integrate**
-button, or a Downloads quick-pick — first shows a **preview card** built
+button, a Downloads quick-pick, or a dropped file — first shows a
+**preview card** built
 by the offline `--preview-integrate` verb: the app name and version read
 from the file itself (URL sources show "unknown until download" — the
 preview fetches nothing), the destination path, and how the artifact
