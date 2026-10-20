@@ -1,0 +1,15 @@
+{
+  "desktop_id": "fakeapp.desktop",
+  "downloaded_bytes": 4805926,
+  "error": null,
+  "heartbeat": 1792500480.9091132,
+  "message": "downloading update",
+  "new_version": null,
+  "phase": "downloading",
+  "pid": 3432883,
+  "progress": 0.42,
+  "schema_version": 1,
+  "started": 1792500480.9082832,
+  "status": null,
+  "total_bytes": 11442680
+}

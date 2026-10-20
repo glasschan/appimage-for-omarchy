@@ -1,0 +1,15 @@
+{
+  "desktop_id": "fakeapp.desktop",
+  "downloaded_bytes": 0,
+  "error": "http://127.0.0.1:36485/f.appimage.zsync: zsync control file has no SHA-1 line; refusing to install an unverified artifact",
+  "heartbeat": 1792500480.962984,
+  "message": "http://127.0.0.1:36485/f.appimage.zsync: zsync control file has no SHA-1 line; refusing to install an unverified artifact",
+  "new_version": null,
+  "phase": "error",
+  "pid": 3432883,
+  "progress": 0.0,
+  "schema_version": 1,
+  "started": 1792500480.9263654,
+  "status": "error",
+  "total_bytes": 21
+}

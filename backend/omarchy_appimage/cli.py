@@ -17,12 +17,15 @@ import logging
 import os
 import posixpath
 import re
+import select
 import shutil
 import sys
 import tempfile
+import time
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from . import constants, net, pick_file, settings, utils
+from . import (constants, extractor, janitor, jobs, net, pick_file, settings,
+               utils)
 from .extractor import read_desktop_entry_in_place
 from .ini_config import Config
 from .provider import (AppImageListElement, AppImageProvider,
@@ -71,7 +74,11 @@ Commands:
                            source for a new release
   --update <target>        Download and install an update (--keep-both
                            keeps the old version, --force updates even
-                           while the app is running)
+                           while the app is running, --async runs the
+                           whole update as a detached background job and
+                           reports `job-started` immediately; the job's
+                           progress is published as a JSON document
+                           under $XDG_STATE_HOME)
   --set-update-source ...  Set a custom update source:
                            <target> --manager <name> [key=value ...]
                            (--unset removes it again)
@@ -958,6 +965,14 @@ def cmd_preview_integrate(args: list) -> int:
 
 def cmd_list_installed(args: list) -> int:
     json_output = '--json' in args
+    # janitor sweep (ticket 03): fossils — terminal/interrupted job
+    # documents past the acknowledgement window and orphan update temp
+    # dirs past the grace window — go away on every listing. THROTTLED:
+    # the panel polls this every 10 s and each sweep is an unbounded
+    # listdir + stat walk of the shared temp dir in this process's
+    # foreground (the job-start hook in _cmd_update_async stays
+    # unthrottled). Best-effort by contract: never raises.
+    janitor.sweep_throttled()
     apps = appimage_provider.list_installed()
 
     if json_output:
@@ -1102,11 +1117,145 @@ def cmd_list_updates(args: list) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------------ update core
+
+class UpdateResult:
+    """What run_update decided. Callers (cmd_update here, the async job
+    runner below) turn it into output; the core itself never writes
+    stdout. `status` uses the CLI's update result values:
+    'skipped-running' | 'up-to-date' | 'updated' — anything else fails
+    closed (InternalError) in both output paths."""
+
+    __slots__ = ('status', 'el', 'manager', 'message', 'downloaded_bytes')
+
+    def __init__(self, status: str, el, manager=None, message: str = '',
+                 downloaded_bytes: int = 0):
+        self.status = status
+        # the element to report: the old one for skipped-running /
+        # up-to-date, the freshly installed one for updated
+        self.el = el
+        self.manager = manager
+        # human-readable message for skipped-running / updated ('' for
+        # up-to-date: its plain-mode line is derived from el.file_path)
+        self.message = message
+        self.downloaded_bytes = downloaded_bytes
+
+
+class _ManagerStageProxy:
+    """Read-only view over an update manager that reports stage changes
+    for the async job document: `on_stage('replacing')` fires when
+    download() — whose tail performs the digest verification — returns,
+    i.e. when only the install step of update_from_url remains. Constant
+    structure: nothing is ever written to the real manager, the pipeline
+    owns the view."""
+
+    def __init__(self, manager, on_replacing):
+        self._manager = manager
+        self._on_replacing = on_replacing
+
+    def __getattr__(self, name):
+        return getattr(self._manager, name)
+
+    def download(self, dest_dir: str, progress_cb=None) -> str:
+        result = self._manager.download(dest_dir, progress_cb)
+        if self._on_replacing is not None:
+            try:
+                self._on_replacing()
+            except Exception:
+                logging.exception('stage callback failed')
+        return result
+
+
+def run_update(target: str, keep_both: bool = False,
+               force: bool = False, progress_cb=None,
+               on_stage=None) -> UpdateResult:
+    """The shared update pipeline: resolve target → update-source check →
+    running guard → availability check → download to temp → verify →
+    atomic replace → scoped temp-dir cleanup → pending-notification drop.
+
+    Plain function: no argv parsing, no stdout writes. Raises the same
+    exceptions the CLI reported before this was extracted (OperationError
+    for an unresolvable target / missing update source, InternalError /
+    net.NetworkError / updater errors from download & install) — main()
+    maps them to error documents and exit codes exactly as before, and
+    cmd_update adds no behaviour of its own beyond the argv check.
+    Ticket 02's async job runner calls this too, so the sync and async
+    paths cannot drift.
+
+    Hooks (both optional, used by the async runner only):
+      progress_cb(fraction) — download progress from net.download_to_file;
+        without it the fraction is only debug-logged (sync behaviour).
+      on_stage(stage, manager=None) — 'downloading' fires before the
+        download starts (with the checked manager, so its declared
+        download_size is available), 'replacing' after the download and
+        its digest verification returned (via _ManagerStageProxy).
+    """
+    el = _resolve_target(target)
+
+    manager = UpdateManagerChecker.check_url_for_app(el)
+    if not manager:
+        raise OperationError('No update method was found for this AppImage '
+                             '(set one with --set-update-source)')
+
+    if appimage_provider.is_app_running(el) and not force:
+        return UpdateResult(
+            status='skipped-running', el=el, manager=manager,
+            message=(f'{el.file_path} was skipped because the application '
+                     'is running; use --force to override'))
+
+    # tri-state: None (state not determinable) still attempts the download
+    if manager.is_update_available() is False:
+        return UpdateResult(status='up-to-date', el=el, manager=manager)
+
+    if on_stage is not None:
+        on_stage('downloading', manager)
+        manager = _ManagerStageProxy(manager, lambda: on_stage('replacing'))
+
+    logging.debug('downloading update with %s', manager.name)
+
+    if progress_cb is None:
+        def progress_cb(fraction: float):
+            logging.debug('download: %d%%', round(fraction * 100))
+
+    temp_dirs_before = extractor.temp_dirs_snapshot()
+    try:
+        new_el = appimage_provider.update_from_url(
+            manager, el, keep_both=keep_both, progress_cb=progress_cb)
+    finally:
+        # the temp-dir lifecycle is core-owned: update_from_url registers
+        # its download dir via extractor.new_temp_dir() (and the install
+        # step registers extraction dirs) — the scoped cleanup removes
+        # exactly the dirs THIS call added and leaves the rest of the
+        # process-global registry alone. The global wipe stays where it
+        # belongs: main.py's process-exit finally-block as a backstop.
+        for path in extractor.temp_dirs_snapshot():
+            if path not in temp_dirs_before:
+                extractor.remove_temp_dir(path)
+
+    # the update was applied: drop the pending-notification marker so the
+    # next --fetch-updates does not re-notify for the (now installed) release
+    state = settings.load_updates_state()
+    key = _updates_state_key(el)
+    if key in state:
+        del state[key]
+        settings.save_updates_state(state)
+
+    return UpdateResult(
+        status='updated', el=new_el, manager=manager,
+        message=f'{el.file_path} was updated successfully',
+        downloaded_bytes=new_el.size or 0)
+
+
 def cmd_update(args: list) -> int:
+    """CLI wrapper over run_update: argv/flag parsing plus the result's
+    JSON document / plain line and exit code (byte-identical to the
+    pre-extraction inline pipeline). --async detaches the pipeline into a
+    double-forked grandchild and reports `job-started` instead."""
     json_output = '--json' in args
     assume_yes = ('-y' in args) or ('--yes' in args)
     keep_both = '--keep-both' in args
     force = '--force' in args
+    async_job = '--async' in args
 
     if json_output and not assume_yes:
         _print_json({
@@ -1117,73 +1266,324 @@ def cmd_update(args: list) -> int:
         return EXIT_USAGE
 
     positional = _remove_flag_value(
-        args, ['--json', '--yes', '-y', '--keep-both', '--force'])
+        args, ['--json', '--yes', '-y', '--keep-both', '--force',
+               '--async'])
     positional = [a for a in positional if not a.startswith('--')]
     if not positional:
         raise UsageError('missing argument: --update <name-or-desktop-id>')
 
-    el = _resolve_target(positional[0])
+    if async_job:
+        return _cmd_update_async(positional[0], keep_both=keep_both,
+                                 force=force, json_output=json_output)
 
-    manager = UpdateManagerChecker.check_url_for_app(el)
-    if not manager:
-        raise OperationError('No update method was found for this AppImage '
-                             '(set one with --set-update-source)')
+    result = run_update(positional[0], keep_both=keep_both, force=force)
 
-    if appimage_provider.is_app_running(el) and not force:
-        message = (f'{el.file_path} was skipped because the application is '
-                   'running; use --force to override')
+    if result.status == 'skipped-running':
         if json_output:
             _print_json({
                 'schema_version': constants.JSON_SCHEMA_VERSION,
                 'result': 'skipped-running',
-                'message': message,
-                'app': _make_app_json(el, manager=manager),
+                'message': result.message,
+                'app': _make_app_json(result.el, manager=result.manager),
             })
         else:
-            print(message)
+            print(result.message)
         return EXIT_OK
 
-    # tri-state: None (state not determinable) still attempts the download
-    if manager.is_update_available() is False:
+    if result.status == 'up-to-date':
         if json_output:
             _print_json({
                 'schema_version': constants.JSON_SCHEMA_VERSION,
                 'result': 'up-to-date',
-                'app': _make_app_json(el, manager=manager),
+                'app': _make_app_json(result.el, manager=result.manager),
             })
         else:
-            print(f'{el.file_path} is up to date')
+            print(f'{result.el.file_path} is up to date')
         return EXIT_OK
 
-    logging.debug('downloading update with %s', manager.name)
+    if result.status != 'updated':
+        # fail closed: a future typo'd status must never print a wrong
+        # document (same verdict the async runner's mapper reaches)
+        raise InternalError(f'unknown update result status: '
+                            f'{result.status!r}')
 
-    def _progress(fraction: float):
-        logging.debug('download: %d%%', round(fraction * 100))
-
-    new_el = appimage_provider.update_from_url(
-        manager, el, keep_both=keep_both, progress_cb=_progress)
-    downloaded_bytes = new_el.size or 0
-
-    # the update was applied: drop the pending-notification marker so the
-    # next --fetch-updates does not re-notify for the (now installed) release
-    state = settings.load_updates_state()
-    key = _updates_state_key(el)
-    if key in state:
-        del state[key]
-        settings.save_updates_state(state)
-
-    message = f'{el.file_path} was updated successfully'
     if json_output:
         _print_json({
             'schema_version': constants.JSON_SCHEMA_VERSION,
             'result': 'updated',
-            'message': message,
-            'app': _make_app_json(new_el),
-            'downloaded_bytes': downloaded_bytes,
+            'message': result.message,
+            'app': _make_app_json(result.el),
+            'downloaded_bytes': result.downloaded_bytes,
         })
     else:
-        print(message)
+        print(result.message)
     return EXIT_OK
+
+
+# ------------------------------------------------------- async job runner
+
+_JOB_HANDSHAKE_TIMEOUT_SECONDS = 10
+
+
+def _cmd_update_async(target: str, keep_both: bool, force: bool,
+                      json_output: bool) -> int:
+    """Parent side of --update --async: validate the target (local name/id
+    resolution only), take the job's atomic claim, refuse when a job is
+    running for the app, then spawn the detached grandchild (see
+    _spawn_update_job) and report `job-started` immediately. The parent
+    never runs the pipeline itself and never resolves the update manager:
+    that is run_update's first step inside the grandchild, so a missing
+    or broken source surfaces as a terminal `error` job document instead
+    of a second, drifting manager resolution here."""
+    el = _resolve_target(target)
+    # fail closed BEFORE any side effect (no sweep, no fork): the id must
+    # be able to name a job file, or this path cannot honour its contract
+    desktop_id = _job_desktop_id(el)
+
+    # janitor sweep (ticket 03), parent-side only — never in the
+    # grandchild: stale terminal/interrupted documents age out and orphan
+    # update temp dirs are reclaimed before a new job is spawned.
+    # Best-effort by contract: sweep() never raises.
+    janitor.sweep()
+
+    # The claim comes first, and it is atomic: two starts racing before
+    # either job document exists would otherwise both pass the active-job
+    # check and both write this log (TOCTOU). open_job_log_fd also owns
+    # the only legal truncation of an over-cap log, so a start that turns
+    # out to be refused cannot wipe a live job's log.
+    try:
+        log_fd = jobs.open_job_log_fd(desktop_id)
+    except BlockingIOError:
+        return _refuse_second_job(desktop_id, json_output)
+
+    try:
+        active = jobs.active_job(desktop_id)
+        if active is not None:
+            return _refuse_second_job(desktop_id, json_output, active)
+
+        try:
+            pid, job_path, log_path = _spawn_update_job(
+                desktop_id, target, keep_both=keep_both, force=force,
+                log_fd=log_fd)
+        except OSError as e:
+            raise OperationError(f'could not start the update job: {e}')
+    finally:
+        # single owner: the grandchild inherited the description (and the
+        # flock with it) through the fork, so this copy is done
+        os.close(log_fd)
+
+    if json_output:
+        _print_json({
+            'schema_version': constants.JSON_SCHEMA_VERSION,
+            'result': 'job-started',
+            'desktop_id': desktop_id,
+            'job_path': job_path,
+            'log_path': log_path,
+            'pid': pid,
+        })
+    else:
+        print(f'Update job started for {el.file_path} '
+              f'(pid {pid}, desktop id {desktop_id}); '
+              f'job document: {job_path}')
+    return EXIT_OK
+
+
+def _job_desktop_id(el) -> str:
+    """The app's job key, with the fail-closed precondition attached: an
+    id the job store cannot turn into a file name (a legal .desktop
+    filename may hold a space or a non-ASCII char) is an OperationError,
+    i.e. the contract's error shape — never a ValueError escaping to
+    main()'s catch-all as a generic "unexpected error" + traceback. Sync
+    --update accepts such an id, so the refusal has to name the reason."""
+    desktop_id = _updates_state_key(el)
+    if not jobs.is_usable_desktop_id(desktop_id):
+        raise OperationError(
+            f'{el.file_path} cannot be updated in the background: its '
+            f'desktop id {desktop_id!r} is not usable as a job file name '
+            f'(allowed: letters, digits, ".", "_" and "-", '
+            f'starting with a letter or digit)')
+    return desktop_id
+
+
+def _refuse_second_job(desktop_id: str, json_output: bool,
+                       active: dict = None) -> int:
+    """The --async refusal, one shape for both gates (the atomic claim
+    and the active-document check). Nothing of the running job is
+    touched: its document is not rewritten and its log is not opened for
+    writing."""
+    pid = (active or {}).get('pid')
+    if pid:
+        message = (f'an update job is already active for {desktop_id} '
+                   f'(pid {pid}); refusing to start a second one')
+    else:
+        message = (f'an update job is already active for {desktop_id}; '
+                   f'refusing to start a second one')
+    if json_output:
+        _print_json({
+            'schema_version': constants.JSON_SCHEMA_VERSION,
+            'result': 'error',
+            'desktop_id': desktop_id,
+            'error': message,
+        })
+    else:
+        print(f'Error: {message}', file=sys.stderr)
+    return EXIT_ERROR
+
+
+def _job_entrypoint(desktop_id: str, target: str, keep_both: bool,
+                    force: bool) -> int:
+    """The detached grandchild's body: run the whole update pipeline and
+    publish one job document per phase (jobs.JobWriter). Never raises;
+    returns a process exit code (the fork site os._exit()s with it).
+    In-process callers (tests) use the same entrypoint, so the sync and
+    async pipelines cannot drift."""
+    writer = jobs.JobWriter(desktop_id)
+    writer.start_heartbeat()
+    try:
+        try:
+            result = run_update(target, keep_both=keep_both, force=force,
+                                progress_cb=writer.progress_cb,
+                                on_stage=writer.stage)
+        except Exception as e:
+            # the traceback lands in the bounded per-job log (stderr is
+            # redirected there), never on stdout
+            logging.exception('update job for %s failed', desktop_id)
+            writer.finish_error(str(e) or type(e).__name__)
+            return EXIT_ERROR
+        return _finish_job_document(writer, result)
+    finally:
+        writer.stop_heartbeat()
+        # process-exit backstop for the grandchild: run_update's scoped
+        # cleanup removed what the pipeline registered; whatever is left
+        # in the registry dies with this process here
+        extractor.cleanup_temp_dirs()
+
+
+def _finish_job_document(writer, result: UpdateResult) -> int:
+    """Map a completed run_update to its terminal job document (same
+    verdicts, fail closed, as cmd_update's output branches)."""
+    if result.status == 'updated':
+        writer.finish('updated', message=result.message,
+                      new_version=result.el.version,
+                      downloaded_bytes=result.downloaded_bytes)
+        return EXIT_OK
+    if result.status == 'up-to-date':
+        writer.finish('up-to-date',
+                      message=f'{result.el.file_path} is up to date')
+        return EXIT_OK
+    if result.status == 'skipped-running':
+        writer.finish('skipped-running', message=result.message)
+        return EXIT_OK
+    writer.finish_error(f'unknown update result status: {result.status!r}')
+    return EXIT_ERROR
+
+
+def _spawn_update_job(desktop_id: str, target: str, keep_both: bool,
+                      force: bool, log_fd: int) -> tuple:
+    """Detach the job runner as a grandchild: os.fork() twice (setsid in
+    the intermediate, so the grandchild owns no controlling terminal and
+    cannot reacquire one), stdio redirected into the size-capped per-job
+    log, stdin from /dev/null. No shell, no exec, nothing interpolated —
+    the grandchild continues this process image and runs
+    _job_entrypoint, then reports its pid back over a pipe so the parent
+    can name it in the job-started document. The parent reaps only the
+    intermediate; the grandchild is reparented and reaped by init.
+
+    `log_fd` is the caller's already-open (and flock-claimed) job log, not
+    something this function opens: the claim has to be held across the
+    active-job check and the fork, and only the caller can bracket that.
+    Ownership of the fd stays with the caller.
+
+    Returns (grandchild_pid, job_document_path, job_log_path)."""
+    devnull_fd = os.open(os.devnull, os.O_RDONLY)
+    job_path = jobs.job_document_path(desktop_id)
+    log_path = jobs.job_log_path(desktop_id)
+    read_fd, write_fd = os.pipe()
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    intermediate_pid = os.fork()
+
+    if intermediate_pid == 0:
+        # --- intermediate child --------------------------------------
+        code = 1
+        try:
+            os.close(read_fd)
+            os.setsid()
+            grandchild_pid = os.fork()
+        except BaseException:
+            try:
+                logging.exception('could not fork the update job')
+            except Exception:
+                pass
+            os._exit(code)
+        if grandchild_pid == 0:
+            # --- grandchild: the detached job ------------------------
+            grandchild_code = EXIT_ERROR
+            try:
+                # write_fd only: the intermediate already closed read_fd
+                # before forking, so the grandchild's fd table has no
+                # read end to close (a double close here would EBADF and
+                # kill the job before its stdio is even redirected)
+                os.close(write_fd)
+                os.dup2(devnull_fd, 0)
+                os.dup2(log_fd, 1)
+                os.dup2(log_fd, 2)
+                os.close(devnull_fd)
+                os.close(log_fd)
+                os.chdir('/')
+                grandchild_code = _job_entrypoint(
+                    desktop_id, target, keep_both=keep_both, force=force)
+            except BaseException:
+                try:
+                    logging.exception('update job crashed')
+                except Exception:
+                    pass
+                grandchild_code = EXIT_ERROR
+            finally:
+                os._exit(grandchild_code)
+        # report the grandchild pid, then leave: the grandchild is
+        # reparented and never reaped by this tree
+        try:
+            os.write(write_fd, str(grandchild_pid).encode('ascii'))
+        except OSError:
+            pass
+        finally:
+            os._exit(0)
+
+    # --- parent ------------------------------------------------------
+    os.close(write_fd)
+    try:
+        data = b''
+        deadline = time.monotonic() + _JOB_HANDSHAKE_TIMEOUT_SECONDS
+        while len(data) < 32:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([read_fd], [], [], remaining)
+            if not ready:
+                break
+            chunk = os.read(read_fd, 32)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(read_fd)
+        os.close(devnull_fd)
+    # bounded above by the handshake deadline only via the pipe: the
+    # intermediate's post-fork code is close/setsid/fork/write/_exit, so a
+    # hang here would require a signal mid-sequence — reap is unblocking-free
+    os.waitpid(intermediate_pid, 0)
+
+    try:
+        grandchild_pid = int(data.decode('ascii', errors='replace').strip())
+    except ValueError:
+        grandchild_pid = 0
+    if grandchild_pid <= 0:
+        raise OperationError('could not start the update job '
+                             '(the detached process died before it '
+                             'reported its pid)')
+    return grandchild_pid, job_path, log_path
 
 
 def cmd_set_update_source(args: list) -> int:

@@ -1,0 +1,312 @@
+# janitor.py — best-effort sweep of fossil job documents and orphan
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
+# update temp dirs (stdlib only).
+#
+# Runs (ticket 03): (a) in the async-update PARENT before it spawns a job,
+# (b) on every --list-installed. NEVER in the detached grandchild (the
+# grandchild owns exactly one live job and exits through its own scoped +
+# global temp-dir cleanup), and NEVER via extractor.cleanup_temp_dirs()
+# — that global wipe is the process-exit backstop of the process that
+# owns the registry; this module decides from DISK evidence alone (it
+# runs in a different process than any live job and cannot see another
+# process's registry).
+#
+# Everything here is best-effort and bounded: every per-item operation is
+# wrapped in try/except OSError (plus a blanket except Exception guard),
+# removals are capped per sweep, and the entrypoints never raise — a
+# sweep failure must never fail --list-installed or a job start.
+
+import json
+import logging
+import os
+import shutil
+import stat
+import tempfile
+import time
+
+from . import constants, jobs, utils
+
+# A terminal (done|error) or interrupted document is removed — together
+# with its per-job log — once this window has passed since its last
+# activity. For every document the writer refreshes `heartbeat` on each
+# rewrite (JobWriter._write), so the terminal rewrite's heartbeat doubles
+# as the finished-at timestamp and a dead job's heartbeat is its last
+# sign of life; that field (falling back to the file mtime when it is
+# missing or malformed, e.g. for corrupt documents) is the window clock.
+# 24 h comfortably outlives a desktop session, so the panel can still
+# show `interrupted` (and offer a retry) long after a crashed job, while
+# the state dir cannot grow without bound.
+JOB_ACK_WINDOW_SECONDS = 24 * 60 * 60
+
+# An `appimage-update-*` dir in the temp area (the prefix provider.
+# update_from_url downloads into; legacy orphans from hard-killed
+# pre-async downloads carry no registry entry and no job document) is
+# removed once its EFFECTIVE mtime — the max of the dir's own mtime and
+# its immediate entries' mtimes — is older than this grace window. The
+# children matter: net.download_to_file writes one file continuously, so
+# during a live download the FILE's mtime keeps advancing while the
+# DIRECTORY's only reflects entry creation. 600 s is 5x
+# jobs.JOB_STALE_AFTER_SECONDS (120 s) and 20x the downloader's 30 s
+# per-read stall guard: a live job cannot go quiet that long, and a job
+# whose document still classifies active (heartbeat < 120 s old) always
+# has a download dir well inside the grace window.
+UPDATE_TEMP_GRACE_SECONDS = 600
+
+# Only this prefix is ever swept from the temp area. Extraction dirs
+# (`gearlever_appimage_`, `unsquashfs-`, `bsdtar-`, anything else) are
+# never touched — they belong to a live process's registry.
+UPDATE_TEMP_PREFIX = 'appimage-update-'
+
+# Hard bounds per sweep: the scans stop after this many removals, so a
+# pathological state/temp dir cannot make --list-installed slow.
+MAX_REMOVALS_PER_SWEEP = 200
+
+
+def sweep_job_documents(now: float = None) -> int:
+    """Remove terminal/interrupted job documents past the acknowledgement
+    window (JOB_ACK_WINDOW_SECONDS), each together with its log.
+
+    Per document (one `*.json` file in jobs.jobs_dir()):
+      * ACTIVE documents (jobs.classify_job: non-terminal phase, live pid,
+        fresh heartbeat) are NEVER touched;
+      * every other document ages out from its `heartbeat` (the writer
+        refreshes it on every rewrite, so a terminal document's heartbeat
+        is its finished-at time and an interrupted one's is its last sign
+        of life) — falling back to the file mtime when the field is
+        missing or malformed (corrupt documents have no heartbeat at all
+        and age out from their mtime under the same window);
+      * symlinks and non-regular files are skipped, never followed.
+
+    Returns the number of documents removed. Never raises.
+    """
+    if now is None:
+        now = time.time()
+    removed = 0
+    try:
+        entries = os.listdir(jobs.jobs_dir())
+    except OSError as e:
+        logging.debug('janitor: no job directory to sweep: %s', e)
+        return 0
+
+    for name in entries:
+        if removed >= MAX_REMOVALS_PER_SWEEP:
+            break
+        if not name.endswith('.json'):
+            continue
+        path = os.path.join(jobs.jobs_dir(), name)
+        try:
+            if not _is_regular_file(path):
+                continue
+            doc = _read_document(path)
+            classification = jobs.classify_job(doc, now=now)
+            if classification == 'active':
+                continue
+            if _age_seconds(path, doc, now) <= JOB_ACK_WINDOW_SECONDS:
+                continue
+            os.unlink(path)
+            removed += 1
+            _remove_log_companion(path)
+            logging.debug('janitor: removed stale job document %s (%s)',
+                          path, classification)
+        except Exception as e:
+            logging.debug('janitor: skipped job document %s: %s', path, e)
+    return removed
+
+
+def sweep_update_temp_dirs(now: float = None,
+                           temp_area: str = None) -> int:
+    """Remove partial-download temp dirs with no live owner.
+
+    Disk-only rule (the janitor runs in a different process than any live
+    job, so the in-process registry is invisible): an
+    `appimage-update-*` directory in the temp area whose EFFECTIVE mtime
+    (the dir's own mtime vs. the max of its immediate entries' mtimes —
+    a live download keeps writing its file, so the file's mtime is the
+    live signal) is older than UPDATE_TEMP_GRACE_SECONDS is a fossil and
+    is removed. Symlinked entries are skipped (never followed), and
+    nothing with any other prefix — `gearlever_appimage_*` above all —
+    is ever touched.
+
+    `temp_area` overrides the scan root (default tempfile.gettempdir(),
+    the same area provider.update_from_url downloads into). Returns the
+    number of dirs removed. Never raises.
+    """
+    if now is None:
+        now = time.time()
+    if temp_area is None:
+        temp_area = tempfile.gettempdir()
+    removed = 0
+    try:
+        entries = os.listdir(temp_area)
+    except OSError as e:
+        logging.debug('janitor: cannot list temp area %s: %s', temp_area, e)
+        return 0
+
+    for name in entries:
+        if removed >= MAX_REMOVALS_PER_SWEEP:
+            break
+        if not name.startswith(UPDATE_TEMP_PREFIX):
+            continue
+        path = os.path.join(temp_area, name)
+        try:
+            if os.path.islink(path) or not os.path.isdir(path):
+                continue
+            if _effective_age_seconds(path, now) \
+                    <= UPDATE_TEMP_GRACE_SECONDS:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+            logging.debug('janitor: removed orphan update dir %s', path)
+        except Exception as e:
+            logging.debug('janitor: skipped temp dir %s: %s', path, e)
+    return removed
+
+
+def sweep(now: float = None, temp_area: str = None) -> dict:
+    """Both sweeps, best-effort: job documents past the acknowledgement
+    window, then orphan update temp dirs past the grace window. Returns
+    per-surface removal counts; never raises."""
+    counts = {'documents_removed': 0, 'temp_dirs_removed': 0}
+    try:
+        counts['documents_removed'] = sweep_job_documents(now=now)
+    except Exception:  # belt and braces: sweep() itself never raises
+        logging.exception('janitor: job-document sweep failed')
+    try:
+        counts['temp_dirs_removed'] = sweep_update_temp_dirs(
+            now=now, temp_area=temp_area)
+    except Exception:
+        logging.exception('janitor: temp-dir sweep failed')
+    return counts
+
+
+# --list-installed runs on the panel's 10 s poll, and each sweep is an
+# UNBOUNDED os.listdir + stat walk of the shared temp dir (every other
+# user's temp entries land in that same walk) in the CLI's FOREGROUND —
+# the listing hook must not pay that every tick. Job starts keep
+# sweeping unconditionally: they are rare, and a fossil document must be
+# gone before the new job's document appears.
+SWEEP_THROTTLE_SECONDS = 5 * 60
+
+
+def sweep_marker_path() -> str:
+    """The throttle marker: plugin state dir, NEVER /tmp.
+
+    A /tmp marker would be (a) wiped by the very cleanup the sweep does
+    and (b) shared with every other process on the box."""
+    return os.path.join(constants.plugin_state_dir(), 'last-sweep')
+
+
+def sweep_throttled(interval_seconds: float = SWEEP_THROTTLE_SECONDS,
+                    now: float = None) -> bool:
+    """sweep(), at most once per `interval_seconds`.
+
+    For the high-frequency hook (--list-installed) only; sweep() itself
+    keeps its semantics for every direct caller. The marker holds the
+    epoch of the last sweep; a MISSING or CORRUPT marker means "never
+    swept" and sweeps (the throttle is an optimisation, never a
+    precondition — a janitor that stops running because its bookkeeping
+    broke is worse than one extra sweep). A marker timestamped in the
+    future (clock skew) is treated the same way.
+
+    Returns True when this call swept, False when it was throttled.
+    Never raises."""
+    if now is None:
+        now = time.time()
+    last = None
+    try:
+        with open(sweep_marker_path(), 'r', encoding='utf-8') as f:
+            last = float(f.read().strip())
+    except (OSError, ValueError):
+        last = None
+    if last is not None and 0 <= now - last < interval_seconds:
+        return False
+
+    # stamp BEFORE sweeping: a sweep that is interrupted (or that dies in
+    # a crash loop) must not be retried on every single poll
+    try:
+        utils.atomic_write(sweep_marker_path(),
+                           repr(float(now)).encode('utf-8'))
+    except OSError as e:
+        logging.debug('janitor: could not stamp the sweep marker: %s', e)
+    sweep(now=now)
+    return True
+
+
+# ----------------------------------------------------------------- helpers
+
+def _is_regular_file(path: str) -> bool:
+    """True for a plain regular file only. Symlinks are skipped outright
+    (never followed, never removed — the writer never produces them), as
+    are directories and every other file type."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode)
+
+
+def _read_document(path: str):
+    """The parsed job document, or None when unreadable/corrupt (the
+    janitor's own read — it walks the directory and has no desktop id
+    for jobs.read_job; corrupt documents fall through to the mtime
+    rule)."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _document_timestamp(doc, path: str, now: float) -> float:
+    """The document's last-activity epoch second: `heartbeat` when it is
+    a sane number, else the file's mtime (corrupt documents, legacy
+    shapes)."""
+    heartbeat = doc.get('heartbeat') if isinstance(doc, dict) else None
+    try:
+        value = float(heartbeat)
+    except (TypeError, ValueError):
+        value = 0.0
+    # sanity: a future timestamp is corrupt, never a live clock — fall
+    # through to mtime so a far-future value can't pin the file forever
+    if 0 < value <= max(now, 0.0):
+        return value
+    try:
+        return os.lstat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
+def _age_seconds(path: str, doc, now: float) -> float:
+    return max(0.0, now - _document_timestamp(doc, path, now))
+
+
+def _effective_age_seconds(path: str, now: float) -> float:
+    """now - max(mtime of `path`, mtime of its immediate entries): the
+    dir mtime alone goes stale the moment a live download stops creating
+    entries, the file mtimes keep moving until it finishes."""
+    newest = 0.0
+    try:
+        newest = os.lstat(path).st_mtime
+        for name in os.listdir(path):
+            try:
+                newest = max(newest,
+                             os.lstat(os.path.join(path, name)).st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        return 0.0
+    return max(0.0, now - newest)
+
+
+def _remove_log_companion(document_path: str):
+    """Remove `<stem>.log` next to a removed document (best-effort; a
+    directory squatting on the log name is left alone)."""
+    log_path = document_path[:-len('.json')] + '.log'
+    try:
+        if os.path.isdir(log_path) and not os.path.islink(log_path):
+            return
+        os.unlink(log_path)
+    except OSError as e:
+        logging.debug('janitor: could not remove job log %s: %s',
+                      log_path, e)

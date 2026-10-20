@@ -645,9 +645,12 @@ class AppImageProvider():
         calls replaced by plain paths and the GTK progress callback
         replaced by an optional progress_cb(fraction). Deviations:
           * the download lands in a temp dir from
-            extractor.new_temp_dir('appimage-update-'), which main.py's
-            finally-block removes via extractor.cleanup_temp_dirs()
-            (upstream kept it in a per-run extraction folder);
+            extractor.new_temp_dir('appimage-update-'), which the shared
+            update core (cli.run_update) removes — scoped to the dirs
+            this call registered — right after the call; the global
+            cleanup_temp_dirs() wipe stays in main.py's process-exit
+            finally-block as a backstop (upstream kept it in a per-run
+            extraction folder);
           * `keep_both` lets the caller pick AppImageUpdateLogic.KEEP —
             upstream's CLI path always installs with REPLACE;
           * on success we only clear updating_from here, update_logic is

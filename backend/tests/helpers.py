@@ -53,16 +53,20 @@ class FakeXDGTestCase(unittest.TestCase):
         self.sandbox = tempfile.mkdtemp(prefix='omarchy-appimage-test-')
         self.data_home = os.path.join(self.sandbox, 'data')
         self.config_home = os.path.join(self.sandbox, 'config')
+        self.state_home = os.path.join(self.sandbox, 'state')
         self.home = os.path.join(self.sandbox, 'home')
-        for d in (self.data_home, self.config_home, self.home):
+        for d in (self.data_home, self.config_home, self.state_home,
+                  self.home):
             os.makedirs(d, exist_ok=True)
 
         self._old_env = {k: os.environ.get(k)
-                         for k in ('HOME', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME')}
+                         for k in ('HOME', 'XDG_DATA_HOME',
+                                   'XDG_CONFIG_HOME', 'XDG_STATE_HOME')}
 
         os.environ['HOME'] = self.home
         os.environ['XDG_DATA_HOME'] = self.data_home
         os.environ['XDG_CONFIG_HOME'] = self.config_home
+        os.environ['XDG_STATE_HOME'] = self.state_home
 
         self.addCleanup(self._restore)
         self.addCleanup(shutil.rmtree, self.sandbox, ignore_errors=True)
@@ -83,6 +87,13 @@ class FakeXDGTestCase(unittest.TestCase):
     @property
     def applications_dir(self) -> str:
         return os.path.join(self.data_home, 'applications')
+
+    @property
+    def plugin_jobs_dir(self) -> str:
+        """The plugin's job-document directory inside the sandbox
+        ($XDG_STATE_HOME/io.github.glasschan.appimage/jobs)."""
+        return os.path.join(self.state_home,
+                            'io.github.glasschan.appimage', 'jobs')
 
     @property
     def trash_files(self) -> str:
@@ -133,11 +144,14 @@ X-AppImage-Version=1.0
 
     # ---------------------------------------------------------- subprocess
 
-    def run_cli(self, *args, check=False) -> subprocess.CompletedProcess:
+    def run_cli(self, *args, check=False, extra_env: dict = None
+                ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         env['HOME'] = self.home
         env['XDG_DATA_HOME'] = self.data_home
         env['XDG_CONFIG_HOME'] = self.config_home
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(
             [sys.executable, MAIN_PY, *args],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -256,6 +270,11 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             if self.command != 'HEAD':
                 self.wfile.write(body)
             return
+        if callable(route):
+            # a route may be a callable receiving the handler (used for
+            # slow/deferred bodies: it can branch on handler.command and
+            # blocks inside itself before answering)
+            route = route(self)
         status, headers, body = route
         self.send_response(status)
         for key, value in headers.items():

@@ -62,7 +62,31 @@ def new_temp_dir(prefix: str = 'appimage-') -> str:
     return d
 
 
+def temp_dirs_snapshot() -> tuple:
+    """Point-in-time copy of the registered temp dirs, for scoped cleanup
+    (cli.run_update removes exactly the dirs its own pipeline added)."""
+    return tuple(_TEMP_DIRS)
+
+
+def remove_temp_dir(path: str):
+    """Remove ONE registered temp dir and drop it from the global registry.
+
+    Scoped cleanup for sequential in-process callers: unlike
+    cleanup_temp_dirs() it touches only the named dir — but the
+    snapshot-delta pattern in cli.run_update is correct only when one
+    update runs at a time; concurrent in-process updates could each
+    rmtree the other's live download dir."""
+    try:
+        _TEMP_DIRS.remove(path)
+    except ValueError:
+        pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def cleanup_temp_dirs():
+    """Process-exit backstop: wipe every registered temp dir. Only main()
+    (and the detached async job's own exit path) may call this — a library
+    caller must use remove_temp_dir()/temp_dirs_snapshot() instead."""
     for d in _TEMP_DIRS:
         shutil.rmtree(d, ignore_errors=True)
     _TEMP_DIRS.clear()

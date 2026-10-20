@@ -39,7 +39,9 @@ python3 <plugin_dir>/backend/main.py [OPTION]...
 
 ### `--list-installed [--json]`
 
-Lists integrated apps. Plain text (name, version, path) or JSON.
+Lists integrated apps. Plain text (name, version, path) or JSON. Runs the
+janitor sweep first (see *Document lifecycle* under `--update --async`)
+— best-effort, it can never fail the listing.
 
 For every app an update source is resolved **locally** (the per-app config
 in `apps.ini`, else the AppImage's embedded `.upd_info` ELF section — no
@@ -257,6 +259,139 @@ Real example output (skipped-running, exit 0):
 {"schema_version": 1, "result": "skipped-running", "message": "/home/user/AppImages/neovim.appimage was skipped because the application is running; use --force to override", "app": <app>}
 ```
 
+### `--update <target> --async [--yes] [--keep-both] [--force] [--json]`
+
+Runs the whole `--update` pipeline as a **detached background job** and
+returns immediately.
+
+- Same target resolution and flags as plain `--update`; `--json` still
+  requires `--yes` (exit 2 otherwise).
+- The app's desktop id must be usable as a job file name
+  (`^[A-Za-z0-9][A-Za-z0-9._-]*$` after the `.desktop` suffix is
+  stripped). A **legal** `.desktop` filename may violate that (a space, a
+  non-ASCII char); plain `--update` accepts it, `--async` cannot name a
+  job file for it and refuses **before any side effect** (no sweep, no
+  fork) with exit 1 and the error document `<path> cannot be updated in
+  the background: its desktop id <id> is not usable as a job file name
+  (allowed: letters, digits, ".", "_" and "-", starting with a letter
+  or digit)`.
+- **Atomic claim, then the liveness check.** The parent opens the
+  per-job log and takes an exclusive non-blocking `flock` on that fd
+  *before* it consults any document; the claim is held by the live
+  grandchild (the inherited open file description survives the `dup2`
+  onto its stdout/stderr) and released by the kernel when it dies, so
+  there is no claim file to go stale. A second start is thereby refused
+  even when both start before either job document exists (two starts
+  used to pass the active-document check and truncate/write the same
+  log). If an **active** job document already exists for the app
+  (liveness rule below), the command refuses too: exit 1, error document
+  `an update job is already active for <desktop id> (pid <pid>); refusing
+  to start a second one` (pid omitted when only the claim said so) — the
+  running job's document is left untouched and its log is never reopened
+  for writing.
+- Otherwise the updater detaches as a grandchild (double `fork()`,
+  `setsid`, stdin from `/dev/null`, stdout+stderr into the per-job log)
+  and the parent reports `job-started` and exits **0** immediately; the
+  job survives the invoking process. No shell, no exec: the grandchild
+  continues the same process image.
+- Everything else plain `--update` reports — the running guard
+  (`skipped-running`), `up-to-date`, the download, digest verification,
+  the atomic replace, and the pending-notification-marker drop — happens
+  **inside the job** through the same shared update core, and is
+  published as the job document. A missing update source therefore
+  surfaces as a terminal `error` document, not a spawn-time failure.
+
+Real example output (job-started, exit 0):
+
+```json
+{"schema_version": 1, "result": "job-started", "desktop_id": "neovim.desktop", "job_path": "/home/user/.local/state/io.github.glasschan.appimage/jobs/neovim.json", "log_path": "/home/user/.local/state/io.github.glasschan.appimage/jobs/neovim.log", "pid": 12345}
+```
+
+#### Job documents
+
+One JSON document per app at
+`$XDG_STATE_HOME/io.github.glasschan.appimage/jobs/<desktop id stem>.json`
+(`$XDG_STATE_HOME` is honoured like `XDG_DATA_HOME`/`XDG_CONFIG_HOME`,
+default `~/.local/state`). Every rewrite is atomic (temp file +
+`os.replace`) — on every phase change and progress tick, plus a heartbeat
+refresh at least every 2 s (`JOB_HEARTBEAT_INTERVAL_SECONDS`).
+`schema_version` stays **1**.
+
+| Key | Type | Notes |
+|---|---|---|
+| `desktop_id` | string | The app's desktop id (e.g. `neovim.desktop`) |
+| `phase` | string | Writer-set: `starting` / `downloading` / `verifying` / `replacing` / `done` / `error`. Terminal: `done`, `error`. `verifying` is best-effort: sources without a `Content-Length` go straight from `downloading` to `replacing` |
+| `progress` | float | Download fraction 0.0–1.0 (1.0 from `replacing` on) |
+| `total_bytes` | int or null | Download size declared at the availability check; `null` when unknown. For `.zsync` sources that is the control file's size, so mid-download `downloaded_bytes` are approximate — the terminal value is exact |
+| `downloaded_bytes` | int | Derived from the fraction while downloading; exact once terminal |
+| `pid` | int | The detached job's process id |
+| `started`, `heartbeat` | float | Epoch seconds; `heartbeat` refreshes on every rewrite |
+| `message` | string | Human-readable phase/status text |
+| `status` | string or null | Terminal result: `updated` / `up-to-date` / `skipped-running` / `error`; `null` while running |
+| `new_version` | string or null | Installed release (`updated` jobs) |
+| `error` | string or null | Error text (`error` jobs); the traceback tail goes to the log, never into the document |
+
+**Liveness rule:** a job is **ACTIVE** if and only if its phase is
+non-terminal **and** its `pid` is alive **and** its `heartbeat` is
+fresher than `JOB_STALE_AFTER_SECONDS` = **120 s** (comfortably above the
+downloader's 30 s per-read stall guard). `interrupted` is **never
+written**: it is the reader-side classification for a non-terminal
+document that fails the rule (dead pid or stale heartbeat); unparsable
+documents classify the same way.
+
+The per-job log lives next to the document (`<stem>.log`, append mode)
+and is size-capped at 256 KiB (`JOB_LOG_MAX_BYTES`): an over-cap log is
+truncated by the next job that legitimately opens it (i.e. only under
+the held claim, so a refused start can never wipe a live job's log), and
+the running job drops it back to empty whenever it passes the cap
+(`JobWriter.enforce_log_cap`, driven by the 2 s heartbeat thread) — the
+log therefore always holds the most recent phase and never grows
+without bound.
+
+#### Document lifecycle (janitor sweep, additive)
+
+Every `--list-installed` and every async job start (in the spawning
+**parent**, before the fork — never inside the grandchild) runs a
+best-effort sweep that **never fails the command** and removes,
+silently (debug log only — there is no expiry notification):
+
+- **`--list-installed` is throttled**: it runs on the panel's 10 s poll
+  and a sweep is an unbounded `listdir` + `stat` walk of the shared temp
+  dir in the CLI's foreground, so the listing hook sweeps at most once
+  per `janitor.SWEEP_THROTTLE_SECONDS` = **300 s**
+  (`janitor.sweep_throttled()`, recorded in
+  `$XDG_STATE_HOME/io.github.glasschan.appimage/last-sweep` — the plugin
+  state dir, never the temp area the sweep cleans). A **missing or
+  corrupt marker sweeps** (the throttle is an optimisation, never a
+  precondition). An async job start still sweeps **unconditionally**
+  (`janitor.sweep()`), and both entry points share the same removal
+  semantics.
+
+- a **terminal** (`done`/`error`) or **`interrupted`** document — together
+  with its `<stem>.log` — once `JOB_ACK_WINDOW_SECONDS` = **24 h** have
+  passed since its last activity. The window clock is the document's
+  `heartbeat` (refreshed on every rewrite, so a terminal document's
+  heartbeat is its finished-at time and a dead job's is its last sign of
+  life); a document without a usable `heartbeat` (corrupt JSON, malformed
+  field) ages out from its **file mtime** under the same window.
+- an **`appimage-update-*` directory** in the temp area whose *effective
+  mtime* — its own mtime vs. the newest of its immediate entries (a live
+  download keeps writing its one file, so the file's mtime is the live
+  signal while the directory's own mtime goes stale at entry creation) —
+  is older than `UPDATE_TEMP_GRACE_SECONDS` = **600 s** (5× the 120 s
+  liveness threshold, 20× the downloader's 30 s per-read stall guard).
+  This disk-only rule reclaims legacy orphans from hard-killed pre-async
+  downloads, which carry neither a registry entry nor a job document. No
+  other prefix (`gearlever_appimage_*` above all) is ever touched, and
+  symlinks are never followed.
+
+**ACTIVE documents are never removed.** Readers may therefore rely on:
+a document they can read survives at least until 24 h after its last
+heartbeat; `read_job() == None` means "no job known" (never expired, and
+an expired one disappears rather than reading as `interrupted`).
+Removals are capped per sweep (`janitor.MAX_REMOVALS_PER_SWEEP` = 200)
+so a pathological state dir cannot grow unbounded removal work (the scan itself reads each document once).
+
 ### `--set-update-source <target> --manager <name> [key=value ...] [--unset] [--json]`
 
 Sets or removes a per-app custom update source (stored in `apps.ini` under
@@ -455,6 +590,7 @@ Real example output:
 | `--replace` | Replace the conflicting app instead of keeping both (integrate) |
 | `--keep-both` | Keep the old version when updating |
 | `--force` | Update even while the app is running |
+| `--async` | With `--update`: run the whole update as a detached background job and report `job-started` immediately (see the `--update --async` section) |
 | `--delete` | Bypass the trash (irreversible) |
 | `--help` / `-h` | Usage text, exit 0 |
 
@@ -643,6 +779,7 @@ meaning, so readers that ignore unknown keys are unaffected
 | `$XDG_CONFIG_HOME/io.github.glasschan.appimage/settings.json` | User settings |
 | `$XDG_CONFIG_HOME/io.github.glasschan.appimage/apps.ini` | Per-app metadata (`[app.<md5>]`) and update sources (`[app.<md5>.update_manager]`, `manager` + config keys, booleans stored as `true`/`false`), INI format compatible with GearLever |
 | `$XDG_CONFIG_HOME/io.github.glasschan.appimage/updates-state.json` | Last background-check signatures, `{desktop_id: "available_version|download_size"}` (desktop id falls back to the AppImage basename) |
+| `$XDG_STATE_HOME/io.github.glasschan.appimage/jobs/` | Background job documents (`<desktop id stem>.json`) and their size-capped logs (`<stem>.log`) written by `--update --async` |
 
 ### XDG override behaviour (required for tests/sandboxes)
 

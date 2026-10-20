@@ -58,12 +58,26 @@ def xdg_config_home() -> str:
     return os.path.join(home_dir(), '.config')
 
 
+def xdg_state_home() -> str:
+    """Respect $XDG_STATE_HOME (default ~/.local/state) — same env-or-
+    default pattern as xdg_data_home/xdg_config_home above. Hosts the
+    plugin's volatile state (background job documents and their logs)."""
+    value = os.environ.get('XDG_STATE_HOME')
+    if value:
+        return os.path.abspath(os.path.expanduser(value))
+    return os.path.join(home_dir(), '.local', 'state')
+
+
 def user_applications_dir() -> str:
     return os.path.join(xdg_data_home(), 'applications')
 
 
 def plugin_config_dir() -> str:
     return os.path.join(xdg_config_home(), APP_ID)
+
+
+def plugin_state_dir() -> str:
+    return os.path.join(xdg_state_home(), APP_ID)
 
 
 def settings_path() -> str:

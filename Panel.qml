@@ -7,6 +7,7 @@ import qs.Commons
 import qs.Ui
 import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
+import "lib/JobDocs.js" as JobDocs
 
 // Main AppImage manager surface.
 //
@@ -21,8 +22,10 @@ import "lib/Backend.js" as Backend
 // PanelKeyCatcher, exactly like the first-party panels.
 //
 // M1b wiring: every action runs backend/main.py (see backend/CONTRACT.md)
-// through the shared Process in this file — the long --update runs on its
-// own Process pair so it can never stomp a short call in flight —
+// through dedicated Process/Timer pairs in this file — a shared short-call
+// pair for refresh-style calls, a dedicated pair for the --update --async
+// spawn (so refresh traffic can never fail it synthetically) and the
+// python probe pair —
 // F1 list (cache-first, the
 // store renders instantly and refreshes in the background), F2 integrate
 // (inline picker: Quickshell ships no file dialog, so a path field, a
@@ -34,11 +37,15 @@ import "lib/Backend.js" as Backend
 // store).
 //
 // M2 wiring: F6 check updates (--list-updates with a long watchdog; the
-  // offline error document surfaces its own message), F7 one-click update
-  // per row (--update --yes, 10-minute timeout for large downloads), F9
-  // per-row update-source editors plus the F8 cadence knobs in a settings
-  // card toggled by the header gear. The F8 background service itself
-  // lives in Service.qml — this panel only edits what it runs on.
+// offline error document surfaces its own message), F7 one-click update
+  // per row as a DETACHED BACKGROUND JOB (--update --async: the spawn
+  // answers within milliseconds, the transfer runs outside this panel's
+  // process tree, and every row renders the app's on-disk job document —
+  // reader lib/JobDocs.js — so no in-memory flag can outlive a reload and
+  // no spinner can exist without a document behind it), F9 per-row
+  // update-source editors plus the F8 cadence knobs in a settings card
+  // toggled by the header gear. The F8 background service itself lives in
+  // Service.qml — this panel only edits what it runs on.
 Panel {
   id: root
   moduleName: "io.github.glasschan.appimage"
@@ -60,11 +67,13 @@ Panel {
   readonly property int staleAfterMs: 60000
   // Integrating means squashfs extraction + a file copy; give it room.
   readonly property int integrateTimeoutMs: 120000
+  // --integrate from a release URL downloads the whole AppImage inside
+  // this panel's process — the watchdog must outlast the transfer, not
+  // the UI. (--update no longer needs a long budget here: it runs as a
+  // detached background job and the spawn answers in milliseconds.)
+  readonly property int integrateUrlTimeoutMs: 600000
   // Update sweeps walk every configured release source over the network.
   readonly property int checkTimeoutMs: 120000
-  // F7 downloads can be a full AppImage; the backend replaces the file in
-  // place, so the watchdog must outlast the transfer, not the UI.
-  readonly property int updateTimeoutMs: 600000
   // --pick-file: the backend bounds probe + portal dialog + zenity under
   // one 600 s whole-operation deadline (CONTRACT.md); the watchdog matches
   // it instead of undercutting it, so a slow portal is never reaped while
@@ -89,14 +98,45 @@ Panel {
   // backend's desktop-notification expire time); errors never auto-hide.
   readonly property int statusTimeoutMs: 5000
 
+  // ---- background update jobs (F7 reworked, ticket #11) ----------------------
+  // Row update state is derived from the backend's on-disk job documents
+  // (CONTRACT.md "Job documents", reader lib/JobDocs.js): every open and
+  // every poll tick re-reads the documents, so a reload mid-download
+  // re-derives everything from disk and no spinner can outlive its doc.
+  readonly property int jobPollMs: 3000
+  // $XDG_STATE_HOME/io.github.glasschan.appimage/jobs (jobs.py's path rule;
+  // XDG_STATE_HOME defaults to ~/.local/state like XDG_DATA_HOME).
+  readonly property string jobsDir: (Quickshell.env("XDG_STATE_HOME")
+    || (homeDir + "/.local/state")) + "/io.github.glasschan.appimage/jobs"
+  // desktop_id → adopted decision (JobDocs shape), mirrored from the store
+  // so row bindings stay reactive; jobsBusy gates both polls below.
+  property var jobStates: ({})
+  property bool jobsBusy: false
+  // Sequential single-document read state for jobFileView: at most one
+  // job document is being read at any time (a FileView repointed mid-read
+  // aborts the old load, so the queue never races on one instance).
+  property var jobReadQueue: []
+  property string jobReadingId: ""
+  // Click grace (per id → Date.now()): a "no document" read landing
+  // within jobStartGraceMs of a job-started reply is a race with the
+  // grandchild's FIRST write, not evidence that nothing runs — during
+  // the grace it must not overwrite the provisional active decision
+  // (that would kill the spinner AND the poll before the document ever
+  // appears). Past the grace an absent document honestly means the job
+  // died before writing anything, and idle wins.
+  readonly property int jobStartGraceMs: 10000
+  property var jobStartGraces: ({})
+
   // Current Backend.run context (null while idle); the Process and Timer
   // signal handlers feed it back into lib/Backend.js.
   property var runCtx: null
 
-  // Dedicated Backend.run context for the long --update (null while idle):
-  // a 10-minute download must not occupy the shared short-call Process —
-  // mirror of Service.qml's fetchProc/settingsProc split.
-  property var updateCtx: null
+  // Backend.run context for the --update --async spawn (null while idle).
+  // The spawn owns a dedicated Process/Timer pair (updateSpawnProc below):
+  // routing it through the shared short-call pair instead would let any
+  // in-flight re-list or update check synthetically fail the click via
+  // callBackend's single flight.
+  property var updateSpawnCtx: null
 
   // ---- python3 dependency (authorized install) ------------------------------
   // The probe settles python presence once per open (and every second while
@@ -135,9 +175,6 @@ Panel {
   property bool busyPick: false
   property bool busyRemove: false
   property bool busyUpdates: false
-  // desktop_id of the in-flight --update ("" when idle) — rows compare it
-  // to dim every Update button and spin the updating one.
-  property string updatingId: ""
   property string lastError: ""
   property string statusText: ""
   property var unsubscribe: null
@@ -279,7 +316,14 @@ Panel {
     busyPick = Model.state.busy.pick === true
     busyRemove = Model.state.busy.remove === true
     busyUpdates = Model.state.busy.updates === true
-    updatingId = String(Model.state.busy.update || "")
+    // Per-row job views (ticket #11): mirror the adopted decisions into a
+    // reactive map — rows read jobStates[id] and nothing else.
+    var jobs = {}
+    for (var id in Model.state.jobStates) {
+      jobs[id] = Model.state.jobStates[id].decision
+    }
+    jobStates = jobs
+    jobsBusy = Model.anyJobActive()
     lastError = Model.state.lastError
     statusText = Model.state.status
     // A bar-widget drop waits here for an idle store (see
@@ -321,6 +365,11 @@ Panel {
         || Date.now() - Model.state.lastSyncMs > staleAfterMs) {
       refresh()
     }
+    // Adopt whatever the on-disk job documents say right now — this is
+    // the fossil-spinner fix: state comes from disk on EVERY open, so a
+    // reload mid-download re-renders the running job (or its
+    // interruption) instead of resurrecting an in-memory flag.
+    refreshJobStates()
     controller.show()
     Qt.callLater(function() {
       if (root.opened && keyCatcher) keyCatcher.forceActiveFocus()
@@ -560,6 +609,9 @@ Panel {
         reportFailure(result, "list")
       }
       syncFromModel()
+      // The row set may have changed (first-ever open, post-install):
+      // adopt the job documents for whatever is installed now.
+      refreshJobStates()
     })
   }
 
@@ -625,6 +677,12 @@ Panel {
   // repeat when two versions coexist, CONTRACT.md).
   function requestRemove(item) {
     if (!item) return
+    // A row whose detached update job is still downloading/replacing is
+    // not removable: the job installs where the AppImage sits, so a
+    // removal now would land the new release in a target that is already
+    // in the trash. Fail closed here as well as on the buttons (same
+    // shape as updateItem's per-app single-flight guard).
+    if (root.jobActive(item.id)) return
     if (confirmRemoveId !== item.id) {
       confirmRemoveId = item.id
       confirmResetTimer.restart()
@@ -670,10 +728,10 @@ Panel {
     Model.setStatus(strings.integrateWorking)
     syncFromModel()
     // A GitHub release URL install downloads the whole AppImage first;
-    // give it the same long budget as --update so the watchdog doesn't
-    // reap a big transfer. Local paths keep the fast extract budget.
+    // give it the long transfer budget so the watchdog doesn't reap a
+    // big download. Local paths keep the fast extract budget.
     var timeout = /^https?:\/\//i.test(trimmed)
-      ? updateTimeoutMs : integrateTimeoutMs
+      ? integrateUrlTimeoutMs : integrateTimeoutMs
     callBackend(["--integrate", trimmed, "--yes", "--json"],
         { timeoutMs: timeout }, function(result) {
       Model.setBusy("integrate", false)
@@ -732,61 +790,202 @@ Panel {
     })
   }
 
-  // F7: run --update in place. No confirm — the backend replaces the
-  // AppImage where it sits and refuses when the app is running
-  // (result "skipped-running", shown as status, not error).
+  // F7: one-click update as a DETACHED BACKGROUND JOB. The click only
+  // spawns: `--update --async` answers job-started (exit 0) or an error
+  // document (exit 1 — e.g. the active-job refusal) within milliseconds.
+  // The spawn runs on its OWN Process/Timer pair (updateSpawnProc below)
+  // with the default 15 s watchdog — never through callBackend, whose
+  // single flight would synthetically fail the spawn whenever the shared
+  // short-call pair is busy (a 10 s re-list poll, a 120 s --list-updates
+  // check). The transfer itself runs outside this panel's process tree
+  // and reaches the row through its job document. No confirm — the
+  // backend replaces the AppImage where it sits; the running-app guard
+  // and "up-to-date" now surface as terminal job documents, not
+  // spawn-time results.
   function updateItem(item) {
     if (!item || item.id === "") return
-    if (Model.state.busy.update !== "") return
+    // Per-app single flight: a row with an active job refuses here (the
+    // button is disabled too; the backend refuses a second job for the
+    // same app regardless). Other rows are never blocked — different
+    // apps update in parallel.
+    if (root.jobActive(item.id)) return
     if (backendCommand.length === 0) {
       Model.setError(strings.backendMissing)
       syncFromModel()
       return
     }
+    // Single flight on the spawn pair itself: a second --update --async
+    // while one spawn is still answering would overwrite updateSpawnCtx
+    // and misroute the first reply (same guard as callBackend's).
+    if (root.updateSpawnCtx && root.updateSpawnCtx.active === true) return
     Model.clearError()
-    Model.setUpdatingId(item.id)
     Model.setStatus(Model.formatCount(item.name, strings.updating))
     syncFromModel()
-    // Dedicated Process/Timer pair: the transfer runs for up to ten
-    // minutes, so it must not occupy backendProc — refresh/settings calls
-    // stay possible meanwhile (callBackend's guard fails them cleanly
-    // rather than stomping this context). Two concurrent --update calls
-    // stay impossible through the setUpdatingId guard above.
-    var ctx = Backend.run(updateProc, updateTimer, backendCommand,
-        ["--update", item.id, "--yes", "--json"],
-        { timeoutMs: updateTimeoutMs }, function(result) {
-      Model.setUpdatingId("")
+    // Default watchdog on purpose: this call is over in milliseconds.
+    var ctx = Backend.run(updateSpawnProc, updateSpawnTimer, backendCommand,
+        ["--update", item.id, "--yes", "--json", "--async"], {},
+        function(result) {
+      root.updateSpawnCtx = null
       if (result.ok) {
-        var action = Model.parseActionJson(result.stdout)
-        if (action.ok) {
-          if (action.result === "updated") {
-            var version = action.app && action.app.updateVersion !== ""
-              ? action.app.updateVersion : item.updateVersion
-            // A version the backend could not resolve falls back to the
-            // action's own message — never "Updated to " with an empty %1.
-            Model.setStatus(version !== ""
-              ? Model.formatCount(version, strings.updated)
-              : action.message)
-          } else if (action.message !== "") {
-            // "up-to-date" / "skipped-running" carry the user-facing copy.
-            Model.setStatus(action.message)
-          } else {
-            Model.setStatus(action.result === "up-to-date"
-              ? strings.upToDate : strings.skippedRunning)
-          }
-          Model.clearError()
+        var doc = Backend.parseJson(result.stdout)
+        if (doc && doc.result === "job-started") {
+          // The row may spin before the job's first document write
+          // lands: adopt a provisional active decision and read the
+          // real document right away. Every later state — including
+          // "the job died before writing anything" — arrives as a
+          // document decision and replaces this, so the spinner can
+          // never outlive its document.
+          root.jobStartGraces[item.id] = Date.now()
+          Model.adoptJobDecision(item.id,
+            JobDocs.provisionalActiveDecision(item.id))
         } else {
-          Model.setError(action.error !== "" ? action.error : strings.backendFailed)
+          // job-started is the only success shape --async reports.
+          Model.setError(strings.backendFailed + " (update)")
         }
       } else {
+        // Refusals arrive as error documents — the backend's own message
+        // (the active-job refusal names the pid) surfaces verbatim.
         reportFailure(result, "update")
       }
       syncFromModel()
-      // The AppImage (and its desktop entry's version) just changed:
-      // re-list so names, versions and manager columns stay truthful.
-      refresh()
+      // Converge the row with whatever its job document says now — the
+      // refusal case too, where the already-running job's document is
+      // exactly what the row should show.
+      root.queueJobRead(item.id)
+      root.pumpJobReads()
     })
-    updateCtx = ctx && ctx.active ? ctx : null
+    // A synchronous onDone (no-backend-command) has already finished by
+    // the time this line runs; ctx.active is false then, the ctx stays
+    // null — same convention as probePython.
+    updateSpawnCtx = ctx && ctx.active ? ctx : null
+  }
+
+  // ---- background update jobs: document reads + adoption (ticket #11) -------
+
+  // True while THIS row renders an active job (spinner + progress). The
+  // only source is the adopted document view — never a click flag.
+  function jobActive(id) {
+    var d = root.jobStates[id]
+    return !!d && d.state === "active"
+  }
+
+  // Queue every installed app's job document for adoption. Called on every
+  // panel open, whenever the installed list lands, and by the job poll;
+  // the queue drains one document at a time through jobFileView.
+  function refreshJobStates() {
+    for (var i = 0; i < root.items.length; i++) {
+      root.queueJobRead(root.items[i].id)
+    }
+    root.pumpJobReads()
+  }
+
+  function queueJobRead(id) {
+    if (id === "" || root.jobReadingId === id) return
+    if (root.jobReadQueue.indexOf(id) !== -1) return
+    root.jobReadQueue.push(id)
+  }
+
+  function pumpJobReads() {
+    if (root.jobReadingId !== "" || root.jobReadQueue.length === 0) return
+    var id = String(root.jobReadQueue.shift())
+    var path = JobDocs.jobDocumentPath(root.jobsDir, id)
+    if (path === "") {
+      // Unusable desktop id: jobs.py's stem rule means no document can
+      // exist for it — adopt the idle decision and move on.
+      root.adoptJob(id, root.idleParsed())
+      root.pumpJobReads()
+      return
+    }
+    root.jobReadingId = id
+    jobReadWatchdog.restart()
+    // Clear-then-set (the Service.qml jobView idiom): an equal-value
+    // property write fires no change signal, so re-pointing the view at
+    // the SAME document — a single-app install re-queues its one id every
+    // poll tick — would never reload and hang the read until the watchdog
+    // retired it without adopting anything.
+    jobFileView.path = ""       // force a re-read even when the previous
+    jobFileView.path = path     // read pointed at this same document
+  }
+
+  // The "no document" parse result (file missing, or an id that cannot
+  // name one): JobDocs.adoptJob(null) is the idle decision — idle is ONLY
+  // ever adopted from an absent document, never from a corrupt one.
+  function idleParsed() {
+    return { parseError: "", heartbeat: 0,
+             decision: JobDocs.adoptJob(null, true, Date.now()) }
+  }
+
+  // Store one adopted decision and surface any non-active outcome. The
+  // desktopId check keeps a document that names another app from ever
+  // dressing this row (paranoia: the read path was built from the row's
+  // own id, but the check is JobDocs's stated adoption contract).
+  function adoptJob(id, parsed) {
+    if (parsed.decision.desktopId !== "" && parsed.decision.desktopId !== id) {
+      parsed = root.idleParsed()
+    }
+    // Click grace: do not let an early "no document" read overwrite a
+    // provisional active decision — see jobStartGraces above.
+    if (parsed.decision.state === "idle" && root.jobActive(id)
+        && Date.now() - (root.jobStartGraces[id] || 0) < root.jobStartGraceMs) {
+      return
+    }
+    root.jobStartGraces[id] = 0
+    Model.adoptJobDecision(id, parsed.decision)
+    syncFromModel()
+    var entry = Model.jobEntry(id)
+    root.surfaceJobOutcome(id, parsed, entry ? entry.consumed : 0)
+  }
+
+  // Terminal and interrupted outcomes surface ONCE per sign-of-life (the
+  // document's heartbeat; a corrupt document has none, so -1 marks its
+  // once-per-session banner). Active needs no surfacing — the row shows
+  // it; idle has nothing to say.
+  function surfaceJobOutcome(id, parsed, consumed) {
+    var d = parsed.decision
+    if (d.state === "active" || d.state === "idle") return
+    var seen = parsed.heartbeat > 0
+      ? consumed === parsed.heartbeat : consumed === -1
+    if (seen) return
+    Model.markJobConsumed(id, parsed.heartbeat > 0 ? parsed.heartbeat : -1)
+    if (d.state === "done") {
+      // "updated" changed the AppImage (and its desktop entry's version):
+      // re-list so names, versions and manager columns stay truthful.
+      if (d.status === "updated") {
+        Model.setStatus(d.newVersion !== ""
+          ? Model.formatCount(d.newVersion, strings.updated)
+          : d.message)
+        refresh()
+      } else if (d.status === "up-to-date") {
+        Model.setStatus(d.message !== "" ? d.message : strings.upToDate)
+      } else if (d.status === "skipped-running") {
+        Model.setStatus(d.message !== "" ? d.message : strings.skippedRunning)
+      } else if (d.message !== "") {
+        Model.setStatus(d.message)
+      }
+    } else if (d.state === "error") {
+      Model.setError(d.errorText !== ""
+        ? d.errorText
+        : (d.message !== "" ? d.message : strings.backendFailed))
+    } else { // interrupted: dead updater or a heartbeat stale past 120 s
+      Model.setError(strings.jobInterrupted)
+    }
+    syncFromModel()
+  }
+
+  // Per-row progress label: percent from the document's progress fraction
+  // (the trustworthy live signal), byte pair only when the declared total
+  // is plausibly the payload (JobDocs.bytesSane — a zsync source declares
+  // its control file's size, and a kilobyte "total" under a truthful
+  // percent reads as a lie).
+  function jobProgressLabel(id) {
+    var d = root.jobStates[id]
+    if (!d || d.state !== "active") return ""
+    var label = Math.round((d.progress || 0) * 100) + "%"
+    if (JobDocs.bytesSane(d.totalBytes)) {
+      label += " · " + JobDocs.formatBytes(d.downloadedBytes)
+        + " / " + JobDocs.formatBytes(d.totalBytes)
+    }
+    return label
   }
 
   // ---- settings card (F8 cadence) -------------------------------------------
@@ -1419,6 +1618,40 @@ Panel {
     onTriggered: Backend.handleTimeout(root.runCtx)
   }
 
+  // Dedicated spawn pair for --update --async (F7): the click must never
+  // queue behind the shared backendProc's single flight — a 10 s re-list
+  // poll or a 120 s --list-updates check in flight would synthetically
+  // fail the spawn (a spurious error banner and a lost click). Same
+  // declarative wiring as backendProc; the default 15 s watchdog bounds
+  // only the spawn itself, never the detached transfer.
+  Process {
+    id: updateSpawnProc
+    command: []
+    stdout: StdioCollector {
+      id: updateSpawnStdout
+      waitForEnd: true
+      // streamed producer-side bound (see Backend.feedStream)
+      onRead: function(data) { Backend.feedStream(root.updateSpawnCtx, "stdout", data) }
+    }
+    stderr: StdioCollector {
+      id: updateSpawnStderr
+      waitForEnd: true
+      onRead: function(data) { Backend.feedStream(root.updateSpawnCtx, "stderr", data) }
+    }
+    // Proof of spawn: separates "python3 missing" (never started) from
+    // "ran and failed" in the failure reporting above.
+    onStarted: Backend.markStarted(root.updateSpawnCtx)
+    onExited: function(exitCode) {
+      Backend.handleExit(root.updateSpawnCtx, exitCode, updateSpawnStdout.text, updateSpawnStderr.text)
+    }
+  }
+
+  Timer {
+    id: updateSpawnTimer
+    repeat: false
+    onTriggered: Backend.handleTimeout(root.updateSpawnCtx)
+  }
+
   // ---- python3 dependency plumbing -------------------------------------------
   // A dedicated probe Process (it must answer even while a backend call is
   // failing or in flight), the install pair — a short prep that re-validates
@@ -1552,33 +1785,76 @@ Panel {
     onTriggered: root.probePython()
   }
 
-  // Long-op pair for --update (F7), kept separate from backendProc so a
-  // download never fights the short calls for one Process (same split as
-  // Service.qml's fetchProc/settingsProc).
-  Process {
-    id: updateProc
-    command: []
-    stdout: StdioCollector {
-      id: updateStdout
-      waitForEnd: true
-      // streamed producer-side bound (see Backend.feedStream)
-      onRead: function(data) { Backend.feedStream(root.updateCtx, "stdout", data) }
+  // ---- background update jobs: the reader plumbing (ticket #11) --------------
+  // One reusable FileView drains the document queue: pumpJobReads points
+  // it at one job document at a time (a path change aborts any in-flight
+  // read, so the sequential queue never races on the instance), and the
+  // handlers adopt the result. loadFailed means "no document" — the file
+  // is missing, the normal case for an app that never ran a background
+  // update — which adopts idle. A present-but-corrupt file READS fine and
+  // adopts interrupted instead (JobDocs's no-document/corrupt split).
+  // preload keeps every read asynchronous; printErrors stays off because
+  // a missing document is idle, not an error worth a log line.
+  FileView {
+    id: jobFileView
+    path: ""
+    preload: true
+    printErrors: false
+    onLoaded: {
+      var id = root.jobReadingId
+      root.jobReadingId = ""
+      jobReadWatchdog.stop()
+      // The path guard retires a superseded read: only the document the
+      // queue actually pointed at may adopt. `null` is the pid argument
+      // this panel can actually stand behind: QML cannot probe a pid
+      // (the third JobDocs state, "caller cannot probe"), so the heartbeat
+      // rule decides alone — asserting `true` would claim a probe that
+      // never happened and make pidDead unreachable.
+      if (id !== "" && jobFileView.path === JobDocs.jobDocumentPath(root.jobsDir, id)) {
+        root.adoptJob(id, JobDocs.adoptDocumentForPanel(jobFileView.text(), null, Date.now()))
+      }
+      root.pumpJobReads()
     }
-    stderr: StdioCollector {
-      id: updateStderr
-      waitForEnd: true
-      onRead: function(data) { Backend.feedStream(root.updateCtx, "stderr", data) }
-    }
-    onStarted: Backend.markStarted(root.updateCtx)
-    onExited: function(exitCode) {
-      Backend.handleExit(root.updateCtx, exitCode, updateStdout.text, updateStderr.text)
+    onLoadFailed: {
+      var id = root.jobReadingId
+      root.jobReadingId = ""
+      jobReadWatchdog.stop()
+      // Same superseded-read guard as onLoaded: a failure report for a
+      // read the queue has already repointed away from must not adopt
+      // idle for the wrong id.
+      if (id !== "" && jobFileView.path === JobDocs.jobDocumentPath(root.jobsDir, id)) {
+        root.adoptJob(id, root.idleParsed())
+      }
+      root.pumpJobReads()
     }
   }
 
+  // Read watchdog: a job document is a tiny local JSON file and a failed
+  // read reports through loadFailed; if a reader ever wedges anyway,
+  // retire it (5 s is generous) so the queue — and the progress UI it
+  // feeds — keeps moving. A stuck read must never fossilize.
   Timer {
-    id: updateTimer
+    id: jobReadWatchdog
+    interval: 5000
     repeat: false
-    onTriggered: Backend.handleTimeout(root.updateCtx)
+    onTriggered: {
+      if (root.jobReadingId === "") return
+      root.jobReadingId = ""
+      root.pumpJobReads()
+    }
+  }
+
+  // The job poll: only while the panel is open AND at least one row
+  // carries a non-idle decision, re-read every job document at jobPollMs
+  // (3 s — the writer heartbeats every 2 s, the contract goes stale at
+  // 120 s). An idle panel runs no poll and performs no reads at all; the
+  // binding drops when the last active job adopts a terminal decision.
+  Timer {
+    id: jobPoll
+    interval: root.jobPollMs
+    repeat: true
+    running: root.opened && root.jobsBusy
+    onTriggered: root.refreshJobStates()
   }
 
   Timer {
@@ -1599,14 +1875,15 @@ Panel {
   // flag otherwise goes stale forever if the app is closed outside this panel
   // (explicit Refresh / reopen / post-launch settle are the only other
   // refresh paths). The running binding auto-pauses while any backend
-  // operation is in flight and resumes after; refresh()'s own busy guard
-  // makes a racing trigger a no-op anyway.
+  // operation — including a live background update job — is in flight and
+  // resumes after; refresh()'s own busy guard makes a racing trigger a
+  // no-op anyway.
   Timer {
     id: runningPollTimer
     interval: 10000
     repeat: true
     running: root.opened && !root.busyList && !root.busyIntegrate && !root.busyRemove
-      && !root.busyPick && !root.busyUpdates && root.updatingId === ""
+      && !root.busyUpdates && !root.busyPick && !root.jobsBusy
       && !root.settingsBusy && !root.sourceBusy
     onTriggered: root.refresh()
   }
@@ -2599,6 +2876,20 @@ Panel {
                                 font.family: root.fontFamily
                                 font.pixelSize: Style.font.caption
                               }
+
+                              // F7 background job (ticket #11): live
+                              // progress for this row's running update —
+                              // percent plus a byte pair when the source
+                              // declared a payload-sized total. The
+                              // label exists only while the adopted
+                              // document says active.
+                              Text {
+                                visible: root.jobActive(rowOuter.modelData.id)
+                                text: root.jobProgressLabel(rowOuter.modelData.id)
+                                color: Color.accent
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                              }
                             }
 
                             // F9: configured update source under the row's meta.
@@ -2645,13 +2936,16 @@ Panel {
 
                             // F7: one-click update, shown only once a
                             // pending release is known for the row.
-                            // Single flight: every button dims
-                            // while one download runs, and the row being
-                            // updated loops its arrow upward.
+                            // Per-app single flight (ticket #11): only
+                            // THIS row's button dims and loops its arrow
+                            // while its job runs — other rows keep
+                            // launching/updating in parallel, and the
+                            // state behind the flag is the app's job
+                            // document, not a click.
                             PanelActionButton {
                               id: updateButton
                               visible: rowOuter.modelData.updateVersion !== ""
-                              enabled: root.updatingId === ""
+                              enabled: !root.jobActive(rowOuter.modelData.id)
                               tooltipText: root.strings.updateAction
                               foreground: root.foreground
                               hoverColor: Color.accent
@@ -2680,7 +2974,7 @@ Panel {
                                 }
 
                                 SequentialAnimation {
-                                  running: root.updatingId === rowOuter.modelData.id
+                                  running: root.jobActive(rowOuter.modelData.id)
                                   loops: Animation.Infinite
 
                                   ParallelAnimation {
@@ -2764,6 +3058,9 @@ Panel {
 
                             // Two-click inline remove (F3): first click arms
                             // "Remove?" on this row only, second click runs it.
+                            // Blocked while this row's update job runs: the
+                            // job is installing over the AppImage, so a
+                            // remove would delete the target under it.
                             Button {
                               visible: root.confirmRemoveId === rowOuter.modelData.id
                               text: root.strings.removeConfirm
@@ -2773,13 +3070,17 @@ Panel {
                               fontFamily: root.fontFamily
                               fontSize: Style.font.caption
                               implicitHeight: root.controlHeight
-                              enabled: !root.busyRemove
+                              enabled: !root.busyRemove && !root.jobActive(rowOuter.modelData.id)
                               onClicked: root.requestRemove(rowOuter.modelData)
                             }
 
                             PanelActionButton {
                               id: removeButton
                               visible: root.confirmRemoveId !== rowOuter.modelData.id
+                              // same per-row gate as the update button: only
+                              // THIS row dims while ITS job runs (other rows
+                              // stay removable)
+                              enabled: !root.jobActive(rowOuter.modelData.id)
                               tooltipText: root.strings.removeTooltip
                               foreground: root.foreground
                               hoverColor: root.urgent

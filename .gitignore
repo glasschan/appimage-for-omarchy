@@ -38,3 +38,5 @@ Thumbs.db
 # NOTE: design/cover.html + panel.png ARE tracked — they are the cover
 # pipeline sources (see AGENTS.md preview pipeline).
 docs/MARKETPLACE.md
+.scratch/
+AGENTS.md

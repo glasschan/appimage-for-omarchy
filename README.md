@@ -154,6 +154,7 @@ python3 backend/main.py --pick-file --json
 python3 backend/main.py --remove <desktop-id> --yes --json
 python3 backend/main.py --list-updates --json
 python3 backend/main.py --update <desktop-id> --yes --json
+python3 backend/main.py --update <desktop-id> --yes --json --async
 python3 backend/main.py --set-update-source <desktop-id> --manager StaticFileUpdater url=https://example.com/app.AppImage --json
 python3 backend/main.py --get-update-source <desktop-id> --json
 python3 backend/main.py --list-update-managers --json
@@ -277,6 +278,27 @@ compatible INI); global settings in `…/settings.json` —
 `update_check_enabled`, `update_check_interval_minutes` (minimum 15) and
 `update_check_delay_minutes`, all writable via `--set-setting`.
 
+### Updating
+
+**Check updates** sweeps every configured source and marks each row with
+a pending release; the row's Update button starts the update as a
+**detached background job** (the `--update --async` form above) — the
+panel stays responsive, several apps
+can update at once, and a running job never blocks anything else. While
+a job runs, its row shows live progress (percent, plus a byte pair when
+the source declares a real download size). A job's state lives in a
+small document on disk (`$XDG_STATE_HOME/io.github.glasschan.appimage/
+jobs/`), so closing the panel — or restarting the shell mid-download —
+loses nothing: reopening shows the job still running, and a job whose
+updater died (or whose heartbeat went quiet) shows an interrupted notice
+with the Update button ready to retry. Outcomes show in the panel as
+they finish, and the background checker announces new updates and
+outcomes with desktop notifications. A janitor sweep expires settled job
+documents (and their logs) after 24 h. While a row's job is still
+running its Remove button stays disabled — the job installs over that
+AppImage, so removing it mid-flight would leave the new release with no
+target (the armed "Remove?" confirm honours the same block).
+
 ## Plugin layout
 
 ```
@@ -288,6 +310,7 @@ Service.qml       Background update checker (scheduled --fetch-updates sweeps)
 ThemeIcon.qml     Theme-colored tabler icon (runtime currentColor tint)
 lib/Model.js      Shared state store (items cache, counts, busy flags, JSON mapping)
 lib/Backend.js    Process wrapper for the backend CLI (watchdog, tolerant JSON parse)
+lib/JobDocs.js    Update-job document reader (parse, classify, adopt — node-tested decision table)
 icons/            Bundled tabler SVGs (cube-unfolded, plus, refresh, trash, player-play, settings, arrow-up, cloud-download, pin; MIT) + LICENSE-TABLER.md
 backend/          Python stdlib CLI (derived from GearLever)
 ```
@@ -304,6 +327,24 @@ named after the plugin id), and publishes a GitHub Release with
 auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
+
+### 0.8.0
+
+- Updates run as **detached background jobs**: the row's Update button
+  spawns `--update --async`, the panel stays responsive, several apps
+  update in parallel, and a job survives closing the panel or restarting
+  the shell — reopening shows live progress, an interrupted notice with
+  a working retry, or the finished outcome. Job state is a small
+  per-app document under `$XDG_STATE_HOME/io.github.glasschan.appimage/jobs/`;
+  a janitor sweep expires settled documents (and their logs) after 24 h
+  and removes orphaned partial downloads.
+- The background checker announces job outcomes (updated / failed /
+  interrupted) with desktop notifications.
+- The row's Remove button is blocked while that row's update job is
+  still running (the job installs over the AppImage it would delete).
+- New CLI surface: `--update <target> --async` (job-started document),
+  documented in `backend/CONTRACT.md` together with the job-document
+  schema and the job liveness rule.
 
 ### 0.7.0
 
