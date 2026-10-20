@@ -80,7 +80,13 @@ class OfflineCliTests(FakeXDGTestCase):
         result = self.run_cli('--list-installed', '--json')
         self.assertEqual(result.returncode, 0)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload, {'schema_version': 1, 'installed': []})
+        # the additive runtime block (schema_version stays 1): the e2e
+        # run probes the real host, so only the vocabulary is pinned
+        # here — the state matrix itself is unit-tested against fakes
+        self.assertEqual(payload['installed'], [])
+        self.assertEqual(set(payload['runtime']), {'fuse2'})
+        self.assertIn(payload['runtime']['fuse2'],
+                      ('present', 'missing', 'unknown'))
 
     def test_list_installed_json_schema(self):
         appimage, desktop, _icon = self._install_fake_app()
@@ -105,6 +111,12 @@ class OfflineCliTests(FakeXDGTestCase):
         self.assertFalse(app['running'])
         # the fake desktop entry carries no Exec arguments
         self.assertEqual(app['exec_arguments'], '')
+
+        # the runtime block rides every successful envelope, with or
+        # without installed apps
+        self.assertEqual(set(payload['runtime']), {'fuse2'})
+        self.assertIn(payload['runtime']['fuse2'],
+                      ('present', 'missing', 'unknown'))
 
     def test_json_stdout_is_pure(self):
         self._install_fake_app()
@@ -163,6 +175,45 @@ class OfflineCliTests(FakeXDGTestCase):
         result = self.run_cli('--integrate', '/nonexistent.appimage',
                               '--yes')
         self.assertEqual(result.returncode, 1)
+
+
+class RuntimeBlockCliTests(InProcessCliMixin, FakeXDGTestCase):
+    """The additive `runtime` envelope block on --list-installed --json
+    (schema_version stays 1): best-effort fuse2 states for the panel's
+    launch-failure banner. The probe runs once per call, never per app,
+    and can never fail the listing."""
+
+    def test_envelope_carries_runtime_fuse2(self):
+        with mock.patch.object(utils, 'probe_fuse2',
+                               return_value='missing'):
+            out, _err, code = self.run_cmd(cli.cmd_list_installed, ['--json'])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload['schema_version'], 1)
+        self.assertEqual(payload['runtime'], {'fuse2': 'missing'})
+
+    def test_probe_runs_once_per_call_not_per_app(self):
+        self.install_fake_app()
+        self.install_fake_app('secondapp', 'Second App')
+        with mock.patch.object(utils, 'probe_fuse2',
+                               return_value='present') as probe:
+            out, _err, code = self.run_cmd(cli.cmd_list_installed,
+                                           ['--json'])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(len(payload['installed']), 2)
+        self.assertEqual(probe.call_count, 1)
+
+    def test_probe_crash_keeps_call_successful(self):
+        # belt and braces: probe_fuse2 never raises by contract, but a
+        # crash must still not fail the listing — the block is always
+        # present, worst case with 'unknown'
+        with mock.patch.object(utils, 'probe_fuse2',
+                               side_effect=RuntimeError('boom')):
+            out, _err, code = self.run_cmd(cli.cmd_list_installed, ['--json'])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload['runtime'], {'fuse2': 'unknown'})
 
 
 class ExecArgumentsCliTests(FakeXDGTestCase):

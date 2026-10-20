@@ -5,6 +5,7 @@
 # ported from src/lib/utils.py; Gio/Gtk/dbus helpers are dropped and the
 # subprocess helpers always use argument lists (never `sh -c`).
 
+import glob
 import hashlib
 import logging
 import os
@@ -274,3 +275,102 @@ def gnu_naturalsize(value: int, precision: int = 1) -> str:
 
     v = value / math.pow(base, i)
     return f"{v:.{precision}f} {suffixes[i]}"
+
+
+# ------------------------------------------------------------ fuse2 probe
+#
+# The fuse2 runtime probe (spec #14, ticket #17): type-2 AppImages need
+# libfuse.so.2 to launch; when it is absent the panel's launch-failure
+# banner can name the likely cause instead of a generic error. The probe
+# is best-effort only — it NEVER raises and NEVER fails a caller; a state
+# it cannot decide is reported as 'unknown'.
+
+FUSE2_SONAME = 'libfuse.so.2'
+
+# `ldconfig -p` prints the dynamic-linker cache as one
+# "<soname> (<abi>) => <path>" line per entry; a missing binary, a
+# non-zero exit or a timeout only degrades the probe to the directory
+# globs below — never an error.
+FUSE2_CACHE_COMMAND = ['ldconfig', '-p']
+
+# Standard library directories: the multiarch dir, lib64 and lib under
+# the usual roots, scanned with the glob FUSE2_SONAME + '*'.
+_FUSE2_LIB_SUBDIRS = ('lib/x86_64-linux-gnu', 'lib64', 'lib')
+FUSE2_LIB_DIRS = tuple(root + sub
+                       for root in ('/', '/usr/', '/usr/local/')
+                       for sub in _FUSE2_LIB_SUBDIRS)
+
+FUSE2_PRESENT = 'present'
+FUSE2_MISSING = 'missing'
+FUSE2_UNKNOWN = 'unknown'
+
+
+def _cache_has_fuse2(cache_output: str) -> bool:
+    """True when the ldcache listing carries a libfuse.so.2 entry.
+
+    Match on the entry's first token (the soname column): the summary
+    line and near-miss sonames (libfuse3.so.3, libfuse.so.20) never
+    match."""
+    for line in cache_output.splitlines():
+        tokens = line.split()
+        if tokens and tokens[0] == FUSE2_SONAME:
+            return True
+    return False
+
+
+def _fuse2_in_lib_dirs(lib_dirs) -> bool:
+    """True when any standard library directory holds the soname file
+    (libfuse.so.2) or a real-file name behind it (libfuse.so.2.9.9).
+    Absent directories are the normal case — glob just finds nothing."""
+    for directory in lib_dirs:
+        if glob.glob(os.path.join(directory, FUSE2_SONAME + '*')):
+            return True
+    return False
+
+
+def probe_fuse2(cache_output: str = None, cache_command: list = None,
+                lib_dirs=None) -> str:
+    """Best-effort fuse2 runtime check: FUSE2_PRESENT, FUSE2_MISSING or
+    FUSE2_UNKNOWN. One linker-cache read plus a few globs, once per
+    caller (the installed-list envelope probes once per call, never per
+    app).
+
+    Signal order:
+      1. the dynamic-linker cache (`ldconfig -p`, best-effort): a
+         libfuse.so.2 entry is decisive ('present');
+      2. otherwise the standard library directories are globbed — a hit
+         is decisive too ('present', even when the cache phase failed);
+         no hit after a *successful* cache read is 'missing'.
+
+    The cache phase failing (binary absent, non-zero exit, timeout) is
+    not an error: the globs still run and, without a glob hit, the
+    verdict is 'unknown' (the primary evidence source was unavailable).
+    The function NEVER raises; any unexpected failure is logged and
+    reported as 'unknown'.
+
+    Tests pin behaviour with fakes (the host's real fuse2 state is never
+    depended on): `cache_output` stands in for the `ldconfig -p` stdout
+    (the command is then not run), `cache_command` replaces the command
+    (point it at something failing to fake an unavailable cache),
+    `lib_dirs` replaces FUSE2_LIB_DIRS."""
+    try:
+        if cache_output is None:
+            try:
+                result = run_command(cache_command or FUSE2_CACHE_COMMAND,
+                                     check=False, timeout=10)
+            except Exception as e:
+                logging.debug('fuse2 probe: linker cache unavailable: %s', e)
+                result = None
+            if result is not None and result.returncode == 0:
+                cache_output = result.stdout.decode(errors='replace')
+
+        cache_phase_ok = cache_output is not None
+        if cache_phase_ok and _cache_has_fuse2(cache_output):
+            return FUSE2_PRESENT
+
+        if _fuse2_in_lib_dirs(lib_dirs or FUSE2_LIB_DIRS):
+            return FUSE2_PRESENT
+        return FUSE2_MISSING if cache_phase_ok else FUSE2_UNKNOWN
+    except Exception:
+        logging.exception('fuse2 probe failed')
+        return FUSE2_UNKNOWN

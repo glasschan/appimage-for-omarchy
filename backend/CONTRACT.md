@@ -17,7 +17,10 @@ python3 <plugin_dir>/backend/main.py [OPTION]...
   `zstd` CLI is used only on Python < 3.14 for zstd-compressed AppImages;
   `update-desktop-database` and `ps` are called best-effort and failures are
   ignored. `notify-send` is used best-effort by `--fetch-updates` only
-  (a missing binary just means no notification, never a failure).
+  (a missing binary just means no notification, never a failure), and
+  `ldconfig -p` is used best-effort by `--list-installed` only (a missing
+  binary or a non-zero exit just degrades the fuse2 probe to the library
+  directory globs — never a failure).
 - The AppImage is **never executed** (metadata is read with a built-in
   squashfs reader; updates download and re-integrate the new file).
 - `OMARCHY_APPIMAGE_DEBUG=1` enables debug logging (stderr), including
@@ -50,6 +53,28 @@ is gone is **not** listed as installed. It is logged on stderr instead
 AppImage: <path> (remove it with --remove <desktop id>)`), so the user can
 reclaim the file — the record itself is removed only on an explicit
 `--remove <desktop id> --yes`.
+
+**`runtime` block (fuse2).** Every successful JSON envelope also carries an
+additive `runtime` block: `{"fuse2": <state>}` with exactly one of
+
+| State | Meaning |
+|---|---|
+| `present` | the `libfuse.so.2` shared object was found (type-2 AppImages can launch) |
+| `missing` | the probe ran to a decision and the library is absent |
+| `unknown` | the probe could not decide (see below) — never an error |
+
+The probe is best-effort and cheap (one linker-cache read + a few globs,
+once per call, never per app). Signal order: the dynamic-linker cache
+(`ldconfig -p`) first — a `libfuse.so.2` entry is decisive; otherwise the
+standard library directories (`lib/x86_64-linux-gnu`, `lib64`, `lib` under
+`/`, `/usr`, `/usr/local`) are globbed for `libfuse.so.2*` — a hit is
+decisive too (even when the cache phase failed). No glob hit after a
+*successful* cache read reports `missing`; a failed cache phase (binary
+absent, non-zero exit) with no glob hit reports `unknown`. Probing never
+errors the call: the block is always present and any unexpected probe
+failure is logged and reported as `unknown`. Consumers must treat
+`unknown` as "no claim" (no fuse2 hint may be shown unless the state is
+exactly `missing`).
 
 ### `--integrate <path> [--yes] [--replace] [--json]`
 
@@ -416,20 +441,25 @@ No arguments prints usage and exits **2**.
 ### `--list-installed --json`
 
 ```json
-{"schema_version": 1, "installed": [<app>, ...]}
+{"schema_version": 1, "installed": [<app>, ...], "runtime": {"fuse2": "present" | "missing" | "unknown"}}
 ```
+
+> `runtime` is an **additive** envelope key (see the `runtime` block
+> section under `--list-installed` above): every other key keeps its
+> meaning and a reader that ignores unknown keys is unaffected —
+> `schema_version` therefore stays **1**.
 
 Real example output (app with an embedded `gh-releases-zsync` string; the
 custom-config case looks the same with `embedded_source: false`):
 
 ```json
-{"schema_version": 1, "installed": [{"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "GithubUpdater", "embedded_source": true, "running": false, "exec_arguments": "%F"}]}
+{"schema_version": 1, "installed": [{"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "GithubUpdater", "embedded_source": true, "running": false, "exec_arguments": "%F"}], "runtime": {"fuse2": "present"}}
 ```
 
 Empty list:
 
 ```json
-{"schema_version": 1, "installed": []}
+{"schema_version": 1, "installed": [], "runtime": {"fuse2": "missing"}}
 ```
 
 ### `--integrate <path> --yes --json` (success)
