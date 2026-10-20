@@ -93,7 +93,7 @@ class OfflineCliTests(FakeXDGTestCase):
         self.assertEqual(set(app), {
             'name', 'path', 'desktop_id', 'current_version',
             'available_version', 'download_size', 'manager',
-            'embedded_source', 'running'})
+            'embedded_source', 'running', 'exec_arguments'})
         self.assertEqual(app['name'], 'Fake App')
         self.assertEqual(app['path'], appimage)
         self.assertEqual(app['desktop_id'], 'fakeapp.desktop')
@@ -103,6 +103,8 @@ class OfflineCliTests(FakeXDGTestCase):
         self.assertIsNone(app['manager'])
         self.assertFalse(app['embedded_source'])
         self.assertFalse(app['running'])
+        # the fake desktop entry carries no Exec arguments
+        self.assertEqual(app['exec_arguments'], '')
 
     def test_json_stdout_is_pure(self):
         self._install_fake_app()
@@ -161,6 +163,154 @@ class OfflineCliTests(FakeXDGTestCase):
         result = self.run_cli('--integrate', '/nonexistent.appimage',
                               '--yes')
         self.assertEqual(result.returncode, 1)
+
+
+class ExecArgumentsCliTests(FakeXDGTestCase):
+    """`exec_arguments` hands the desktop entry's Exec arguments to the UI:
+    the current entry wins, the install-time record is the fallback."""
+
+    def _install_with_exec(self, args: str) -> str:
+        appimage, desktop, icon = self.install_fake_app()
+        with open(desktop, 'w') as f:
+            f.write(f'''[Desktop Entry]
+Name=Fake App
+Exec=env DESKTOPINTEGRATION=1 {appimage} {args}
+TryExec={appimage}
+Icon={icon}
+Type=Application
+Terminal=false
+X-AppImage-Version=1.0
+''')
+        return appimage
+
+    def _listed(self) -> dict:
+        payload = json.loads(self.run_cli('--list-installed', '--json').stdout)
+        self.assertEqual(len(payload['installed']), 1)
+        return payload['installed'][0]
+
+    def _record(self, default_exec_arguments: str) -> None:
+        appimage, desktop, icon = self.install_fake_app()
+        el = AppImageListElement(name='Fake App', description='',
+                                 provider='AppImage',
+                                 installed_status=InstalledStatus.INSTALLED,
+                                 file_path=appimage,
+                                 desktop_file_path=desktop)
+        Config.set_app_config(el, {
+            'appimage_path': appimage,
+            'desktop_file_path': desktop,
+            'icon_path': icon,
+            'default_exec_arguments': default_exec_arguments,
+        })
+
+    def test_exec_arguments_come_from_the_desktop_entry(self):
+        self._install_with_exec('--no-sandbox %U')
+        self.assertEqual(self._listed()['exec_arguments'], '--no-sandbox %U')
+
+    def test_field_codes_stay_verbatim(self):
+        self._install_with_exec('%U')
+        self.assertEqual(self._listed()['exec_arguments'], '%U')
+
+    def test_exec_arguments_empty_without_arguments(self):
+        self.install_fake_app()
+        self.assertEqual(self._listed()['exec_arguments'], '')
+
+    def test_recorded_arguments_are_the_fallback(self):
+        # the current desktop entry carries no arguments: the install-time
+        # record (apps.ini) is used instead
+        self._record('--no-sandbox %U')
+        self.assertEqual(self._listed()['exec_arguments'], '--no-sandbox %U')
+
+    def test_current_entry_wins_over_the_record(self):
+        self._record('--old-flag %U')
+        self._install_with_exec('--no-sandbox %U')
+        self.assertEqual(self._listed()['exec_arguments'], '--no-sandbox %U')
+
+
+class StaleRecordCliTests(FakeXDGTestCase):
+    """A record whose .desktop file is gone is logged, never removed
+    automatically, and can be cleaned up explicitly by its desktop id."""
+
+    def _install_stale(self) -> tuple:
+        os.makedirs(os.path.join(self.managed_dir, '.icons'), exist_ok=True)
+        os.makedirs(self.applications_dir, exist_ok=True)
+
+        appimage = os.path.join(self.managed_dir, 'stale.appimage')
+        Path(appimage).write_bytes(
+            b'\x7fELF\x02\x01\x01\x00\x41\x49\x02padding')
+        os.chmod(appimage, 0o755)
+        icon = os.path.join(self.managed_dir, '.icons', 'stale.png')
+        Path(icon).write_bytes(b'\x89PNG\r\n\x1a\n')
+        # the desktop file is gone (deleted by hand, or never written)
+        missing_desktop = os.path.join(self.applications_dir, 'stale.desktop')
+
+        el = AppImageListElement(name='Stale App', description='',
+                                 provider='AppImage',
+                                 installed_status=InstalledStatus.INSTALLED,
+                                 file_path=appimage,
+                                 desktop_file_path=missing_desktop)
+        Config.set_app_config(el, {
+            'appimage_path': appimage,
+            'desktop_file_path': missing_desktop,
+            'icon_path': icon,
+            'default_exec_arguments': '--no-sandbox %U',
+        })
+        return appimage, icon, missing_desktop
+
+    def _apps_ini(self) -> str:
+        path = os.path.join(self.config_home, 'io.github.glasschan.appimage',
+                            'apps.ini')
+        if not os.path.isfile(path):
+            return ''
+        with open(path) as f:
+            return f.read()
+
+    def test_stale_record_is_logged_and_not_listed(self):
+        appimage, _icon, missing_desktop = self._install_stale()
+
+        result = self.run_cli('--list-installed', '--json')
+
+        # the run does not crash
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        # the record is not listed as an installed app…
+        self.assertEqual(payload['installed'], [])
+        # …but it is not silently dropped either: the orphan is reported
+        # with both the missing desktop file and the orphaned AppImage
+        self.assertIn(missing_desktop, result.stderr)
+        self.assertIn(appimage, result.stderr)
+        # and nothing was removed
+        self.assertTrue(os.path.isfile(appimage))
+        self.assertIn('stale', self._apps_ini())
+
+    def test_stale_record_can_be_removed_by_desktop_id(self):
+        appimage, icon, _missing_desktop = self._install_stale()
+
+        result = self.run_cli('--remove', 'stale.desktop', '--yes', '--json')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['result'], 'removed')
+        # the orphaned AppImage and its icon went to the trash
+        self.assertFalse(os.path.exists(appimage))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.trash_files, 'stale.appimage')))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.trash_files, 'stale.png')))
+        # the record is gone
+        self.assertNotIn('stale', self._apps_ini())
+        # and the listing is still fine
+        payload = json.loads(self.run_cli('--list-installed', '--json').stdout)
+        self.assertEqual(payload['installed'], [])
+
+    def test_stale_record_is_not_removed_by_a_listing(self):
+        appimage, _icon, _missing_desktop = self._install_stale()
+
+        self.run_cli('--list-installed', '--json')
+        self.run_cli('--list-installed')
+
+        # a listing never removes anything
+        self.assertTrue(os.path.isfile(appimage))
+        self.assertIn('stale', self._apps_ini())
 
 
 class SettingsCliTests(FakeXDGTestCase):

@@ -86,9 +86,11 @@ omarchy plugin remove io.github.glasschan.appimage
 The backend needs `python3` — standard library only, no pip packages. On
 the rare Omarchy install without it, the panel detects that, and its body
 is replaced by an explanation plus an **Install Python** button. Pressing
-the button is the authorization: it opens a floating Omarchy terminal
-presenting the exact command it will run (`/usr/bin/omarchy pkg add
-python`), which you watch — and can cancel — like any terminal install.
+the button is the authorization: it opens a visible floating Omarchy
+terminal that shows the Omarchy logo and then runs the exact command
+(`/usr/bin/omarchy pkg add python`) — the command line itself is not
+echoed, but the install (and any `sudo` prompt) is on screen, and you
+can cancel it like any terminal install.
 The command is a fixed string (your `XDG_RUNTIME_DIR` is never spliced
 into it), and the install is refused up front unless that directory is an
 absolute, owner-only (0700) directory owned by you. The panel polls the
@@ -229,3 +231,15 @@ named after the plugin id), and publishes a GitHub Release with
 auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
+
+### 0.7.0
+
+- Exec arguments are forwarded on launch: the backend reports each app's
+  `exec_arguments` (e.g. `--no-sandbox %U`) and the panel passes the real
+  flags to the AppImage, dropping the desktop field codes it has nothing
+  to fill.
+- The panel closes after launching an app, unless it is pinned — a pinned
+  panel is a compact floating window that is meant to stay open.
+- Stale integration records (a recorded app whose `.desktop` file is
+  gone) are reported by `--list-installed` and can be removed by their
+  desktop id; nothing is deleted automatically.

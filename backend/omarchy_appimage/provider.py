@@ -205,14 +205,24 @@ class AppImageProvider():
 
     # ------------------------------------------------------------ listing
 
+    @staticmethod
+    def _recorded_exec_arguments(record) -> str:
+        """The Exec arguments recorded at install time (apps.ini's
+        `default_exec_arguments`), or '' when the record carries none.
+
+        The recorded value is a plain space-joined argument list, so it is
+        read back with shlex.split — the desktop field codes (%f %F %u %U
+        %i %c %k) stay VERBATIM; stripping them is the UI's job."""
+        default_args = (record or {}).get('default_exec_arguments', '') or ''
+        if not default_args.strip():
+            return ''
+        return ' '.join(shlex.split(default_args))
+
     def list_installed(self) -> list:
         default_folder_path = self._get_appimages_default_destination_path()
         manage_from_outside = settings.load_settings()[
             'manage_files_outside_default_folder']
         output = []
-
-        if not os.path.exists(self.user_desktop_files_path):
-            return output
 
         # desktop_file_path -> recorded install config, scanned once. The
         # desktop entry is mutable (apps like VS Code forks rewrite their
@@ -223,6 +233,24 @@ class AppImageProvider():
             dp = rec.get('desktop_file_path', '')
             if dp and dp not in desktop_to_config:
                 desktop_to_config[dp] = rec
+
+        # A record whose .desktop file is gone is invisible to the
+        # desktop-driven scan below — and could never be removed either
+        # (the CLI only resolves what this listing knows). Log it with the
+        # orphaned AppImage path so the user can reclaim the file. Nothing
+        # is deleted here: removal stays an explicit --remove.
+        for desktop_path, rec in desktop_to_config.items():
+            if os.path.exists(desktop_path):
+                continue
+            logging.warning(
+                'stale integration record: the desktop file %s is gone; '
+                'orphaned AppImage: %s (remove it with --remove %s)',
+                desktop_path,
+                rec.get('appimage_path', '') or rec.get('file_path', ''),
+                os.path.basename(desktop_path))
+
+        if not os.path.exists(self.user_desktop_files_path):
+            return output
 
         for file_name in os.listdir(self.user_desktop_files_path):
             desktop_path = os.path.join(self.user_desktop_files_path,
@@ -254,11 +282,8 @@ class AppImageProvider():
                             and self.can_install_file(recorded_appimage)):
                         recovered = True
                         exec_location = recorded_appimage
-                        default_args = (recorded or {}).get(
-                            'default_exec_arguments', '') or ''
-                        if default_args.strip():
-                            exec_arguments = ' '.join(
-                                shlex.split(default_args))
+                        exec_arguments = self._recorded_exec_arguments(
+                            recorded)
                         # env vars from the clobbered entry are unreliable;
                         # the repaired entry below restores the standard ones
                         exec_command_data['env_vars'] = []
@@ -266,6 +291,14 @@ class AppImageProvider():
                         logging.debug('%s skipped because %s does not exist',
                                       desktop_path, exec_location)
                         continue
+
+                if not exec_arguments.strip():
+                    # The current desktop entry carries no arguments: fall
+                    # back to the ones recorded at install time (the entry
+                    # may have been rewritten without them). The current
+                    # entry always wins when it has arguments.
+                    exec_arguments = self._recorded_exec_arguments(
+                        desktop_to_config.get(desktop_path))
 
                 exec_in_default_folder = os.path.isfile(os.path.join(
                     default_folder_path, os.path.basename(exec_location)))
@@ -305,6 +338,33 @@ class AppImageProvider():
                 logging.warning('%s: %s', desktop_path, e)
 
         return output
+
+    def list_stale_records(self) -> list:
+        """Integration records whose .desktop file is gone.
+
+        list_installed() is desktop-driven, so such a record is invisible
+        there — and could never be removed either, because the CLI only
+        resolves targets the listing knows. These elements are the
+        explicit handle for an orphan: nothing is deleted automatically,
+        the user has to ask for the removal (--remove <desktop id>)."""
+        stale = []
+        for _section_key, rec in Config.iter_app_records():
+            desktop_path = rec.get('desktop_file_path', '')
+            if not desktop_path or os.path.exists(desktop_path):
+                continue
+            appimage_path = (rec.get('appimage_path', '')
+                             or rec.get('file_path', ''))
+            stale.append(AppImageListElement(
+                name=rec.get('name', '') or os.path.basename(appimage_path),
+                description='',
+                provider=self.name,
+                installed_status=InstalledStatus.INSTALLED,
+                file_path=appimage_path,
+                desktop_file_path=desktop_path,
+                trusted=True,
+                exec_arguments=self._recorded_exec_arguments(rec),
+            ))
+        return stale
 
     def _repair_clobbered_desktop(self, desktop_path: str, recorded: dict):
         """Point a clobbered .desktop's Exec/TryExec/Icon back at the
@@ -721,23 +781,26 @@ class AppImageProvider():
 
         # 3) the icon, only when tied to this app's entry: recorded path,
         #    or inside <managed folder>/.icons with the desktop id's stem
-        if el.desktop_entry:
-            icon = el.desktop_entry.getIcon()
-            if icon and '/' in icon:
-                real = os.path.realpath(icon)
-                icons_dir = os.path.join(default_folder, '.icons')
-                desktop_stem = os.path.splitext(
-                    os.path.basename(desktop_path or ''))[0]
-                stem_matches = (desktop_stem
-                                == os.path.splitext(
-                                    os.path.basename(real))[0])
-                recorded = app_config.get('icon_path') or ''
-                if (bool(recorded) and real == os.path.realpath(recorded)) \
-                        or (_inside(real, icons_dir) and stem_matches):
-                    _remove(icon)
-                else:
-                    logging.warning('not removing unbound icon path: %s',
-                                    icon)
+        #    A stale record (its .desktop file is gone) has no entry to
+        #    read: the icon path recorded at install time is used instead.
+        icon = el.desktop_entry.getIcon() if el.desktop_entry else ''
+        if not icon:
+            icon = app_config.get('icon_path') or ''
+        if icon and '/' in icon:
+            real = os.path.realpath(icon)
+            icons_dir = os.path.join(default_folder, '.icons')
+            desktop_stem = os.path.splitext(
+                os.path.basename(desktop_path or ''))[0]
+            stem_matches = (desktop_stem
+                            == os.path.splitext(
+                                os.path.basename(real))[0])
+            recorded = app_config.get('icon_path') or ''
+            if (bool(recorded) and real == os.path.realpath(recorded)) \
+                    or (_inside(real, icons_dir) and stem_matches):
+                _remove(icon)
+            else:
+                logging.warning('not removing unbound icon path: %s',
+                                icon)
 
         if remove_configuration:
             Config.delete_app_update_config(el)
