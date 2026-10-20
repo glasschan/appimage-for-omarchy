@@ -1249,6 +1249,46 @@ const adopt = (f, pidAlive, offsetSec) =>
     Model.jobDoneBanner(null, "") === "" && Model.jobDoneBanner(undefined, "") === "")
 }
 
+// -- #27: force-quit card copy (singular / plural / count-free fallback) -----
+{
+  // Model.forceQuitBody owns the whole sentence decision: the QML card only
+  // passes the name and process count pinned at click time, so the choice
+  // is assertable here without a panel.
+  const singular = Model.forceQuitBody("Neovim", 1)
+  const plural = Model.forceQuitBody("Neovim", 3)
+  const fallback = Model.forceQuitBody("Neovim", 0)
+  check("#27: one process reads as a singular sentence",
+    singular === "Neovim is running — 1 process will be closed to apply the update.",
+    singular)
+  check("#27: two or more processes read as a plural sentence",
+    plural === "Neovim is running — 3 processes will be closed to apply the update.",
+    plural)
+  check("#27: an unknown count keeps the count-free fallback sentence",
+    fallback === Model.formatCount("Neovim", Model.strings.forceQuitBody)
+    && !/[0-9]/.test(fallback), fallback)
+  check("#27: absent/junk/negative counts all take the fallback",
+    [undefined, null, "", "junk", -3, NaN].every((v) =>
+      Model.forceQuitBody("Neovim", v) === fallback))
+  check("#27: a name carrying a placeholder is substituted, not re-expanded",
+    Model.forceQuitBody("a%1b", 2)
+    === "a%1b is running — 2 processes will be closed to apply the update.")
+
+  // running_pids rides the app normalization as a clamped int; the key is
+  // additive, so an older capture (or backend) has none at all.
+  const itemWith = (entry) => Model.parseListJson(JSON.stringify({
+    schema_version: 1,
+    installed: [Object.assign({ desktop_id: "x.desktop", name: "X",
+      path: "/x.appimage", running: true }, entry)]
+  })).items[0].runningPids
+  check("#27: running_pids normalizes to a non-negative int",
+    itemWith({ running_pids: 3 }) === 3 && itemWith({ running_pids: "3" }) === 3
+    && itemWith({ running_pids: 0 }) === 0
+    && itemWith({ running_pids: -2 }) === 0
+    && itemWith({ running_pids: "junk" }) === 0)
+  check("#27: an absent running_pids is 0 (older backend/capture)",
+    itemWith({}) === 0 && list.items[0].runningPids === 0)
+}
+
 // -- #11 panel-reader additions: path rules + adoption plumbing ---------------
 {
   // jobDocumentStem/jobDocumentPath: the writer's own character class is

@@ -168,6 +168,23 @@ def _get_file_from_args(args) -> str:
     raise OperationError('please specify a valid AppImage file')
 
 
+def _running_pid_count(el) -> int:
+    """How many processes provably belong to this installed AppImage
+    (ticket #27): `procs.pids_for`'s runtime parent plus its FUSE-mount
+    children — the same set `--kill-running` would close.
+
+    Display-only: the panel's force-quit card names the number before the
+    user agrees to close the app, and nothing acts on it. Best-effort like
+    the `running` flag it accompanies — a failed scan reports 0 instead of
+    erroring, and callers only ask for RUNNING rows."""
+    try:
+        found = procs.pids_for(el.file_path)
+        return len(found['parent']) + len(found['children'])
+    except Exception:
+        logging.exception('pids_for failed')
+        return 0
+
+
 def _make_app_json(el, manager=None, running=None) -> dict:
     if running is None:
         try:
@@ -187,6 +204,10 @@ def _make_app_json(el, manager=None, running=None) -> dict:
         'manager': manager.name if manager else None,
         'embedded_source': bool(manager and manager.embedded),
         'running': running,
+        # additive (schema_version stays 1): how many processes belong to
+        # this AppImage, 0 when it is not running or the scan cannot tell.
+        # Only a running row is scanned — a non-running one costs nothing.
+        'running_pids': _running_pid_count(el) if running else 0,
         # the desktop entry's Exec arguments (field codes stay VERBATIM —
         # the UI strips them), "" when the app has none
         'exec_arguments': getattr(el, 'exec_arguments', '') or '',

@@ -20,7 +20,7 @@ from unittest import mock
 
 from helpers import (FakeXDGTestCase, FixtureHTTPServer, download_fixture)
 
-from omarchy_appimage import cli, net, utils
+from omarchy_appimage import cli, net, procs, utils
 from omarchy_appimage import settings as appimage_settings
 from omarchy_appimage.ini_config import Config
 from omarchy_appimage.provider import AppImageListElement, InstalledStatus
@@ -99,7 +99,7 @@ class OfflineCliTests(FakeXDGTestCase):
         self.assertEqual(set(app), {
             'name', 'path', 'desktop_id', 'current_version',
             'available_version', 'download_size', 'manager',
-            'embedded_source', 'running', 'exec_arguments'})
+            'embedded_source', 'running', 'running_pids', 'exec_arguments'})
         self.assertEqual(app['name'], 'Fake App')
         self.assertEqual(app['path'], appimage)
         self.assertEqual(app['desktop_id'], 'fakeapp.desktop')
@@ -109,6 +109,8 @@ class OfflineCliTests(FakeXDGTestCase):
         self.assertIsNone(app['manager'])
         self.assertFalse(app['embedded_source'])
         self.assertFalse(app['running'])
+        # not running -> nothing is scanned for the count
+        self.assertEqual(app['running_pids'], 0)
         # the fake desktop entry carries no Exec arguments
         self.assertEqual(app['exec_arguments'], '')
 
@@ -214,6 +216,55 @@ class RuntimeBlockCliTests(InProcessCliMixin, FakeXDGTestCase):
         self.assertEqual(code, 0)
         payload = json.loads(out)
         self.assertEqual(payload['runtime'], {'fuse2': 'unknown'})
+
+
+class RunningPidsCliTests(InProcessCliMixin, FakeXDGTestCase):
+    """`running_pids` (ticket #27): the app object's process count, the
+    number the panel's force-quit card names before the user agrees to
+    close the app. It is computed through procs.pids_for — the module that
+    owns the identity rule (runtime parent + FUSE-mount children) — and
+    ONLY for rows the listing reports as running; a failed scan degrades
+    to 0 and never fails the listing."""
+
+    def setUp(self):
+        super().setUp()
+        self.appimage, _desktop, _icon = self.install_fake_app()
+
+    def _list_with(self, running, pids_for):
+        with mock.patch.object(cli.appimage_provider, 'is_app_running',
+                               return_value=running), \
+                mock.patch.object(procs, 'pids_for', pids_for):
+            out, err, code = self.run_cmd(cli.cmd_list_installed, ['--json'])
+        return json.loads(out), err, code
+
+    def test_running_row_reports_the_count(self):
+        scan = mock.Mock(
+            return_value={'parent': [700], 'children': [701, 702]})
+        payload, err, code = self._list_with(True, scan)
+        self.assertEqual(code, 0, err)
+        app = payload['installed'][0]
+        self.assertTrue(app['running'])
+        self.assertEqual(app['running_pids'], 3)
+        scan.assert_called_once_with(self.appimage)
+
+    def test_non_running_row_reports_zero_without_a_scan(self):
+        scan = mock.Mock(return_value={'parent': [700], 'children': [701]})
+        payload, err, code = self._list_with(False, scan)
+        self.assertEqual(code, 0, err)
+        app = payload['installed'][0]
+        self.assertFalse(app['running'])
+        self.assertEqual(app['running_pids'], 0)
+        # a non-running row must not pay for a second process scan
+        scan.assert_not_called()
+
+    def test_scan_failure_degrades_to_zero_and_keeps_the_listing(self):
+        scan = mock.Mock(side_effect=OSError('ps exploded'))
+        payload, err, code = self._list_with(True, scan)
+        self.assertEqual(code, 0, err)
+        app = payload['installed'][0]
+        # the `running` verdict is untouched by the count's failure
+        self.assertTrue(app['running'])
+        self.assertEqual(app['running_pids'], 0)
 
 
 class ExecArgumentsCliTests(FakeXDGTestCase):
