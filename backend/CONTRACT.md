@@ -217,7 +217,7 @@ per-app errors are logged (stderr) and skipped.
 {"schema_version": 1, "updates": [{"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "exec_arguments": "%F"}]}
 ```
 
-### `--update <target> [--yes] [--keep-both] [--force] [--json]`
+### `--update <target> [--yes] [--keep-both] [--force] [--kill-running] [--json]`
 
 Downloads the new release through the app's update source and installs it.
 
@@ -226,8 +226,35 @@ Downloads the new release through the app's update source and installs it.
   `No update method was found for this AppImage (set one with --set-update-source)`.
 - App currently running (the process-identity rule under Security model:
   a live process whose `exe` is the AppImage path, or one running out of
-  a `fuse.*` mount attributed to it in `/proc/mounts`) and no `--force`:
-  exit 0, result `skipped-running`.
+  a `fuse.*` mount attributed to it in `/proc/mounts`), and neither
+  `--force` nor `--kill-running` given: exit 0, result `skipped-running`,
+  and **no process is signalled**. An interactive terminal is asked first
+  (see the two flags below); a non-TTY (`--async`'s grandchild, a script)
+  gets the result straight away with a message that names the fix:
+  `... was skipped because the application is running; pass
+  --kill-running to close it and update, or --force to replace it in
+  place`.
+- **`--kill-running` vs `--force`** — the two ways past that guard, and
+  they differ in exactly one respect: whether the running app is closed.
+  - `--kill-running` closes the app, then updates. The grant is
+    unconditional for the whole job and covers two moments: at job start
+    (fail fast — nothing is downloaded for an app that cannot be
+    replaced) and again immediately before the atomic replace, so a
+    process relaunched during the download is closed too. Processes are
+    found by the process-identity rule above and signalled `SIGTERM`
+    first, escalating to `SIGKILL` after a grace period
+    (`utils.is_app_running`'s identity rule, `procs.quit_app`). On a
+    terminal the command asks one `y/N` question first — the update
+    pipeline's only interactive question — and a no (or an abandoned
+    stdin) is the untouched `skipped-running` result. With `--json`
+    (which requires `--yes`) and with `--yes` no question is asked: the
+    flag itself is the consent.
+  - `--force` replaces the AppImage **while the app keeps running**, in
+    place, without closing anything. Existing processes keep the old
+    inode open until they exit; the file on disk is the new release
+    immediately.
+  - Both given: the explicit close request wins, i.e. `--kill-running`
+    behaviour.
 - Availability check says "definitely up to date": exit 0, result
   `up-to-date`. An indeterminate state (network error, no matching asset —
   tri-state `None`) still attempts the download, like a `True` result.
@@ -258,10 +285,10 @@ Real example output (up-to-date):
 Real example output (skipped-running, exit 0):
 
 ```json
-{"schema_version": 1, "result": "skipped-running", "message": "/home/user/AppImages/neovim.appimage was skipped because the application is running; use --force to override", "app": <app>}
+{"schema_version": 1, "result": "skipped-running", "message": "/home/user/AppImages/neovim.appimage was skipped because the application is running; pass --kill-running to close it and update, or --force to replace it in place", "app": <app>}
 ```
 
-### `--update <target> --async [--yes] [--keep-both] [--force] [--json]`
+### `--update <target> --async [--yes] [--keep-both] [--force] [--kill-running] [--json]`
 
 Runs the whole `--update` pipeline as a **detached background job** and
 returns immediately.
@@ -302,6 +329,10 @@ returns immediately.
   **inside the job** through the same shared update core, and is
   published as the job document. A missing update source therefore
   surfaces as a terminal `error` document, not a spawn-time failure.
+- `--kill-running` is passed down to the grandchild and applies for the
+  job's whole life, including the re-check before the replace. The
+  grandchild's stdin is `/dev/null`, so it never asks: the flag is the
+  only grant the background path accepts.
 
 Real example output (job-started, exit 0):
 
@@ -332,6 +363,7 @@ refresh at least every 2 s (`JOB_HEARTBEAT_INTERVAL_SECONDS`).
 | `status` | string or null | Terminal result: `updated` / `up-to-date` / `skipped-running` / `error`; `null` while running |
 | `new_version` | string or null | Installed release (`updated` jobs) |
 | `error` | string or null | Error text (`error` jobs); the traceback tail goes to the log, never into the document |
+| `force_quit` | object or absent | **Additive** record of the running-app grant: `{"count": n, "sigkill": bool}` — how many processes this job signalled and whether any needed `SIGKILL`. Present **only** when the job actually closed something (`--kill-running`, or the consented question); absent in every other document, including a granted job that found nothing to close. The count is the whole job's (both guards); the field never changes `status`, `phase` or `schema_version`, and the CLI's `--json` result does not carry it |
 
 **Liveness rule:** a job is **ACTIVE** if and only if its phase is
 non-terminal **and** its `pid` is alive **and** its `heartbeat` is
@@ -592,6 +624,7 @@ Real example output:
 | `--replace` | Replace the conflicting app instead of keeping both (integrate) |
 | `--keep-both` | Keep the old version when updating |
 | `--force` | Update even while the app is running |
+| `--kill-running` | Close the running app, then update (asks on a terminal; on `--update` / `--update --async`) |
 | `--async` | With `--update`: run the whole update as a detached background job and report `job-started` immediately (see the `--update --async` section) |
 | `--delete` | Bypass the trash (irreversible) |
 | `--help` / `-h` | Usage text, exit 0 |
@@ -670,6 +703,11 @@ Real example output:
   ever signalled. Quitting (`procs.quit_app`) sends one SIGTERM round to
   the parent and its mount children, then SIGKILLs only the survivors
   after the grace; a process it may not signal is reported and left alone.
+  A grant to quit is CLI-level and explicit — `--kill-running`, or a yes
+  to the one interactive question — and it is the only thing that makes
+  the update signal anything: without it the command reports
+  `skipped-running` and sends no signal at all, and `--force` replaces
+  under the running app without touching it.
 - **Bounded subprocess output** — helper commands' stdout/stderr are
   capped at 10 MiB per stream; past the cap the reader stops and the
   timeout reaps a still-writing child.

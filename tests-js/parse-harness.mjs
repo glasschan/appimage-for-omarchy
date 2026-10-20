@@ -1180,6 +1180,22 @@ const adopt = (f, pidAlive, offsetSec) =>
     JobDocs.normalizeJob(null).ok === false && JobDocs.normalizeJob([]).ok === false
     && JobDocs.normalizeJob("x").ok === false
     && JobDocs.normalizeJob(null).phase === "")
+  // force_quit is additive (ticket 26): present only when the update
+  // actually closed processes, and the reader never trusts its shape.
+  check("force_quit absent/malformed → null, never throws",
+    mk({}).forceQuit === null
+    && mk({ force_quit: null }).forceQuit === null
+    && mk({ force_quit: "closed 3" }).forceQuit === null
+    && mk({ force_quit: [3, true] }).forceQuit === null
+    && mk({ force_quit: 7 }).forceQuit === null)
+  check("force_quit normalizes to {count, sigkill}",
+    mk({ force_quit: { count: 3, sigkill: false } }).forceQuit.count === 3
+    && mk({ force_quit: { count: 3, sigkill: false } }).forceQuit.sigkill === false
+    && mk({ force_quit: { count: "3", sigkill: true } }).forceQuit.count === 3
+    && mk({ force_quit: { count: "3", sigkill: true } }).forceQuit.sigkill === true
+    && mk({ force_quit: { count: "junk", sigkill: "yes" } }).forceQuit.count === 0
+    && mk({ force_quit: { count: -2 } }).forceQuit.count === 0
+    && mk({ force_quit: { count: -2 } }).forceQuit.sigkill === false)
   check("elapsed/age helpers", JobDocs.heartbeatAgeSeconds(mk({}), 1792494410000) === 10
     && JobDocs.isHeartbeatFresh(mk({}), 1792494410000) === true
     && JobDocs.elapsedSeconds(mk({}), 1792494600000) === 600

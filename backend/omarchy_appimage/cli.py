@@ -24,8 +24,8 @@ import tempfile
 import time
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from . import (constants, extractor, janitor, jobs, net, pick_file, settings,
-               utils)
+from . import (constants, extractor, janitor, jobs, net, pick_file, procs,
+               settings, utils)
 from .extractor import read_desktop_entry_in_place
 from .ini_config import Config
 from .provider import (AppImageListElement, AppImageProvider,
@@ -74,7 +74,8 @@ Commands:
                            source for a new release
   --update <target>        Download and install an update (--keep-both
                            keeps the old version, --force updates even
-                           while the app is running, --async runs the
+                           while the app is running, --kill-running closes
+                           the running app first, --async runs the
                            whole update as a detached background job and
                            reports `job-started` immediately; the job's
                            progress is published as a JSON document
@@ -109,6 +110,8 @@ Options:
   --keep-both              On --update, install the new version next to
                            the old one instead of replacing it
   --force                  On --update, proceed even while the app runs
+  --kill-running           On --update, close the running app first (asks
+                           on a terminal) and then update
   --delete                 Delete files permanently instead of trashing
   --help | -h              Show this help
 
@@ -1126,10 +1129,11 @@ class UpdateResult:
     'skipped-running' | 'up-to-date' | 'updated' — anything else fails
     closed (InternalError) in both output paths."""
 
-    __slots__ = ('status', 'el', 'manager', 'message', 'downloaded_bytes')
+    __slots__ = ('status', 'el', 'manager', 'message', 'downloaded_bytes',
+                 'force_quit')
 
     def __init__(self, status: str, el, manager=None, message: str = '',
-                 downloaded_bytes: int = 0):
+                 downloaded_bytes: int = 0, force_quit: dict = None):
         self.status = status
         # the element to report: the old one for skipped-running /
         # up-to-date, the freshly installed one for updated
@@ -1139,6 +1143,10 @@ class UpdateResult:
         # up-to-date: its plain-mode line is derived from el.file_path)
         self.message = message
         self.downloaded_bytes = downloaded_bytes
+        # {"count": int, "sigkill": bool} when the running-app grant
+        # actually closed something (None otherwise); the sync --json
+        # result never carries it — it only reaches the job document
+        self.force_quit = force_quit
 
 
 class _ManagerStageProxy:
@@ -1166,9 +1174,74 @@ class _ManagerStageProxy:
         return result
 
 
+# ------------------------------------------------- running-app grant
+
+def _stdin_is_tty() -> bool:
+    """Whether an interactive question can be asked at all. The single
+    seam the tests override: they never touch the real terminal."""
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        # a closed or replaced stdin is not a terminal
+        return False
+
+
+def _ask_close_running(el) -> bool:
+    """The update pipeline's ONE interactive question, asked by the
+    running-app guard and by nothing else. Anything but an explicit yes
+    declines — the safe answer, and the one an abandoned stdin gets."""
+    print(f'{el.file_path} is running. Close it and continue the update? '
+          f'[y/N] ', end='', file=sys.stderr, flush=True)
+    try:
+        answer = input()
+    except EOFError:
+        # the prompt above ended without a newline
+        print(file=sys.stderr)
+        return False
+    return answer.strip().lower() in ('y', 'yes')
+
+
+def _running_app_prompt(json_output: bool, assume_yes: bool):
+    """The `confirm_close` callable for run_update's guard, or None when
+    no question may be asked: --json keeps stdout a pure document stream
+    (that is why it requires --yes), --yes means "skip any interactive
+    question", and without a TTY there is nobody to ask — that path
+    returns the skipped-running result, whose message names
+    --kill-running."""
+    if json_output or assume_yes or not _stdin_is_tty():
+        return None
+    return _ask_close_running
+
+
+def _close_running_app(file_path: str, stage: str, probe=None) -> dict:
+    """procs.quit_app plus the job document's additive record of it.
+    Returns {'count': n, 'sigkill': bool} for the processes that were
+    actually closed, or None when nothing was signalled (not running any
+    more, or never was)."""
+    report = procs.quit_app(file_path, probe=probe)
+    if not report['signalled']:
+        return None
+    logging.info('%d process(es) closed before %s: %s',
+                 len(report['signalled']), stage, report['outcomes'])
+    return {'count': len(report['signalled']),
+            'sigkill': bool(report['killed_with_sigkill'])}
+
+
+def _merge_force_quit(current: dict, extra: dict):
+    """Fold a second guard's record into the first: `count` is every
+    process the job signalled, `sigkill` if any of them needed it."""
+    if extra is None:
+        return current
+    if current is None:
+        return dict(extra)
+    return {'count': current['count'] + extra['count'],
+            'sigkill': current['sigkill'] or extra['sigkill']}
+
+
 def run_update(target: str, keep_both: bool = False,
                force: bool = False, progress_cb=None,
-               on_stage=None) -> UpdateResult:
+               on_stage=None, kill_running: bool = False,
+               confirm_close=None, probe=None) -> UpdateResult:
     """The shared update pipeline: resolve target → update-source check →
     running guard → availability check → download to temp → verify →
     atomic replace → scoped temp-dir cleanup → pending-notification drop.
@@ -1189,6 +1262,27 @@ def run_update(target: str, keep_both: bool = False,
         download starts (with the checked manager, so its declared
         download_size is available), 'replacing' after the download and
         its digest verification returned (via _ManagerStageProxy).
+
+    Running-app guard (ticket 26). Three modes, and only two of them
+    signal anything:
+      * neither a grant nor consent → the `skipped-running` result,
+        untouched, and no process is signalled;
+      * `kill_running=True` (--kill-running) → an unconditional grant for
+        the whole job: procs.quit_app runs once here, before the
+        download (fail fast — downloading for an app that cannot be
+        replaced wastes the user's bandwidth), and once immediately
+        before the atomic replace, so a process relaunched during the
+        download is closed too;
+      * `confirm_close(el) -> bool` → the interactive path: the same
+        grant, but only when the caller's question was answered yes. The
+        prompt lives in cmd_update; the core never writes stdout.
+
+    `force` keeps its documented meaning — bypass the guard silently and
+    replace under a running app without closing it — and never signals.
+    When both are given the explicit close request wins.
+
+    `probe` is procs' seam: it is the process view and signal sender for
+    both quit calls (None = the production probe).
     """
     el = _resolve_target(target)
 
@@ -1197,11 +1291,23 @@ def run_update(target: str, keep_both: bool = False,
         raise OperationError('No update method was found for this AppImage '
                              '(set one with --set-update-source)')
 
-    if appimage_provider.is_app_running(el) and not force:
-        return UpdateResult(
-            status='skipped-running', el=el, manager=manager,
-            message=(f'{el.file_path} was skipped because the application '
-                     'is running; use --force to override'))
+    force_quit = None
+    granted = kill_running
+    if kill_running:
+        force_quit = _close_running_app(el.file_path, 'the update start',
+                                        probe)
+    elif not force and appimage_provider.is_app_running(el):
+        if confirm_close is None or not confirm_close(el):
+            return UpdateResult(
+                status='skipped-running', el=el, manager=manager,
+                message=(f'{el.file_path} was skipped because the '
+                         'application is running; pass --kill-running to '
+                         'close it and update, or --force to replace it in '
+                         'place'))
+        # the user said yes: same grant as --kill-running
+        granted = True
+        force_quit = _close_running_app(el.file_path, 'the update start',
+                                        probe)
 
     # tri-state: None (state not determinable) still attempts the download
     if manager.is_update_available() is False:
@@ -1217,10 +1323,25 @@ def run_update(target: str, keep_both: bool = False,
         def progress_cb(fraction: float):
             logging.debug('download: %d%%', round(fraction * 100))
 
+    before_replace = None
+    if granted:
+        appimage_path = el.file_path
+
+        def before_replace():
+            # the grant covers the whole job: whatever was (re)started
+            # while the download ran is closed before the replace, so a
+            # relaunched app cannot hold the old inode open behind us
+            nonlocal force_quit
+            force_quit = _merge_force_quit(
+                force_quit,
+                _close_running_app(appimage_path, 'the atomic replace',
+                                   probe))
+
     temp_dirs_before = extractor.temp_dirs_snapshot()
     try:
         new_el = appimage_provider.update_from_url(
-            manager, el, keep_both=keep_both, progress_cb=progress_cb)
+            manager, el, keep_both=keep_both, progress_cb=progress_cb,
+            before_replace=before_replace)
     finally:
         # the temp-dir lifecycle is core-owned: update_from_url registers
         # its download dir via extractor.new_temp_dir() (and the install
@@ -1243,7 +1364,7 @@ def run_update(target: str, keep_both: bool = False,
     return UpdateResult(
         status='updated', el=new_el, manager=manager,
         message=f'{el.file_path} was updated successfully',
-        downloaded_bytes=new_el.size or 0)
+        downloaded_bytes=new_el.size or 0, force_quit=force_quit)
 
 
 def cmd_update(args: list) -> int:
@@ -1255,6 +1376,7 @@ def cmd_update(args: list) -> int:
     assume_yes = ('-y' in args) or ('--yes' in args)
     keep_both = '--keep-both' in args
     force = '--force' in args
+    kill_running = '--kill-running' in args
     async_job = '--async' in args
 
     if json_output and not assume_yes:
@@ -1267,16 +1389,20 @@ def cmd_update(args: list) -> int:
 
     positional = _remove_flag_value(
         args, ['--json', '--yes', '-y', '--keep-both', '--force',
-               '--async'])
+               '--kill-running', '--async'])
     positional = [a for a in positional if not a.startswith('--')]
     if not positional:
         raise UsageError('missing argument: --update <name-or-desktop-id>')
 
     if async_job:
         return _cmd_update_async(positional[0], keep_both=keep_both,
-                                 force=force, json_output=json_output)
+                                 force=force, kill_running=kill_running,
+                                 json_output=json_output)
 
-    result = run_update(positional[0], keep_both=keep_both, force=force)
+    result = run_update(positional[0], keep_both=keep_both, force=force,
+                        kill_running=kill_running,
+                        confirm_close=_running_app_prompt(json_output,
+                                                          assume_yes))
 
     if result.status == 'skipped-running':
         if json_output:
@@ -1326,7 +1452,7 @@ _JOB_HANDSHAKE_TIMEOUT_SECONDS = 10
 
 
 def _cmd_update_async(target: str, keep_both: bool, force: bool,
-                      json_output: bool) -> int:
+                      json_output: bool, kill_running: bool = False) -> int:
     """Parent side of --update --async: validate the target (local name/id
     resolution only), take the job's atomic claim, refuse when a job is
     running for the app, then spawn the detached grandchild (see
@@ -1364,7 +1490,7 @@ def _cmd_update_async(target: str, keep_both: bool, force: bool,
         try:
             pid, job_path, log_path = _spawn_update_job(
                 desktop_id, target, keep_both=keep_both, force=force,
-                log_fd=log_fd)
+                log_fd=log_fd, kill_running=kill_running)
         except OSError as e:
             raise OperationError(f'could not start the update job: {e}')
     finally:
@@ -1431,7 +1557,7 @@ def _refuse_second_job(desktop_id: str, json_output: bool,
 
 
 def _job_entrypoint(desktop_id: str, target: str, keep_both: bool,
-                    force: bool) -> int:
+                    force: bool, kill_running: bool = False) -> int:
     """The detached grandchild's body: run the whole update pipeline and
     publish one job document per phase (jobs.JobWriter). Never raises;
     returns a process exit code (the fork site os._exit()s with it).
@@ -1442,6 +1568,7 @@ def _job_entrypoint(desktop_id: str, target: str, keep_both: bool,
     try:
         try:
             result = run_update(target, keep_both=keep_both, force=force,
+                                kill_running=kill_running,
                                 progress_cb=writer.progress_cb,
                                 on_stage=writer.stage)
         except Exception as e:
@@ -1465,21 +1592,25 @@ def _finish_job_document(writer, result: UpdateResult) -> int:
     if result.status == 'updated':
         writer.finish('updated', message=result.message,
                       new_version=result.el.version,
-                      downloaded_bytes=result.downloaded_bytes)
+                      downloaded_bytes=result.downloaded_bytes,
+                      force_quit=result.force_quit)
         return EXIT_OK
     if result.status == 'up-to-date':
         writer.finish('up-to-date',
-                      message=f'{result.el.file_path} is up to date')
+                      message=f'{result.el.file_path} is up to date',
+                      force_quit=result.force_quit)
         return EXIT_OK
     if result.status == 'skipped-running':
-        writer.finish('skipped-running', message=result.message)
+        writer.finish('skipped-running', message=result.message,
+                      force_quit=result.force_quit)
         return EXIT_OK
     writer.finish_error(f'unknown update result status: {result.status!r}')
     return EXIT_ERROR
 
 
 def _spawn_update_job(desktop_id: str, target: str, keep_both: bool,
-                      force: bool, log_fd: int) -> tuple:
+                      force: bool, log_fd: int,
+                      kill_running: bool = False) -> tuple:
     """Detach the job runner as a grandchild: os.fork() twice (setsid in
     the intermediate, so the grandchild owns no controlling terminal and
     cannot reacquire one), stdio redirected into the size-capped per-job
@@ -1533,7 +1664,8 @@ def _spawn_update_job(desktop_id: str, target: str, keep_both: bool,
                 os.close(log_fd)
                 os.chdir('/')
                 grandchild_code = _job_entrypoint(
-                    desktop_id, target, keep_both=keep_both, force=force)
+                    desktop_id, target, keep_both=keep_both, force=force,
+                    kill_running=kill_running)
             except BaseException:
                 try:
                     logging.exception('update job crashed')
