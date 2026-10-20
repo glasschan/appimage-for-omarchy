@@ -737,11 +737,12 @@ No arguments prints usage and exits **2**.
 | `manager` | string or null | Update manager name (`StaticFileUpdater`, `GithubUpdater`, `GitlabUpdater`, `CodebergUpdater`, `ForgejoUpdater`) or `null` when no source exists |
 | `embedded_source` | boolean | True when the source comes from the AppImage's embedded `.upd_info` string (false for custom configs and for no source) |
 | `running` | boolean | True when the AppImage is currently running (a process whose `exe` is the AppImage path, or one running out of a `fuse.*` mount attributed to it in `/proc/mounts` — see Process identity under Security model) |
+| `running_pids` | int | How many processes belong to this AppImage: the runtime parent (its `exe` is the AppImage path) **plus** the helpers running out of the `fuse.*` mount attributed to it — the set `--kill-running` would close (`procs.pids_for`). `0` when the app is not running (a non-running row is never scanned) and `0` when the count cannot be determined (a failed scan is never an error). **Display-only**: the panel's force-quit prompt names it; no command reads it back |
 | `exec_arguments` | string | The desktop entry's `Exec=` arguments, e.g. `"--no-sandbox %U"` or `"%U"`; `""` when the app has none. The desktop field codes (`%f %F %u %U %i %c %k`) stay **verbatim** — stripping them is the UI's job. The current desktop entry wins; when it carries no arguments, the install-time `default_exec_arguments` from `apps.ini` is used instead |
 
-> `exec_arguments` is an **additive** key: every other key keeps its
-> meaning, and a reader that ignores unknown keys (the QML layer does)
-> is unaffected — the same way `manager` / `embedded_source` /
+> `exec_arguments` and `running_pids` are **additive** keys: every other
+> key keeps its meaning, and a reader that ignores unknown keys (the QML
+> layer does) is unaffected — the same way `manager` / `embedded_source` /
 > `download_size` were added. `schema_version` therefore stays **1**.
 
 ### `--list-installed --json`

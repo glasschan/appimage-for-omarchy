@@ -128,14 +128,16 @@ Panel {
   property var jobStartGraces: ({})
 
   // Force-quit confirm card (ticket #27): Update on a row whose last
-  // --list-installed poll said the app runs opens this card first. The id
-  // and name are pinned at click time (the row's model data may be
-  // replaced by the refresh that follows); nothing is spawned until
-  // confirmForceQuit, and cancel clears the pair with zero side effects.
-  // The card states the consequence, never a process count — the number is
-  // only knowable afterwards, from the job document's force_quit record.
+  // --list-installed poll said the app runs opens this card first. The id,
+  // name and process count are pinned at click time (the row's model data
+  // may be replaced by the refresh that follows); nothing is spawned until
+  // confirmForceQuit, and cancel clears the trio with zero side effects.
+  // The count comes from the backend's additive `running_pids`; 0 means
+  // "not known" (a stale flag, or an older backend) and the card falls
+  // back to its count-free sentence.
   property string forceQuitId: ""
   property string forceQuitName: ""
+  property int forceQuitPids: 0
 
   // Current Backend.run context (null while idle); the Process and Timer
   // signal handlers feed it back into lib/Backend.js.
@@ -829,6 +831,7 @@ Panel {
     if (item.running === true) {
       root.forceQuitId = item.id
       root.forceQuitName = item.name !== "" ? item.name : item.id
+      root.forceQuitPids = item.runningPids > 0 ? item.runningPids : 0
       return
     }
     root.updateItem(item, false)
@@ -837,6 +840,7 @@ Panel {
   function dismissForceQuit() {
     root.forceQuitId = ""
     root.forceQuitName = ""
+    root.forceQuitPids = 0
   }
 
   // Confirm: run exactly the async job, now with the --kill-running grant
@@ -2340,10 +2344,11 @@ Panel {
 
           // ---- Force-quit confirm card (ticket #27) ---------------------
           // Shown instead of spawning when Update lands on a row the last
-          // listing said runs. It names the app and states the consequence,
-          // not a process count (only the backend knows that, afterwards).
-          // Enter confirms, Esc cancels (PanelKeyCatcher wiring above);
-          // Cancel spawns nothing and leaves the row as it was.
+          // listing said runs. It names the app and how many processes the
+          // confirm will close (the listing's `running_pids`; a count of 0
+          // — unknown — keeps the count-free sentence). Enter confirms, Esc
+          // cancels (PanelKeyCatcher wiring above); Cancel spawns nothing
+          // and leaves the row as it was.
           BorderSurface {
             id: forceQuitCard
             width: parent.width
@@ -2368,7 +2373,7 @@ Panel {
               }
 
               Text {
-                text: Model.formatCount(root.forceQuitName, root.strings.forceQuitBody)
+                text: Model.forceQuitBody(root.forceQuitName, root.forceQuitPids)
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
