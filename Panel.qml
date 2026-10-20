@@ -66,6 +66,17 @@ Panel {
   readonly property int confirmResetMs: 4000
   // Grace before the post-launch refresh so `ps` can see the new process.
   readonly property int launchSettleMs: 1500
+  // Launch-failure banner (F4): the id of the app awaiting its post-launch
+  // settle verdict ("" when none) and the moment the launch was clicked.
+  // execDetached cannot report the AppImage runtime's own death (a type-2
+  // AppImage without fuse2 exits right after spawn), so the verdict comes
+  // from the first completed listing that STARTED after the click — a
+  // listing already in flight at click time has a pre-spawn ps snapshot
+  // and must never judge the launch. On a failed verdict the banner gets
+  // the fuse2 hint line only when that same listing's runtime block says
+  // "missing" (Model.launchFailureBanner decides).
+  property string settleLaunchId: ""
+  property real settleLaunchMs: 0
   // Status notices fade on their own after this long (matching the
   // backend's desktop-notification expire time); errors never auto-hide.
   readonly property int statusTimeoutMs: 5000
@@ -471,6 +482,7 @@ Panel {
       syncFromModel()
       return
     }
+    var refreshStartedMs = Date.now()
     Model.setBusy("list", true)
     syncFromModel()
     callBackend(["--list-installed", "--json"], null, function(result) {
@@ -478,8 +490,9 @@ Panel {
       if (result.ok) {
         var parsed = Model.parseListJson(result.stdout)
         if (parsed.ok) {
-          Model.setItems(parsed.items)
+          Model.setItems(parsed.items, parsed.runtime)
           Model.clearError()
+          root.settleLaunch(parsed, refreshStartedMs)
         } else {
           Model.setError(parsed.error)
         }
@@ -507,6 +520,11 @@ Panel {
       .filter(function(a) { return a && !/^%[fFuUicdk]$/.test(a) })
     Quickshell.execDetached(["env", "DESKTOPINTEGRATION=1", item.path].concat(args))
     Model.markRunning(item.id, true)
+    // Arm the launch verdict: the settle listing decides whether the app
+    // really came up (see settleLaunch below — spawn success says nothing
+    // about the AppImage runtime).
+    root.settleLaunchId = item.id
+    root.settleLaunchMs = Date.now()
     launchSettleTimer.restart()
     // The panel is a full-screen overlay with exclusive keyboard focus, so
     // a freshly launched app would sit behind it and the user would have
@@ -515,6 +533,31 @@ Panel {
     // consistent. A pinned panel is a compact floating window that is
     // meant to stay open.
     if (!root.pinned) root.requestClose()
+  }
+
+  // Consume the armed launch verdict on a completed listing. Only a
+  // listing that started AFTER the launch click may judge it — its ps
+  // snapshot is the first one that can see the new process; anything
+  // already in flight at click time (or any earlier snapshot) would read
+  // a false "not running" and blame a healthy launch. App gone from the
+  // list (removed elsewhere) and running apps are silent: a missing row
+  // is no claim, and a successful launch must never show a banner. A
+  // failed verdict raises the launch-failure banner, whose fuse2 hint
+  // line appears only when that same listing's runtime block reports
+  // "missing" (Model.launchFailureBanner; text only — no command, no
+  // button). The store-side error means the banner also survives the
+  // post-launch panel close and greets the next open.
+  function settleLaunch(parsed, startedMs) {
+    if (root.settleLaunchId === "") return
+    if (startedMs < root.settleLaunchMs) return
+    var item = null
+    for (var i = 0; i < parsed.items.length; i++) {
+      if (parsed.items[i].id === root.settleLaunchId) { item = parsed.items[i]; break }
+    }
+    root.settleLaunchId = ""
+    root.settleLaunchMs = 0
+    if (!item || item.running) return
+    Model.setError(Model.launchFailureBanner(item.name, parsed.runtime.fuse2))
   }
 
   // F3: first click arms the inline confirmation, second click runs

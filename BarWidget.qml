@@ -107,7 +107,8 @@ BarWidget {
       ["--list-installed", "--json"], {}, function(result) {
         if (result.ok) {
           var parsed = Model.parseListJson(result.stdout)
-          if (parsed.ok) Model.setItems(parsed.items)
+          // The runtime verdict (fuse2 probe) rides every listing.
+          if (parsed.ok) Model.setItems(parsed.items, parsed.runtime)
         }
       })
     syncCtx = ctx && ctx.active ? ctx : null
