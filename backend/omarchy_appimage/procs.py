@@ -51,6 +51,18 @@ _OUTCOME_TERMINATED = 'terminated'      # died on SIGTERM
 _OUTCOME_SIGKILLED = 'sigkilled'        # survived the grace, needed SIGKILL
 _OUTCOME_NOT_PERMITTED = 'not-permitted'    # another user's process
 _OUTCOME_SIGNAL_FAILED = 'signal-failed'    # the signal itself failed
+# the pid no longer proves it belongs to this AppImage (recycled pid, exe
+# replaced underneath it, /proc entry unreadable): never signalled
+_OUTCOME_IDENTITY_CHANGED = 'identity-changed'
+
+# Outcomes that mean "still there and out of our reach": the pre-replace
+# guard in cli refuses to swap the file on those alone.
+_STUCK_OUTCOMES = (_OUTCOME_NOT_PERMITTED, _OUTCOME_SIGNAL_FAILED)
+
+# SIGKILL cannot be ignored, but the process still needs a scheduling slot
+# to die in: poll the killed set for this long before calling any of it
+# survived (a false "survived" would refuse a legitimate update).
+_SIGKILL_SETTLE_SECONDS = 1.0
 
 
 def _parse_ps_exe_lines(text: str) -> list:
@@ -87,7 +99,7 @@ class _SystemProbe:
     def __init__(self, proc_root: str = '/proc', mounts_path: str = None,
                  ps_command=None):
         self.proc_root = proc_root
-        self.mounts_path = mounts_path or os.path.join(proc_root, 'mounts')
+        self.mounts_path = mounts_path
         self.ps_command = tuple(ps_command or _PS_COMMAND)
 
     def processes(self) -> list:
@@ -103,7 +115,16 @@ class _SystemProbe:
         return _parse_ps_exe_lines(result.stdout.decode(errors='replace'))
 
     def mounts(self) -> list:
-        return parse_proc_mounts(self.mounts_path)
+        """The parsed mounts table. With no explicit path the module
+        CONFIG value utils.PROC_MOUNTS_PATH is read at CALL time (lazy
+        import, like utils.is_fuse_mounted does for this module), so
+        patching that one name redirects the whole production path —
+        utils, cli and this probe — instead of just one of them."""
+        path = self.mounts_path
+        if path is None:
+            from . import utils
+            path = utils.PROC_MOUNTS_PATH
+        return parse_proc_mounts(path)
 
     def exe_for(self, pid: int):
         """The resolved /proc/<pid>/exe, or None when it is absent (the
@@ -225,13 +246,44 @@ def pids_for(appimage_path: str, probe=None) -> dict:
 
     probe = _probe_or_default(probe)
     mounts = _mount_points(probe.mounts(), appimage_path)
+    wanted = os.path.realpath(appimage_path)
     parents, children = [], []
     for pid, exe in iter_processes(probe=probe):
-        if exe == appimage_path:
+        if _is_own_exe(exe, wanted):
             parents.append(pid)
         elif _under(exe, mounts):
             children.append(pid)
     return {'parent': sorted(parents), 'children': sorted(children)}
+
+
+def _is_own_exe(exe: str, wanted_realpath: str) -> bool:
+    """The parent rule: this process's exe IS the AppImage.
+
+    Both sides are realpath-normalised, because an install directory is
+    routinely a symlink (~/Applications -> ~/AppImages) while /proc and
+    `ps` report whichever spelling the process was started with. The
+    normalisation is also what keeps an exe rendered `<path> (deleted)`
+    out of the match, and it is the ONE rule `running` and `running_pids`
+    both answer through (utils._running_by_ps calls pids_for), so a single
+    JSON object can no longer say two different things."""
+    if exe == wanted_realpath:
+        return True
+    return os.path.realpath(exe) == wanted_realpath
+
+
+def _still_ours(probe, pid: int, wanted_realpath: str, mounts) -> bool:
+    """Re-prove membership for one pid against the CURRENT /proc view.
+
+    A pid captured by the scan can be recycled before the signal lands
+    (and between the TERM round and the KILL round the exe can change
+    too), so membership is re-read through the probe right before every
+    signal. An exe that is gone, unreadable or simply different proves
+    nothing and the pid is dropped — a wrong kill is worse than a missed
+    one."""
+    exe = probe.exe_for(pid)
+    if not exe:
+        return False
+    return _is_own_exe(exe, wanted_realpath) or _under(exe, mounts)
 
 
 def quit_app(appimage_path: str, *,
@@ -244,25 +296,37 @@ def quit_app(appimage_path: str, *,
     mount that is about to vanish. Surviving pids are polled for up to
     `term_grace_s` seconds, then SIGKILLed. A pid we may not signal
     (another user's process that happens to share the file name) is
-    reported and left alone — never escalated. The mount set is
-    recomputed here, so a process that appeared since the last check is
-    included.
+    reported and left alone — never escalated.
+
+    This is ONE scan plus one signal round; nothing is re-scanned for
+    processes that appeared later. What IS re-proved before every signal
+    is the identity of each pid already in the set (see _still_ours): a
+    recycled pid is dropped as 'identity-changed' rather than signalled.
 
     Returns {'signalled': [pid...], 'killed_with_sigkill': [pid...],
-    'outcomes': {pid: outcome}}. Only pids we acted on appear: a pid that
-    vanished before the TERM landed is left out of both lists and
-    `outcomes` entirely. Outcome values: 'terminated' (died on TERM),
-    'sigkilled' (needed SIGKILL), 'not-permitted' (could not be signalled
-    at all) and 'signal-failed' (the signal call itself failed)."""
+    'survived': [pid...], 'outcomes': {pid: outcome}}. Only pids we acted
+    on appear in `signalled` / `killed_with_sigkill`: a pid that vanished
+    before the TERM landed, or whose identity changed, is left out of both
+    lists. Outcome values: 'terminated' (died on TERM), 'sigkilled'
+    (needed SIGKILL), 'not-permitted' (could not be signalled at all),
+    'signal-failed' (the signal call itself failed) and 'identity-changed'
+    (no longer provably this AppImage). `survived` lists the pids that are
+    still there afterwards — the caller refuses to replace a file that
+    could not be closed."""
     probe = _probe_or_default(probe)
     found = pids_for(appimage_path, probe=probe)
     # de-duplicated, parent first: the process the user sees leads the
     # round, its helpers follow in the same one
     targets = list(dict.fromkeys(found['parent'] + found['children']))
+    mounts = _mount_points(probe.mounts(), appimage_path)
+    wanted = os.path.realpath(appimage_path)
 
     outcomes = {}
     signalled = []
     for pid in targets:
+        if not _still_ours(probe, pid, wanted, mounts):
+            outcomes[pid] = _OUTCOME_IDENTITY_CHANGED
+            continue
         try:
             probe.signal(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -281,6 +345,10 @@ def quit_app(appimage_path: str, *,
 
     killed = []
     for pid in _wait_for_exit(probe, signalled, term_grace_s):
+        if not _still_ours(probe, pid, wanted, mounts):
+            # recycled during the grace: the new process is not ours
+            outcomes[pid] = _OUTCOME_IDENTITY_CHANGED
+            continue
         try:
             probe.signal(pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -294,11 +362,17 @@ def quit_app(appimage_path: str, *,
         killed.append(pid)
         outcomes[pid] = _OUTCOME_SIGKILLED
 
+    still_alive = set(_wait_for_exit(probe, killed, _SIGKILL_SETTLE_SECONDS))
+    survived = sorted(pid for pid, outcome in outcomes.items()
+                      if outcome in _STUCK_OUTCOMES
+                      or (outcome == _OUTCOME_SIGKILLED
+                          and pid in still_alive))
+
     if signalled:
         logging.info('closed %d process(es) for %s (%d needed SIGKILL)',
                      len(signalled), appimage_path, len(killed))
     return {'signalled': signalled, 'killed_with_sigkill': killed,
-            'outcomes': outcomes}
+            'survived': survived, 'outcomes': outcomes}
 
 
 def _wait_for_exit(probe, pids: list, grace_s: float) -> list:
@@ -321,6 +395,42 @@ def _wait_for_exit(probe, pids: list, grace_s: float) -> list:
     return pending
 
 
+class _ScanCache:
+    """A probe wrapper that answers processes() and mounts() from ONE
+    read each, for the length of one caller's scan.
+
+    A panel listing asks pids_for once per installed app; without the
+    cache that is one fresh `ps` spawn plus one /proc/mounts parse per
+    row, every 10 s. Everything else (exe_for, state_for, signal, the
+    clock) passes straight through to the real probe, so liveness stays
+    live."""
+
+    def __init__(self, probe):
+        self._probe = probe
+        self._processes = None
+        self._mounts = None
+
+    def processes(self):
+        if self._processes is None:
+            self._processes = self._probe.processes()
+        return self._processes
+
+    def mounts(self):
+        if self._mounts is None:
+            self._mounts = self._probe.mounts()
+        return self._mounts
+
+    def __getattr__(self, name):
+        return getattr(self._probe, name)
+
+
+def _cached_probe(probe=None):
+    """One process table + one mounts table, reusable across several
+    pids_for calls. The four public entry points of this module stay its
+    whole public surface; this is a helper for cli's listing only."""
+    return _ScanCache(_probe_or_default(probe))
+
+
 def _is_alive(probe, pid: int) -> bool:
     """Same rule as jobs.pid_alive (ProcessLookupError means gone,
     PermissionError means another user's process — alive), plus the zombie
@@ -332,6 +442,9 @@ def _is_alive(probe, pid: int) -> bool:
     except PermissionError:
         return True
     except OSError:
-        return False
+        # any other OSError means "still there, for all we know": only
+        # ProcessLookupError proves the pid is gone, and a pid we cannot
+        # account for must stay in the KILL round
+        return True
     state = probe.state_for(pid)
     return state is not None and state not in ('Z', 'X')

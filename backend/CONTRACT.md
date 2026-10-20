@@ -58,9 +58,12 @@ AppImage: <path> (remove it with --remove <desktop id>)`), so the user can
 reclaim the file — the record itself is removed only on an explicit
 `--remove <desktop id> --yes`.
 
-`running` and `running_pids` are computed per app from the process view
-(Process identity under Security model); `running_pids` is display-only
-and no command ever reads it back.
+`running` and `running_pids` are computed per app from the same process
+view and by the same identity rule (Process identity under Security
+model), so the two keys of one object can never disagree about what is
+ours: `running: true` with `running_pids: 0` means the `fuse.*` mount is
+still attributed to the file while no process of ours answers —
+`running_pids` is display-only and no command ever reads it back.
 
 **`runtime` block (fuse2).** Every successful JSON envelope also carries an
 additive `runtime` block: `{"fuse2": <state>}` with exactly one of
@@ -240,6 +243,13 @@ Downloads the new release through the app's update source and installs it.
   `... was skipped because the application is running; pass
   --kill-running to close it and update, or --force to replace it in
   place`.
+- **The availability check comes first.** The target is asked whether
+  there is anything to install *before* any process is touched: a
+  `up-to-date` target returns exit 0 with result `up-to-date`, never
+  closes the app (not even with `--kill-running`), never asks the
+  question and never records `force_quit`. When there *is* an update, the
+  close still happens **before the download starts**, so nothing is
+  ever downloaded for an app that cannot be replaced.
 - **`--kill-running` vs `--force`** — the two ways past that guard, and
   they differ in exactly one respect: whether the running app is closed.
   - `--kill-running` closes the app, then updates, and **never asks**:
@@ -253,6 +263,15 @@ Downloads the new release through the app's update source and installs it.
     (`procs.quit_app`). What was actually closed is recorded in the job
     document as `force_quit` (see Job documents); the sync `--json`
     result does not carry it.
+  - A target that **survives** the round — another user's process, or one
+    that ignores both signals — makes the update refuse rather than
+    replace: exit 1, error `<path> is still running before the update
+    start: process(es) <pid>, ... could not be closed; refusing to
+    replace the file` (the stage is `the atomic replace` when the
+    survivor appeared during the download and the pre-replace re-check
+    caught it). Replacing the file under a live process while the panel
+    claimed the app was closed is the failure this refuses; the pids in
+    the message are the ones the user has to close by hand.
   - `--force` replaces the AppImage **while the app keeps running**, in
     place, without closing anything. Existing processes keep the old
     inode open until they exit; the file on disk is the new release
@@ -270,7 +289,12 @@ Downloads the new release through the app's update source and installs it.
   report the update.
 - `--keep-both` installs the new release next to the old one (KEEP logic,
   version-suffixed filename); default replaces in place (REPLACE, same
-  filename + desktop id, so the app-menu entry stays valid).
+  filename + desktop id, so the app-menu entry stays valid). `--keep-both`
+  together with `--kill-running` accepts the flag but **closes nothing**:
+  the new file lands beside the running one and `os.replace` never touches
+  the running app's path, so both the job-start quit and the pre-replace
+  hook are skipped and the document carries no `force_quit`. The running
+  guard still applies when neither flag is given.
 - On success the app's entry in `updates-state.json` is cleared so the next
   `--fetch-updates` does not re-notify for the now-installed release.
 
@@ -335,8 +359,18 @@ returns immediately.
   surfaces as a terminal `error` document, not a spawn-time failure.
 - `--kill-running` is passed down to the grandchild and applies for the
   job's whole life, including the re-check before the replace. The
-  grandchild's stdin is `/dev/null`, so it never asks: the flag is the
-  only grant the background path accepts.
+  grandchild's stdin is `/dev/null`, so **it** never asks — but `--async`
+  is no longer implicitly non-interactive: when stdin is a TTY and the app
+  is running and neither `--yes` nor `--keep-both` is given, the **parent**
+  asks the same `y/N` question before it spawns anything, and a yes
+  appends `--kill-running` to the grandchild's argv. A no (or Ctrl-C, or
+  EOF) starts no job at all and answers like the sync path: exit 0,
+  result `skipped-running` with the message that names the two flags.
+  `--yes` and `--json` never ask, and `--keep-both` never asks because
+  nothing is replaced in place.
+- The surviving-target refusal (see `--kill-running` above) applies inside
+  the job too: it surfaces as a terminal `error` document that still
+  carries the `force_quit` record of whatever *was* closed.
 
 Real example output (job-started, exit 0):
 
@@ -367,7 +401,7 @@ refresh at least every 2 s (`JOB_HEARTBEAT_INTERVAL_SECONDS`).
 | `status` | string or null | Terminal result: `updated` / `up-to-date` / `skipped-running` / `error`; `null` while running |
 | `new_version` | string or null | Installed release (`updated` jobs) |
 | `error` | string or null | Error text (`error` jobs); the traceback tail goes to the log, never into the document |
-| `force_quit` | object or absent | **Additive** record of the running-app grant: `{"count": n, "sigkill": bool}` — how many processes this job signalled and whether any needed `SIGKILL`. Present **only** when the job actually closed something (`--kill-running`, or the consented question); absent in every other document, including a granted job that found nothing to close. The count is the whole job's (both guards); the field never changes `status`, `phase` or `schema_version`, and the CLI's `--json` result does not carry it; when it is present the panel's done banner appends its closed-app clause (`Model.js` `jobDoneBanner`) |
+| `force_quit` | object or absent | **Additive** record of the running-app grant: `{"count": n, "sigkill": bool}` — how many processes this job signalled and whether any needed `SIGKILL`. Present **only** when the job actually closed something (`--kill-running`, or the consented question); absent in every other document, including a granted job that found nothing to close **and every `up-to-date` document** (nothing was applied, so no close can be claimed — the finishing writer drops a stale record). `count` is the whole job's: the processes signalled by the job-start quit plus those the pre-replace re-check had to close, i.e. every pid that got a `SIGTERM`/`SIGKILL`, not just the ones still alive at the end. The record is written on **terminal `error` documents too** — a job that closed the app and then failed is exactly the case where the user needs to know. The field never changes `status`, `phase` or `schema_version`, and the CLI's `--json` result does not carry it; when it is present the panel's banner appends its closed-app clause (`Model.js` `jobDoneBanner` for `updated`, `jobErrorBanner` for `error`), and a `sigkill: true` picks the force-quit wording over the plain close wording |
 
 **Liveness rule:** a job is **ACTIVE** if and only if its phase is
 non-terminal **and** its `pid` is alive **and** its `heartbeat` is
@@ -628,7 +662,7 @@ Real example output:
 | `--replace` | Replace the conflicting app instead of keeping both (integrate) |
 | `--keep-both` | Keep the old version when updating |
 | `--force` | Replace the AppImage even while the app is running, without closing it |
-| `--kill-running` | On `--update` / `--update --async`: close the running app instead of skipping it — the flag is the consent, no question is asked (see `--update`) |
+| `--kill-running` | On `--update` / `--update --async`: close the running app instead of skipping it — the flag is the consent, no question is asked (see `--update`). Ignored by `--keep-both`, which installs beside the running file and closes nothing |
 | `--async` | With `--update`: run the whole update as a detached background job and report `job-started` immediately (see the `--update --async` section) |
 | `--delete` | Bypass the trash (irreversible) |
 | `--help` / `-h` | Usage text, exit 0 |
@@ -707,6 +741,14 @@ Real example output:
   ever signalled. Quitting (`procs.quit_app`) sends one SIGTERM round to
   the parent and its mount children, then SIGKILLs only the survivors
   after the grace; a process it may not signal is reported and left alone.
+  The identity is **re-proved before every signal round**: one `ps` scan
+  collects the set, and each pid's `/proc/<pid>/exe` is read again
+  immediately before it is signalled (both rounds), because a pid can be
+  recycled in between. A pid that no longer proves membership — the exact
+  AppImage path for a parent, a path under the resolved mount for a
+  child, both realpath-normalised — is reported as `identity-changed`,
+  never signalled, and does not count as a survivor. The scan itself is
+  one bounded `ps -eo pid=,exe=` (10 s), never an unbounded one.
   A grant to quit is CLI-level and explicit — `--kill-running`, or a yes
   to the one interactive question — and it is the only thing that makes
   the update signal anything: without it the command reports
@@ -740,8 +782,8 @@ No arguments prints usage and exits **2**.
 | `download_size` | int or null | Byte size of the available update (`null` unless filled by a check) |
 | `manager` | string or null | Update manager name (`StaticFileUpdater`, `GithubUpdater`, `GitlabUpdater`, `CodebergUpdater`, `ForgejoUpdater`) or `null` when no source exists |
 | `embedded_source` | boolean | True when the source comes from the AppImage's embedded `.upd_info` string (false for custom configs and for no source) |
-| `running` | boolean | True when the AppImage is currently running (`utils.is_app_running`: a `ps` `exe` equal to the AppImage path, or a `fuse.*` mount in `/proc/mounts` attributed to it — see Process identity under Security model). The mount signal can outlive the processes, so `true` with `running_pids` 0 is possible |
-| `running_pids` | int | How many processes belong to this AppImage: the runtime parent (its `exe` is the AppImage path) **plus** the helpers running out of the `fuse.*` mount attributed to it — the set `--kill-running` would close (`procs.pids_for`). `0` when the app is not running (a non-running row is never scanned) and `0` when the count cannot be determined (a failed scan is never an error). **Display-only**: the panel's force-quit prompt names it; no command reads it back |
+| `running` | boolean | True when the AppImage is currently running. Computed by **one rule shared with `running_pids`** (`utils._running_by_ps` → `procs.pids_for`'s `parent` list, plus the `fuse.*` mount signal for the runtime that has no attributable exe): a process whose `/proc/<pid>/exe` is the AppImage path (compared through `os.path.realpath`, so a symlinked install directory matches either way round), or a `fuse.*` mount in `/proc/mounts` attributed to it (matched on the mount source's basename — see Process identity under Security model). Because the mount signal can outlive the processes, `running: true` with `running_pids: 0` is possible: the mount is still there, no process of ours is |
+| `running_pids` | int | How many processes belong to this AppImage: the runtime parent (its `exe` is the AppImage path) **plus** the helpers running out of the `fuse.*` mount attributed to it — the set `--kill-running` would close (`procs.pids_for`). `0` when the app is not running (a non-running row is never scanned) and `0` when the count cannot be determined (a failed scan is a warning, never an error, and never flips `running`). **Display-only**: the panel's prompt names it; no command reads it back. A listing builds one process table (and one `/proc/mounts` read) and reuses it for every running row, because the panel polls the listing every 10 s |
 | `exec_arguments` | string | The desktop entry's `Exec=` arguments, e.g. `"--no-sandbox %U"` or `"%U"`; `""` when the app has none. The desktop field codes (`%f %F %u %U %i %c %k`) stay **verbatim** — stripping them is the UI's job. The current desktop entry wins; when it carries no arguments, the install-time `default_exec_arguments` from `apps.ini` is used instead |
 
 > `exec_arguments` and `running_pids` are **additive** keys: every other

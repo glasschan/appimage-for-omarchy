@@ -322,8 +322,12 @@ class JobWriter:
                 self._doc['progress'] = 1.0
         self._write()
 
-    def finish_error(self, message: str):
-        self.finish('error', message, error=message)
+    def finish_error(self, message: str, force_quit: dict = None):
+        """The error terminal document. `force_quit` is threaded through
+        like finish()'s: a job that closed the app and THEN failed has to
+        say so, or the document claims nothing was closed while the user's
+        app is gone."""
+        self.finish('error', message, error=message, force_quit=force_quit)
 
     # ---------------------------------------------------------- heartbeat
 

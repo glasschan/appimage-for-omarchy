@@ -260,9 +260,15 @@ Panel {
   property string sourceEditManager: ""
   property var sourceEditValues: ({})
   property bool sourceBusy: false
-  // Focus count over the editor's dynamic text fields; PanelKeyCatcher
-  // must hand raw keys to whichever field is typing (see formEditing).
-  property int sourceFieldFocusCount: 0
+  // Focus count over EVERY editable text field in the panel (the picker's
+  // path field, the source editor's dynamic fields). PanelKeyCatcher must
+  // hand raw keys to whichever field is typing (see formEditing), and it
+  // has to be blocked for as long as one holds focus: its Keys handler
+  // CONSUMES every key it is handed — a handler that only returns still
+  // accepts — so an unblocked catcher silently eats typed characters (the
+  // force-quit card exposed exactly that: it early-returns on single-letter
+  // text keys while it asks, and `blocked` was formEditing only).
+  property int textFieldFocusCount: 0
   // Mirrors the per-row manager Dropdown's popupOpen so formEditing can
   // keep blocking the key catcher while the popup (outside this item
   // tree) owns keys — see onPopupOpenChanged on the dropdown.
@@ -351,7 +357,7 @@ Panel {
   // at the bottom of this file), so guard on the loaded items.
   readonly property bool formEditing: (pickerFieldLoader.item
       ? pickerFieldLoader.item.activeFocus : false)
-    || sourceFieldFocusCount > 0
+    || textFieldFocusCount > 0
     || root.sourceDropdownOpen
     || (settingsNumbersLoader.item
         ? settingsNumbersLoader.item.anyFieldFocused : false)
@@ -1015,9 +1021,9 @@ Panel {
         Model.setStatus(d.message)
       }
     } else if (d.state === "error") {
-      Model.setError(d.errorText !== ""
-        ? d.errorText
-        : (d.message !== "" ? d.message : strings.backendFailed))
+      // G: the error line also carries the closed-app clause when the job
+      // closed the app and THEN failed (force_quit on an error document)
+      Model.setError(Model.jobErrorBanner(d, strings.backendFailed))
     } else { // interrupted: dead updater or a heartbeat stale past 120 s
       Model.setError(strings.jobInterrupted)
     }
@@ -1156,10 +1162,10 @@ Panel {
     sourceEditManager = item.manager
     rebuildSourceEditValues()
     sourceEditId = item.id
-    // Switching rows empties the previous row's Repeater model, which
+    // Switched rows empty the previous row's Repeater model, which
     // Loader-destroys its fields (see closeSourceEditor for why the count
     // must be zeroed by hand).
-    sourceFieldFocusCount = 0
+    textFieldFocusCount = 0
     // Coarse reveal: the editor may sit below the fold of a long list.
     Qt.callLater(function() {
       if (root.sourceEditId !== "" && listFlick) {
@@ -1203,7 +1209,7 @@ Panel {
     // Loader-destroyed fields may never deliver their final
     // activeFocusChanged(false); zero the count so the key catcher cannot
     // stay blocked forever.
-    sourceFieldFocusCount = 0
+    textFieldFocusCount = 0
   }
 
   function rebuildSourceEditValues() {
@@ -1216,7 +1222,7 @@ Panel {
     }
     // Reset before the model swap re-creates the Loader-held fields, for
     // the same skipped-leave reason as closeSourceEditor above.
-    sourceFieldFocusCount = 0
+    textFieldFocusCount = 0
     sourceEditValues = values
   }
 
@@ -3432,7 +3438,7 @@ Panel {
       enabled: !root.sourceBusy
       value: root.sourceEditValues[fieldKey] || ""
       onEdited: function(v) { root.setSourceValue(fieldKey, v) }
-      onActiveFocusChanged: root.sourceFieldFocusCount = activeFocus ? root.sourceFieldFocusCount + 1 : Math.max(0, root.sourceFieldFocusCount - 1)
+      onActiveFocusChanged: root.textFieldFocusCount = activeFocus ? root.textFieldFocusCount + 1 : Math.max(0, root.textFieldFocusCount - 1)
     }
   }
 
@@ -3495,6 +3501,10 @@ Panel {
         }
       }
       onAccepted: root.requestPreview(root.pickerPath)
+      // Same count as the editor fields: the key catcher stays blocked
+      // while this field types, whatever card is on screen (see
+      // textFieldFocusCount).
+      onActiveFocusChanged: root.textFieldFocusCount = activeFocus ? root.textFieldFocusCount + 1 : Math.max(0, root.textFieldFocusCount - 1)
     }
   }
 

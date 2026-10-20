@@ -1216,6 +1216,12 @@ const adopt = (f, pidAlive, offsetSec) =>
       status: "updated", new_version: "v2.0", message: "updated successfully",
       heartbeat: 1792494400
     }, over)), null, nowMs).decision
+  const err = (over) => JobDocs.adoptDocumentForPanel(
+    JSON.stringify(Object.assign({
+      schema_version: 1, desktop_id: "fakeapp.desktop", phase: "error",
+      status: "error", error: "download failed", message: "download failed",
+      heartbeat: 1792494400
+    }, over)), null, nowMs).decision
   const updatedLine = Model.formatCount("v2.0", Model.strings.updated)
 
   check("#27: forceQuit rides the panel decision (null vs real record)",
@@ -1226,23 +1232,52 @@ const adopt = (f, pidAlive, offsetSec) =>
     Model.jobDoneBanner(done({}), "") === updatedLine
     && Model.jobDoneBanner(done({ force_quit: null }), "") === updatedLine)
   check("#27: done banner appends the closed-app clause once a close was recorded",
-    Model.jobDoneBanner(done({ force_quit: { count: 2, sigkill: true } }), "")
+    Model.jobDoneBanner(done({ force_quit: { count: 2, sigkill: false } }), "")
       === updatedLine + Model.strings.forceQuitApplied
     && Model.jobDoneBanner(done({ force_quit: { count: 1 } }), "")
       === updatedLine + Model.strings.forceQuitApplied)
+  check("#27: SIGKILL reads as force-quit, TERM as closed",
+    Model.jobDoneBanner(done({ force_quit: { count: 2, sigkill: true } }), "")
+      === updatedLine + Model.strings.forceQuitAppliedSigkill
+    && Model.strings.forceQuitAppliedSigkill
+      !== Model.strings.forceQuitApplied)
   check("#27: a malformed force_quit never makes the banner claim a close",
     ["closed 3", [3, true], 7, true].every((v) =>
       Model.jobDoneBanner(done({ force_quit: v }), "") === updatedLine)
     && Model.jobDoneBanner(done({ force_quit: { count: "junk" } }), "") === updatedLine
     && Model.jobDoneBanner(done({ force_quit: { count: -2 } }), "") === updatedLine)
-  check("#27: up-to-date banner keeps message/fallback and gains the clause",
+  check("#27: up-to-date banner keeps message/fallback and claims no close",
     Model.jobDoneBanner(done({ status: "up-to-date", new_version: "",
       message: "" }), Model.strings.upToDate) === Model.strings.upToDate
     && Model.jobDoneBanner(done({ status: "up-to-date", new_version: "",
       message: "already current" }), Model.strings.upToDate) === "already current"
     && Model.jobDoneBanner(done({ status: "up-to-date", new_version: "",
       message: "already current", force_quit: { count: 1, sigkill: false } }),
-      Model.strings.upToDate) === "already current" + Model.strings.forceQuitApplied)
+      Model.strings.upToDate) === "already current"
+    && Model.jobDoneBanner(done({ status: "up-to-date", new_version: "",
+      message: "already current", force_quit: { count: 1, sigkill: true } }),
+      Model.strings.upToDate) === "already current")
+  check("#27: an error banner says the close came before the failure",
+    Model.jobErrorBanner(err({ force_quit: { count: 2, sigkill: false } }),
+      Model.strings.backendFailed)
+      === "download failed" + Model.strings.forceQuitFailed
+    && Model.jobErrorBanner(err({ force_quit: { count: 2, sigkill: true } }),
+      Model.strings.backendFailed)
+      === "download failed" + Model.strings.forceQuitFailedSigkill
+    && Model.strings.forceQuitFailed !== Model.strings.forceQuitApplied)
+  check("#27: an error banner without force_quit is exactly the error text",
+    Model.jobErrorBanner(err({}), Model.strings.backendFailed) === "download failed"
+    && Model.jobErrorBanner(err({ force_quit: { count: 0 } }),
+      Model.strings.backendFailed) === "download failed"
+    && Model.jobErrorBanner(err({ force_quit: "closed 2" }),
+      Model.strings.backendFailed) === "download failed")
+  check("#27: an error banner falls back to message, then to the caller's line",
+    Model.jobErrorBanner(err({ error: "", message: "install failed" }),
+      Model.strings.backendFailed) === "install failed"
+    && Model.jobErrorBanner(err({ error: "", message: "" }),
+      Model.strings.backendFailed) === Model.strings.backendFailed
+    && Model.jobErrorBanner(null, Model.strings.backendFailed)
+      === Model.strings.backendFailed)
   check("#27: a version-less updated doc falls back to the backend message",
     Model.jobDoneBanner(done({ new_version: "" }), "") === "updated successfully")
   check("#27: banner helper tolerates a missing decision",

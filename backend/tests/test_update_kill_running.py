@@ -186,6 +186,81 @@ class RunUpdateKillTests(_RunningAppTestCase):
         self.assertIsNone(self.installs[0]['before_replace'])
         self.assertEqual(self.probe.sent, [])
 
+    # -------------------------------------------------- finding A / G2
+
+    def test_up_to_date_never_touches_a_process(self):
+        # no update, no quit: the availability decision comes first, so
+        # --kill-running must not close an app for a no-op update
+        self.manager.is_update_available.return_value = False
+        result = self._run(kill_running=True)
+        self.assertEqual(result.status, 'up-to-date')
+        self.assertEqual(self.probe.sent, [])
+        self.assertEqual(self.installs, [])
+        self.assertIsNone(result.force_quit)
+
+    def test_up_to_date_does_not_ask_either(self):
+        self.manager.is_update_available.return_value = False
+        asked = mock.Mock(return_value=True)
+        result = self._run(confirm_close=asked)
+        self.assertEqual(result.status, 'up-to-date')
+        self.assertEqual(asked.call_count, 0)
+        self.assertEqual(self.probe.sent, [])
+
+    # -------------------------------------------------- finding C / G5
+
+    def test_keep_both_with_kill_running_never_signals(self):
+        # keep-both installs beside the running file, so os.replace never
+        # touches the running app's path and closing it is gratuitous
+        result = self._run(kill_running=True, keep_both=True)
+        self.assertEqual(result.status, 'updated')
+        self.assertEqual(self.probe.sent, [])
+        self.assertIsNone(self.installs[0]['before_replace'])
+        self.assertIsNone(result.force_quit)
+
+    # -------------------------------------------------- finding F / 12
+
+    def test_survivor_refuses_the_update_before_the_download(self):
+        # a target that survives (signal denied or ignored) must stop the
+        # job: the replace would swap the file under a live process while
+        # the banner claims it was closed
+        self.probe = self._probe(unpermitted={PARENT_PID, CHILD_PID})
+        with self.assertRaises(cli.OperationError) as ctx:
+            self._run(kill_running=True)
+        message = str(ctx.exception)
+        self.assertIn(str(PARENT_PID), message)
+        self.assertIn(str(CHILD_PID), message)
+        self.assertIn('the update start', message)
+        self.assertIn('refusing', message)
+        self.assertEqual(self.installs, [])      # nothing downloaded
+
+    def test_survivor_refuses_the_replace_at_the_hook(self):
+        def install(manager, el, keep_both=False, progress_cb=None,
+                    before_replace=None):
+            self.installs.append({'before_replace': before_replace})
+            # a process that appeared during the download and cannot be
+            # signalled: the seam is the last line of defence
+            self.probe._processes.append((LATE_PID, f'{MOUNT}/usr/bin/new'))
+            self.probe.unpermitted.add(LATE_PID)
+            before_replace()
+            return mock.Mock(version='v2.0', size=11)
+
+        self._install = install
+        with self.assertRaises(cli.OperationError) as ctx:
+            self._run(kill_running=True)
+        message = str(ctx.exception)
+        self.assertIn(str(LATE_PID), message)
+        self.assertIn('the atomic replace', message)
+
+    def test_a_closed_app_that_still_dies_is_not_refused(self):
+        # the normal case stays untouched: SIGKILL's target is gone, so
+        # nothing survives and the update proceeds
+        self.probe = self._probe(
+            reactions={PARENT_PID: 'survive-term',
+                       CHILD_PID: 'survive-term'})
+        result = self._run(kill_running=True)
+        self.assertEqual(result.status, 'updated')
+        self.assertEqual(result.force_quit, {'count': 2, 'sigkill': True})
+
 
 class AtomicInstallSeamTests(unittest.TestCase):
     """The seam itself: _atomic_install calls before_replace after the
@@ -252,6 +327,31 @@ class JobDocumentForceQuitTests(FakeXDGTestCase):
         jobs.JobWriter('thirdapp.desktop', pid=4242)
         self.assertNotIn('force_quit', jobs.read_job('thirdapp.desktop'))
 
+    def test_up_to_date_document_drops_a_stale_force_quit(self):
+        # finding B: an `up-to-date` document applied nothing, so it must
+        # never carry a close record — the banner would claim the app was
+        # closed to apply an update that did not exist
+        writer = jobs.JobWriter('fifthapp.desktop', pid=4242)
+        el = mock.Mock(version='v1.0', file_path='/x/fakeapp.appimage')
+        result = cli.UpdateResult('up-to-date', el=el, message='up to date',
+                                  force_quit={'count': 2, 'sigkill': False})
+        self.assertEqual(cli._finish_job_document(writer, result), 0)
+        doc = jobs.read_job('fifthapp.desktop')
+        self.assertEqual(doc['status'], 'up-to-date')
+        self.assertNotIn('force_quit', doc)
+
+    def test_finish_error_threads_the_force_quit_record(self):
+        # finding G: the writer takes the record too, so an error document
+        # can say the app was closed before the update failed
+        writer = jobs.JobWriter('sixthapp.desktop', pid=4242)
+        writer.finish_error('the download failed',
+                            force_quit={'count': 1, 'sigkill': True})
+        doc = jobs.read_job('sixthapp.desktop')
+        self.assertEqual(doc['phase'], 'error')
+        self.assertEqual(doc['status'], 'error')
+        self.assertEqual(doc['error'], 'the download failed')
+        self.assertEqual(doc['force_quit'], {'count': 1, 'sigkill': True})
+
 
 class AsyncGrantTests(_RunningAppTestCase):
     """The grant has to survive the detach: --async forwards the flag to
@@ -297,19 +397,175 @@ class AsyncGrantTests(_RunningAppTestCase):
         captured = {}
         with mock.patch.object(cli, '_cmd_update_async',
                                side_effect=lambda target, keep_both, force,
-                               kill_running, json_output:
-                               captured.update(kill_running=kill_running)
+                               kill_running, json_output, assume_yes=False:
+                               captured.update(kill_running=kill_running,
+                                               assume_yes=assume_yes)
                                or 0):
             code = cli.cmd_update(['fakeapp', '--async', '--json', '--yes',
                                    '--kill-running'])
         self.assertEqual(code, 0)
         self.assertTrue(captured['kill_running'])
 
+    def test_cmd_update_hands_yes_down_to_the_async_branch(self):
+        captured = {}
+        with mock.patch.object(cli, '_cmd_update_async',
+                               side_effect=lambda target, keep_both, force,
+                               kill_running, json_output, assume_yes=False:
+                               captured.update(assume_yes=assume_yes) or 0):
+            cli.cmd_update(['fakeapp', '--async', '--yes'])
+        self.assertTrue(captured['assume_yes'])
+
+    # -------------------------------------------------- finding D / G6
+
+    def _spy(self):
+        captured = {}
+
+        def spawn(desktop_id, target, keep_both, force, log_fd,
+                  kill_running=False):
+            captured.update(desktop_id=desktop_id, target=target,
+                            kill_running=kill_running, spawned=True)
+            return 4242, '/tmp/job.json', '/tmp/job.log'
+        return captured, spawn
+
+    def _async(self, tty, answer, running=True, keep_both=False,
+               assume_yes=False, json_output=False):
+        """Run the async parent in-process; returns (code, captured,
+        asks, stdout)."""
+        captured, spawn = self._spy()
+        asks = mock.Mock(return_value=answer)
+        out = io.StringIO()
+        with mock.patch.object(cli, '_spawn_update_job', side_effect=spawn), \
+                mock.patch.object(cli, '_stdin_is_tty', return_value=tty), \
+                mock.patch.object(cli.appimage_provider, 'is_app_running',
+                                  return_value=running), \
+                mock.patch('builtins.input', asks), \
+                redirect_stdout(out):
+            code = cli._cmd_update_async('fakeapp', keep_both=keep_both,
+                                         force=False, json_output=json_output,
+                                         assume_yes=assume_yes)
+        return code, captured, asks, out.getvalue()
+
+    def test_async_asks_on_a_tty_and_forwards_the_grant(self):
+        code, captured, asks, _out = self._async(tty=True, answer='y')
+        self.assertEqual(code, 0)
+        self.assertEqual(asks.call_count, 1)
+        self.assertTrue(captured['spawned'])
+        self.assertTrue(captured['kill_running'])
+
+    def test_async_decline_starts_no_job(self):
+        code, captured, asks, out = self._async(tty=True, answer='n')
+        self.assertEqual(code, 0)
+        self.assertEqual(asks.call_count, 1)
+        self.assertNotIn('spawned', captured)
+        self.assertIn('--kill-running', out)
+
+    def test_async_never_asks_without_a_tty(self):
+        code, captured, asks, _out = self._async(tty=False, answer=None)
+        self.assertEqual(code, 0)
+        self.assertEqual(asks.call_count, 0)
+        self.assertFalse(captured['kill_running'])
+
+    def test_async_never_asks_with_yes(self):
+        code, captured, asks, _out = self._async(tty=True, answer=None,
+                                                 assume_yes=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(asks.call_count, 0)
+        self.assertFalse(captured['kill_running'])
+
+    def test_async_never_asks_with_keep_both(self):
+        # finding C: nothing is replaced in place, so nothing is closed
+        code, captured, asks, _out = self._async(tty=True, answer=None,
+                                                 keep_both=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(asks.call_count, 0)
+        self.assertFalse(captured['kill_running'])
+
+    def test_async_does_not_ask_when_the_app_is_not_running(self):
+        code, captured, asks, _out = self._async(tty=True, answer=None,
+                                                 running=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(asks.call_count, 0)
+        self.assertFalse(captured['kill_running'])
+
+    def test_async_with_the_flag_never_asks(self):
+        captured, spawn = self._spy()
+        asks = mock.Mock(return_value=AssertionError)
+        with mock.patch.object(cli, '_spawn_update_job', side_effect=spawn), \
+                mock.patch.object(cli, '_stdin_is_tty', return_value=True), \
+                mock.patch.object(cli.appimage_provider, 'is_app_running',
+                                  return_value=True), \
+                mock.patch('builtins.input', asks), \
+                redirect_stdout(io.StringIO()):
+            code = cli._cmd_update_async('fakeapp', keep_both=False,
+                                         force=False, kill_running=True,
+                                         json_output=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(asks.call_count, 0)
+        self.assertTrue(captured['kill_running'])
+
+
+class ErrorDocumentForceQuitTests(_RunningAppTestCase):
+    """Finding G / spec G4: a job that closed the app and then failed must
+    publish the close on its `error` document — that is the difference
+    between "the update failed, the app is still there" and "the update
+    failed and the app was closed for nothing"."""
+
+    def setUp(self):
+        super().setUp()
+        self.probe = self._probe()
+        probe_patch = mock.patch.object(procs, '_PROBE', self.probe)
+        probe_patch.start()
+        self.addCleanup(probe_patch.stop)
+        manager = mock.Mock(download_size=10, available_version='v2.0',
+                            embedded=False)
+        manager.name = 'StaticFileUpdater'
+        manager.is_update_available.return_value = True
+        self.manager = manager
+
+    def _run_failing(self, kill_running=True, sigkill=False, running=True):
+        reactions = ({PARENT_PID: 'survive-term',
+                      CHILD_PID: 'survive-term'} if sigkill else {})
+        self.probe = self._probe(parents=running, children=running,
+                                 reactions=reactions)
+        with mock.patch.object(procs, '_PROBE', self.probe), \
+                mock.patch.object(cli.UpdateManagerChecker,
+                                  'check_url_for_app',
+                                  return_value=self.manager), \
+                mock.patch.object(cli.appimage_provider, 'update_from_url',
+                                  side_effect=cli.OperationError(
+                                      'the download failed')):
+            code = cli._job_entrypoint('fakeapp.desktop', 'fakeapp',
+                                      keep_both=False, force=False,
+                                      kill_running=kill_running)
+        return code, jobs.read_job('fakeapp.desktop')
+
+    def test_error_document_carries_the_close_that_happened(self):
+        code, doc = self._run_failing()
+        self.assertEqual(code, 1)
+        self.assertEqual(doc['status'], 'error')
+        self.assertEqual(doc['error'], 'the download failed')
+        self.assertEqual(doc['force_quit'], {'count': 2, 'sigkill': False})
+
+    def test_error_document_keeps_the_sigkill_bit(self):
+        code, doc = self._run_failing(sigkill=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(doc['force_quit'], {'count': 2, 'sigkill': True})
+
+    def test_error_document_without_a_close_stays_clean(self):
+        # nothing was closed (the app was not running), so the document
+        # carries no trace of a close
+        code, doc = self._run_failing(kill_running=True, running=False)
+        self.assertEqual(code, 1)
+        self.assertEqual(doc['status'], 'error')
+        self.assertNotIn('force_quit', doc)
+
 
 class RunningGuardCliTests(_RunningAppTestCase):
     """cmd_update's flag parsing and the one interactive question, run
-    in-process against a served source that reports up-to-date (so the
-    flow stops right after the guard)."""
+    in-process against a source that HAS an update (the guard now runs
+    after the availability check, so an up-to-date source would stop the
+    flow before the question — finding A). update_from_url is stubbed, so
+    nothing downloads."""
 
     def run_cmd(self, func, args: list):
         """Run a cmd_* function in-process (same shape as test_cli's
@@ -337,12 +593,37 @@ class RunningGuardCliTests(_RunningAppTestCase):
         Config.set_app_update_config(el, 'StaticFileUpdater',
                                      {'url': server.url('/f.appimage')})
         self.mounts = os.path.join(self.sandbox, 'mounts')
+        # the measured shape of a live type-2 runtime's entry: the SOURCE
+        # field is the file's basename, never the absolute path (that is
+        # what 0.9.0's basename matching exists for)
         Path(self.mounts).write_text(
-            f'{self.appimage} {MOUNT} fuse.AppImage rw 0 0\n')
+            f'fakeapp.appimage {MOUNT} fuse.fakeapp.appimage rw 0 0\n')
         self.probe = self._probe()
         probe_patch = mock.patch.object(procs, '_PROBE', self.probe)
         probe_patch.start()
         self.addCleanup(probe_patch.stop)
+        # an update IS available: otherwise the availability check answers
+        # first and the guard is never reached
+        # every attribute the JSON document reads must be a real value
+        manager = mock.Mock(download_size=10, available_version='v2.0',
+                            embedded=False)
+        manager.name = 'StaticFileUpdater'      # `name=` would christen it
+        manager.is_update_available.return_value = True
+        for target, kwargs in (
+                ((cli.UpdateManagerChecker, 'check_url_for_app'),
+                 {'return_value': manager}),
+                ((cli.appimage_provider, 'update_from_url'),
+                 {'side_effect': self._install})):
+            patcher = mock.patch.object(*target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _install(manager, el, keep_both=False, progress_cb=None,
+                 before_replace=None):
+        # the seam is not exercised here (RunUpdateKillTests owns it): the
+        # job-start guard is what these tests are about
+        return mock.Mock(version='v2.0', size=11)
 
     def _run(self, args, tty, answer=None, runner=None):
         runner = runner or (lambda: self.run_cmd(cli.cmd_update, args))
@@ -366,7 +647,7 @@ class RunningGuardCliTests(_RunningAppTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(asks.call_count, 1)
         self.assertIn('is running', err)
-        self.assertIn('up to date', out)
+        self.assertIn('was updated successfully', out)
         self.assertEqual(self._acted_on(self.probe),
                          [PARENT_PID, CHILD_PID])
 
@@ -399,7 +680,7 @@ class RunningGuardCliTests(_RunningAppTestCase):
                                           tty=False)
         self.assertEqual(code, 0)
         self.assertEqual(asks.call_count, 0)
-        self.assertIn('up to date', out)
+        self.assertIn('was updated successfully', out)
         self.assertEqual(self._acted_on(self.probe),
                          [PARENT_PID, CHILD_PID])
 
@@ -425,7 +706,19 @@ class RunningGuardCliTests(_RunningAppTestCase):
                                           answer=AssertionError)
         self.assertEqual(code, 0)
         self.assertEqual(asks.call_count, 0)
-        self.assertIn('up to date', out)
+        self.assertIn('was updated successfully', out)
+        self.assertEqual(self.probe.sent, [])
+
+    def test_ctrl_c_on_the_question_declines(self):
+        # finding 9: an interrupt at the prompt degrades to
+        # `skipped-running`, exactly like a plain "no"
+        asks = mock.Mock(side_effect=KeyboardInterrupt)
+        with mock.patch.object(utils, 'PROC_MOUNTS_PATH', self.mounts), \
+                mock.patch.object(cli, '_stdin_is_tty', return_value=True), \
+                mock.patch('builtins.input', asks):
+            out, _err, code = self.run_cmd(cli.cmd_update, ['fakeapp'])
+        self.assertEqual(code, 0)
+        self.assertIn('--kill-running', out)
         self.assertEqual(self.probe.sent, [])
 
     def test_json_requires_yes_with_the_flag(self):

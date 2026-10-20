@@ -11,8 +11,9 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
-from omarchy_appimage import utils
+from omarchy_appimage import procs, utils
 
 # Synthetic /proc/mounts content: two FUSE AppImage mounts (as produced
 # by running type-2 AppImages, one with octal-escaped spaces in the
@@ -157,6 +158,42 @@ class IsAppRunningTests(MountsTestCase):
 
     def test_empty_path_is_false(self):
         self.assertFalse(utils.is_app_running('', self.mounts))
+
+
+class RunningByPsRuleTests(unittest.TestCase):
+    """Finding 7: `running` and `running_pids` are computed by ONE rule.
+
+    `_running_by_ps` asks procs.pids_for — the same identity rule the pid
+    list uses, with the same bounded `ps` (10 s) — so one JSON object can
+    never report `running: false` with a non-zero `running_pids`. It used
+    to run its own `ps -eo exe` with run_command's 120 s default and
+    compare strings."""
+
+    def test_the_parent_rule_is_the_procs_one(self):
+        with mock.patch.object(procs, 'pids_for',
+                               return_value={'parent': [11],
+                                             'children': []}) as scan:
+            self.assertTrue(utils._running_by_ps(FUSE_APP))
+        scan.assert_called_once_with(FUSE_APP)
+
+    def test_children_alone_are_not_the_app_itself(self):
+        with mock.patch.object(procs, 'pids_for',
+                               return_value={'parent': [],
+                                             'children': [3]}):
+            self.assertFalse(utils._running_by_ps(FUSE_APP))
+
+    def test_a_failing_scan_is_one_warning_and_false(self):
+        with mock.patch.object(procs, 'pids_for',
+                               side_effect=OSError('ps wedged')):
+            with self.assertLogs(level='WARNING') as logs:
+                self.assertFalse(utils._running_by_ps(FUSE_APP))
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('ps lookup failed', logs.output[0])
+
+    def test_empty_path_never_spawns_ps(self):
+        with mock.patch.object(procs, 'pids_for') as scan:
+            self.assertFalse(utils._running_by_ps(''))
+        scan.assert_not_called()
 
 
 class Fuse2ProbeTests(unittest.TestCase):

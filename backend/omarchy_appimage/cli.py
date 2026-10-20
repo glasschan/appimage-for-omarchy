@@ -168,7 +168,7 @@ def _get_file_from_args(args) -> str:
     raise OperationError('please specify a valid AppImage file')
 
 
-def _running_pid_count(el) -> int:
+def _running_pid_count(el, probe=None) -> int:
     """How many processes provably belong to this installed AppImage
     (ticket #27): `procs.pids_for`'s runtime parent plus its FUSE-mount
     children — the same set `--kill-running` would close.
@@ -176,16 +176,22 @@ def _running_pid_count(el) -> int:
     Display-only: the panel's force-quit card names the number before the
     user agrees to close the app, and nothing acts on it. Best-effort like
     the `running` flag it accompanies — a failed scan reports 0 instead of
-    erroring, and callers only ask for RUNNING rows."""
+    erroring (one warning, not a traceback: the panel polls this every
+    10 s), and callers only ask for RUNNING rows.
+
+    `probe` is procs' probe seam; a listing passes ONE cached probe (see
+    procs._cached_probe) so N running rows cost one `ps` and one mounts
+    parse instead of N of each."""
     try:
-        found = procs.pids_for(el.file_path)
+        found = procs.pids_for(el.file_path, probe=probe)
         return len(found['parent']) + len(found['children'])
-    except Exception:
-        logging.exception('pids_for failed')
+    except Exception as e:
+        logging.warning('could not count the processes of %s: %s',
+                        el.file_path, e)
         return 0
 
 
-def _make_app_json(el, manager=None, running=None) -> dict:
+def _make_app_json(el, manager=None, running=None, probe=None) -> dict:
     if running is None:
         try:
             running = appimage_provider.is_app_running(el)
@@ -207,7 +213,7 @@ def _make_app_json(el, manager=None, running=None) -> dict:
         # additive (schema_version stays 1): how many processes belong to
         # this AppImage, 0 when it is not running or the scan cannot tell.
         # Only a running row is scanned — a non-running one costs nothing.
-        'running_pids': _running_pid_count(el) if running else 0,
+        'running_pids': _running_pid_count(el, probe) if running else 0,
         # the desktop entry's Exec arguments (field codes stay VERBATIM —
         # the UI strips them), "" when the app has none
         'exec_arguments': getattr(el, 'exec_arguments', '') or '',
@@ -1001,13 +1007,18 @@ def cmd_list_installed(args: list) -> int:
 
     if json_output:
         table = []
+        # ONE process table + one mounts read for the whole listing: the
+        # panel polls this every 10 s and a scan per running row would
+        # spawn a fresh `ps` each time
+        scan = procs._cached_probe()
         for a in apps:
             # check_url_for_app is local-only (apps.ini config + the
             # embedded .upd_info ELF section) and fills the manager /
             # embedded_source fields; available_version / download_size
             # stay null until an actual check runs (--list-updates).
             table.append(_make_app_json(
-                a, manager=UpdateManagerChecker.check_url_for_app(a)))
+                a, manager=UpdateManagerChecker.check_url_for_app(a),
+                probe=scan))
         _print_json({
             'schema_version': constants.JSON_SCHEMA_VERSION,
             'installed': table,
@@ -1124,9 +1135,10 @@ def cmd_list_updates(args: list) -> int:
     updates = _check_updates()
 
     if json_output:
+        scan = procs._cached_probe()
         _print_json({
             'schema_version': constants.JSON_SCHEMA_VERSION,
-            'updates': [_make_app_json(el, manager=manager)
+            'updates': [_make_app_json(el, manager=manager, probe=scan)
                         for el, manager in updates],
         })
         return EXIT_OK
@@ -1219,6 +1231,11 @@ def _ask_close_running(el) -> bool:
         # the prompt above ended without a newline
         print(file=sys.stderr)
         return False
+    except KeyboardInterrupt:
+        # Ctrl-C at the question means "no": the caller gets the
+        # documented skipped-running result instead of a traceback
+        print(file=sys.stderr)
+        return False
     return answer.strip().lower() in ('y', 'yes')
 
 
@@ -1234,18 +1251,41 @@ def _running_app_prompt(json_output: bool, assume_yes: bool):
     return _ask_close_running
 
 
-def _close_running_app(file_path: str, stage: str, probe=None) -> dict:
+def _close_running_app(file_path: str, stage: str, probe=None,
+                       sink: dict = None) -> dict:
     """procs.quit_app plus the job document's additive record of it.
+
     Returns {'count': n, 'sigkill': bool} for the processes that were
     actually closed, or None when nothing was signalled (not running any
-    more, or never was)."""
+    more, or never was).
+
+    A pid that survived the round — another user's process, a signal the
+    app blocks, a SIGKILL that did not take — is never a licence to swap
+    the file underneath it: that raises OperationError naming the pid(s)
+    and the stage. The record is written to `sink` FIRST, so a job that
+    closed the app and then failed still says so in its error document.
+
+    `sink` is the caller's dict (run_update's force-quit sink); passing it
+    keeps the record visible to the failure path without a second scan."""
     report = procs.quit_app(file_path, probe=probe)
-    if not report['signalled']:
-        return None
-    logging.info('%d process(es) closed before %s: %s',
-                 len(report['signalled']), stage, report['outcomes'])
-    return {'count': len(report['signalled']),
-            'sigkill': bool(report['killed_with_sigkill'])}
+
+    record = None
+    if report['signalled']:
+        logging.info('%d process(es) closed before %s: %s',
+                     len(report['signalled']), stage, report['outcomes'])
+        record = {'count': len(report['signalled']),
+                  'sigkill': bool(report['killed_with_sigkill'])}
+
+    if sink is not None:
+        sink['force_quit'] = _merge_force_quit(sink.get('force_quit'),
+                                               record)
+
+    if report['survived']:
+        pids = ', '.join(str(pid) for pid in report['survived'])
+        raise OperationError(
+            f'{file_path} is still running before {stage}: process(es) '
+            f'{pids} could not be closed; refusing to replace the file')
+    return record
 
 
 def _merge_force_quit(current: dict, extra: dict):
@@ -1262,9 +1302,10 @@ def _merge_force_quit(current: dict, extra: dict):
 def run_update(target: str, keep_both: bool = False,
                force: bool = False, progress_cb=None,
                on_stage=None, kill_running: bool = False,
-               confirm_close=None, probe=None) -> UpdateResult:
+               confirm_close=None, probe=None,
+               force_quit_sink: dict = None) -> UpdateResult:
     """The shared update pipeline: resolve target → update-source check →
-    running guard → availability check → download to temp → verify →
+    availability check → running guard → download to temp → verify →
     atomic replace → scoped temp-dir cleanup → pending-notification drop.
 
     Plain function: no argv parsing, no stdout writes. Raises the same
@@ -1284,8 +1325,11 @@ def run_update(target: str, keep_both: bool = False,
         download_size is available), 'replacing' after the download and
         its digest verification returned (via _ManagerStageProxy).
 
-    Running-app guard (ticket 26). Three modes, and only two of them
-    signal anything:
+    Running-app guard (ticket 26). The availability check runs FIRST, so
+    an update that does not exist never costs the user their running app
+    (status `up-to-date`, no process touched, no force_quit). When an
+    update DOES exist, three modes decide what happens, and only two of
+    them signal anything:
       * neither a grant nor consent → the `skipped-running` result,
         untouched, and no process is signalled;
       * `kill_running=True` (--kill-running) → an unconditional grant for
@@ -1293,17 +1337,27 @@ def run_update(target: str, keep_both: bool = False,
         download (fail fast — downloading for an app that cannot be
         replaced wastes the user's bandwidth), and once immediately
         before the atomic replace, so a process relaunched during the
-        download is closed too;
+        download is closed too. A process that survives either round is
+        an OperationError: replacing the file under a running app is
+        exactly what the banner must never lie about;
       * `confirm_close(el) -> bool` → the interactive path: the same
         grant, but only when the caller's question was answered yes. The
         prompt lives in cmd_update; the core never writes stdout.
+
+    `keep_both` installs into a NEW file: os.replace never touches the
+    running app's path, so neither quit call runs — --kill-running is
+    accepted and ignored in that combination (a running app is not in
+    the way).
 
     `force` keeps its documented meaning — bypass the guard silently and
     replace under a running app without closing it — and never signals.
     When both are given the explicit close request wins.
 
     `probe` is procs' seam: it is the process view and signal sender for
-    both quit calls (None = the production probe).
+    both quit calls (None = the production probe). `force_quit_sink`, when
+    given, receives the job's force-quit record as soon as it is known, so
+    a failure AFTER the app was closed (which raises, so there is no
+    result) can still publish it.
     """
     el = _resolve_target(target)
 
@@ -1312,12 +1366,23 @@ def run_update(target: str, keep_both: bool = False,
         raise OperationError('No update method was found for this AppImage '
                              '(set one with --set-update-source)')
 
+    # A: the availability decision comes FIRST. Closing (or refusing for)
+    # the running app for an update that turns out not to exist is the
+    # worst possible trade — the user loses the app and gains nothing.
+    # tri-state: None (state not determinable) still attempts the download
+    if manager.is_update_available() is False:
+        return UpdateResult(status='up-to-date', el=el, manager=manager)
+
+    sink = force_quit_sink if force_quit_sink is not None else {}
     force_quit = None
-    granted = kill_running
-    if kill_running:
+    # C: --keep-both writes beside the running app, never over it
+    replaces_in_place = not keep_both
+    granted = kill_running and replaces_in_place
+    if kill_running and replaces_in_place:
         force_quit = _close_running_app(el.file_path, 'the update start',
-                                        probe)
-    elif not force and appimage_provider.is_app_running(el):
+                                        probe, sink)
+    elif not kill_running and not force \
+            and appimage_provider.is_app_running(el):
         if confirm_close is None or not confirm_close(el):
             return UpdateResult(
                 status='skipped-running', el=el, manager=manager,
@@ -1328,11 +1393,7 @@ def run_update(target: str, keep_both: bool = False,
         # the user said yes: same grant as --kill-running
         granted = True
         force_quit = _close_running_app(el.file_path, 'the update start',
-                                        probe)
-
-    # tri-state: None (state not determinable) still attempts the download
-    if manager.is_update_available() is False:
-        return UpdateResult(status='up-to-date', el=el, manager=manager)
+                                        probe, sink)
 
     if on_stage is not None:
         on_stage('downloading', manager)
@@ -1356,7 +1417,7 @@ def run_update(target: str, keep_both: bool = False,
             force_quit = _merge_force_quit(
                 force_quit,
                 _close_running_app(appimage_path, 'the atomic replace',
-                                   probe))
+                                   probe, sink))
 
     temp_dirs_before = extractor.temp_dirs_snapshot()
     try:
@@ -1418,7 +1479,8 @@ def cmd_update(args: list) -> int:
     if async_job:
         return _cmd_update_async(positional[0], keep_both=keep_both,
                                  force=force, kill_running=kill_running,
-                                 json_output=json_output)
+                                 json_output=json_output,
+                                 assume_yes=assume_yes)
 
     result = run_update(positional[0], keep_both=keep_both, force=force,
                         kill_running=kill_running,
@@ -1473,7 +1535,8 @@ _JOB_HANDSHAKE_TIMEOUT_SECONDS = 10
 
 
 def _cmd_update_async(target: str, keep_both: bool, force: bool,
-                      json_output: bool, kill_running: bool = False) -> int:
+                      json_output: bool, kill_running: bool = False,
+                      assume_yes: bool = False) -> int:
     """Parent side of --update --async: validate the target (local name/id
     resolution only), take the job's atomic claim, refuse when a job is
     running for the app, then spawn the detached grandchild (see
@@ -1481,11 +1544,41 @@ def _cmd_update_async(target: str, keep_both: bool, force: bool,
     never runs the pipeline itself and never resolves the update manager:
     that is run_update's first step inside the grandchild, so a missing
     or broken source surfaces as a terminal `error` job document instead
-    of a second, drifting manager resolution here."""
+    of a second, drifting manager resolution here.
+
+    --async is NOT implicitly non-interactive any more: on a TTY the
+    close-the-running-app question is asked HERE, in the parent, before
+    anything is spawned (the grandchild's stdin is /dev/null, so a job
+    that asked would have to publish skipped-running after a
+    `job-started` that already told the user the update was under way).
+    A yes becomes the grandchild's --kill-running grant."""
     el = _resolve_target(target)
     # fail closed BEFORE any side effect (no sweep, no fork): the id must
     # be able to name a job file, or this path cannot honour its contract
     desktop_id = _job_desktop_id(el)
+
+    # D: the question, still before any side effect — a decline leaves no
+    # claimed log, no sweep and no grandchild behind.
+    if not kill_running and not force and not keep_both:
+        ask = _running_app_prompt(json_output, assume_yes)
+        if ask is not None and appimage_provider.is_app_running(el):
+            if not ask(el):
+                message = (f'{el.file_path} was skipped because the '
+                           'application is running; pass --kill-running to '
+                           'close it and update, or --force to replace it '
+                           'in place')
+                if json_output:
+                    _print_json({
+                        'schema_version': constants.JSON_SCHEMA_VERSION,
+                        'result': 'skipped-running',
+                        'message': message,
+                        'app': _make_app_json(el),
+                    })
+                else:
+                    print(message)
+                return EXIT_OK
+            # a yes is the whole job's grant, exactly like --kill-running
+            kill_running = True
 
     # janitor sweep (ticket 03), parent-side only — never in the
     # grandchild: stale terminal/interrupted documents age out and orphan
@@ -1586,17 +1679,23 @@ def _job_entrypoint(desktop_id: str, target: str, keep_both: bool,
     async pipelines cannot drift."""
     writer = jobs.JobWriter(desktop_id)
     writer.start_heartbeat()
+    # G: run_update raises instead of returning a result when it fails, so
+    # the only way the error document can carry the force-quit record is
+    # this sink — filled the moment the app is actually closed.
+    sink = {}
     try:
         try:
             result = run_update(target, keep_both=keep_both, force=force,
                                 kill_running=kill_running,
                                 progress_cb=writer.progress_cb,
-                                on_stage=writer.stage)
+                                on_stage=writer.stage,
+                                force_quit_sink=sink)
         except Exception as e:
             # the traceback lands in the bounded per-job log (stderr is
             # redirected there), never on stdout
             logging.exception('update job for %s failed', desktop_id)
-            writer.finish_error(str(e) or type(e).__name__)
+            writer.finish_error(str(e) or type(e).__name__,
+                                force_quit=sink.get('force_quit'))
             return EXIT_ERROR
         return _finish_job_document(writer, result)
     finally:
@@ -1617,9 +1716,12 @@ def _finish_job_document(writer, result: UpdateResult) -> int:
                       force_quit=result.force_quit)
         return EXIT_OK
     if result.status == 'up-to-date':
+        # B: belt on top of run_update's ordering — a document that
+        # applied nothing must never say the app was closed for it, so
+        # `force_quit` is dropped here whatever the result carries
         writer.finish('up-to-date',
                       message=f'{result.el.file_path} is up to date',
-                      force_quit=result.force_quit)
+                      force_quit=None)
         return EXIT_OK
     if result.status == 'skipped-running':
         writer.finish('skipped-running', message=result.message,

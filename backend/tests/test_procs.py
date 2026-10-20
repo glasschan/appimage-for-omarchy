@@ -16,8 +16,9 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
-from omarchy_appimage import procs
+from omarchy_appimage import procs, utils
 
 APP = '/home/user/AppImages/foo.appimage'
 MOUNT = '/tmp/.mount_fooXq8zW'
@@ -84,7 +85,15 @@ class FakeProbe:
 
     def exe_for(self, pid):
         self.exe_reads.append(pid)
-        return self.exes.get(pid)
+        if pid in self.exes:
+            return self.exes[pid]
+        # No explicit readlink result: /proc/<pid>/exe answers what `ps`
+        # showed for the same pid (that is what makes the identity
+        # re-check a no-op on an unchanged process).
+        for proc_pid, exe in self._processes:
+            if proc_pid == pid:
+                return exe or None
+        return None
 
     def state_for(self, pid):
         if pid in self.dead:
@@ -156,6 +165,24 @@ class MountPointsForTests(MountsFileTestCase):
 
     def test_empty_path_yields_nothing(self):
         self.assertEqual(procs.mount_points_for('', self.mounts), [])
+
+
+class SystemProbeMountsTests(MountsFileTestCase):
+    """Finding 16: the real probe resolves /proc/mounts through
+    utils.PROC_MOUNTS_PATH at CALL time, so patching that one name drives
+    the whole path end to end — the way every CLI test does it."""
+
+    def test_mounts_follow_the_patched_name(self):
+        with mock.patch.object(utils, 'PROC_MOUNTS_PATH', self.mounts):
+            self.assertEqual(procs._SystemProbe().mounts(),
+                             procs.parse_proc_mounts(self.mounts))
+
+    def test_an_explicit_mounts_path_still_wins(self):
+        with mock.patch.object(utils, 'PROC_MOUNTS_PATH',
+                               '/no/such/mounts'):
+            probe = procs._SystemProbe(mounts_path=self.mounts)
+            self.assertEqual(probe.mounts(),
+                             procs.parse_proc_mounts(self.mounts))
 
 
 class ParsePsOutputTests(unittest.TestCase):
@@ -273,6 +300,49 @@ class PidsForTests(unittest.TestCase):
                          {'parent': [], 'children': []})
         self.assertEqual(probe.scans, 0)
 
+    def test_symlinked_install_directory_matches_both_ways(self):
+        # finding 7: ~/Applications -> ~/AppImages. `ps` and /proc can
+        # render the exe either way round, so both sides of the parent
+        # comparison are realpath-normalised
+        root = tempfile.mkdtemp(prefix='omarchy-appimage-link-')
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        real_dir = os.path.join(root, 'AppImages')
+        os.makedirs(real_dir)
+        real = os.path.join(real_dir, 'foo.appimage')
+        with open(real, 'wb') as f:
+            f.write(b'ELF')
+        link = os.path.join(root, 'Applications')
+        os.symlink(real_dir, link)
+        via_link = os.path.join(link, 'foo.appimage')
+
+        probe = FakeProbe(processes=[(460, via_link)])
+        self.assertEqual(procs.pids_for(real, probe=probe)['parent'], [460])
+        probe = FakeProbe(processes=[(461, real)])
+        self.assertEqual(procs.pids_for(via_link, probe=probe)['parent'],
+                         [461])
+
+
+class CachedProbeTests(unittest.TestCase):
+    """Finding 8: a listing wraps the probe once, so every row of the
+    document shares ONE `ps` table and ONE /proc/mounts read."""
+
+    def test_process_table_is_read_once_for_many_lookups(self):
+        probe = FakeProbe(processes=[(441, APP), (442, MOUNT + '/foo')],
+                          mounts=APP_MOUNTS)
+        scan = procs._cached_probe(probe)
+        self.assertEqual(procs.pids_for(APP, probe=scan)['parent'], [441])
+        self.assertEqual(procs.pids_for(APP, probe=scan)['children'], [442])
+        self.assertEqual(probe.scans, 1)
+
+    def test_the_wrapper_answers_the_rest_of_the_protocol(self):
+        probe = FakeProbe(processes=[(441, APP)], mounts=APP_MOUNTS)
+        scan = procs._cached_probe(probe)
+        self.assertEqual(scan.exe_for(441), APP)
+        self.assertEqual(scan.state_for(441), 'S')
+        scan.signal(441, signal.SIGTERM)
+        self.assertIn((441, signal.SIGTERM), probe.sent)
+        self.assertIsNone(scan.state_for(441))      # now dead to the fake
+
 
 class QuitAppTests(unittest.TestCase):
     """TERM the whole set in one round, grace-poll the survivors, KILL
@@ -288,11 +358,13 @@ class QuitAppTests(unittest.TestCase):
         report = procs.quit_app(APP, term_grace_s=2.0, probe=probe)
 
         self.assertEqual(set(report),
-                         {'signalled', 'killed_with_sigkill', 'outcomes'})
+                         {'signalled', 'killed_with_sigkill', 'outcomes',
+                          'survived'})
         self.assertEqual(report['signalled'], [441, 442])
         self.assertEqual(report['killed_with_sigkill'], [])
         self.assertEqual(report['outcomes'],
                          {441: 'terminated', 442: 'terminated'})
+        self.assertEqual(report['survived'], [])
         self.assertNotIn(signal.SIGKILL,
                          [sig for _pid, sig in probe.sent])
         # everything died on TERM: the grace was never consumed
@@ -364,6 +436,78 @@ class QuitAppTests(unittest.TestCase):
         report = procs.quit_app('', probe=probe)
         self.assertEqual(report['signalled'], [])
         self.assertEqual(probe.sent, [])
+
+    # ------------------------------------- finding E / SHOULD-FIX 2 and 3
+
+    def test_recycled_pid_is_dropped_before_the_term(self):
+        # the scan captured 441, but by the time the round runs 441 is
+        # somebody else's process: never signal it, and say so
+        probe = self._probe(exes={441: '/usr/bin/impostor'})
+        report = procs.quit_app(APP, term_grace_s=1.0, probe=probe)
+        self.assertEqual(report['outcomes'][441], 'identity-changed')
+        self.assertNotIn((441, signal.SIGTERM), probe.sent)
+        self.assertEqual(report['signalled'], [442])
+        # an identity change is not a survivor: nothing of ours is left
+        self.assertEqual(report['survived'], [])
+
+    def test_child_whose_exe_changed_between_rounds_is_not_killed(self):
+        class _FlippingProbe(FakeProbe):
+            """442's /proc exe reads fine for the TERM round, then
+            resolves to an unrelated program before the KILL round."""
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.flipped = False
+
+            def exe_for(self, pid):
+                self.exe_reads.append(pid)
+                if pid == 442 and self.flipped:
+                    return '/usr/bin/impostor'
+                if pid == 442:
+                    self.flipped = True
+                return super().exe_for(pid)
+
+        probe = _FlippingProbe(processes=[(441, APP), (442, MOUNT + '/foo')],
+                               mounts=APP_MOUNTS,
+                               reactions={442: 'survive-term'})
+        report = procs.quit_app(APP, term_grace_s=1.0, probe=probe)
+        self.assertIn((442, signal.SIGTERM), probe.sent)
+        self.assertNotIn((442, signal.SIGKILL), probe.sent)
+        self.assertEqual(report['outcomes'][442], 'identity-changed')
+        self.assertEqual(report['killed_with_sigkill'], [])
+        self.assertEqual(report['survived'], [])
+
+    def test_unreadable_exe_during_recheck_is_never_signalled(self):
+        # the pid vanished between the scan and the round: nothing to
+        # prove membership with, so nothing is signalled
+        probe = self._probe(exes={441: None, 442: None})
+        report = procs.quit_app(APP, term_grace_s=1.0, probe=probe)
+        self.assertEqual(report['signalled'], [])
+        self.assertEqual(probe.sent, [])
+        self.assertEqual(report['outcomes'],
+                         {441: 'identity-changed', 442: 'identity-changed'})
+
+    def test_survivors_are_listed_for_the_caller(self):
+        # finding F / 12: the caller has to refuse the replace, so the
+        # report has to name what is still alive
+        probe = self._probe(unpermitted={442})
+        report = procs.quit_app(APP, term_grace_s=1.0, probe=probe)
+        self.assertEqual(report['survived'], [442])
+
+    # ------------------------------------------- finding 10 / J(NITPICK)
+
+    def test_generic_oserror_counts_as_alive(self):
+        # only ProcessLookupError proves the pid is gone; a generic OSError
+        # (EIO from /proc, a wedged kernel call) must not be read as death,
+        # or the KILL round silently drops a live process
+        class _Odd(FakeProbe):
+            def signal(self, pid, sig):
+                super().signal(pid, sig)
+                if sig == 0:
+                    raise OSError('EIO')
+
+        probe = _Odd(processes=[(441, APP)], mounts=APP_MOUNTS)
+        self.assertTrue(procs._is_alive(probe, 441))
 
 
 def _pid_alive(pid: int) -> bool:

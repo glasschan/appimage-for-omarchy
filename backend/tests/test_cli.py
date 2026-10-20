@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import (FakeXDGTestCase, FixtureHTTPServer, download_fixture)
+from test_procs import FakeProbe
 
 from omarchy_appimage import cli, net, procs, utils
 from omarchy_appimage import settings as appimage_settings
@@ -245,7 +246,9 @@ class RunningPidsCliTests(InProcessCliMixin, FakeXDGTestCase):
         app = payload['installed'][0]
         self.assertTrue(app['running'])
         self.assertEqual(app['running_pids'], 3)
-        scan.assert_called_once_with(self.appimage)
+        # the listing hands the shared scan down, so a running row costs
+        # one `ps` table for the whole document (finding 8)
+        scan.assert_called_once_with(self.appimage, probe=mock.ANY)
 
     def test_non_running_row_reports_zero_without_a_scan(self):
         scan = mock.Mock(return_value={'parent': [700], 'children': [701]})
@@ -265,6 +268,24 @@ class RunningPidsCliTests(InProcessCliMixin, FakeXDGTestCase):
         # the `running` verdict is untouched by the count's failure
         self.assertTrue(app['running'])
         self.assertEqual(app['running_pids'], 0)
+
+    def test_every_running_row_shares_one_process_table(self):
+        # finding 8: the panel polls this listing every 10 s, so two
+        # running rows must not cost two `ps` spawns and two /proc/mounts
+        # parses — the scan is built once per listing
+        self.install_fake_app(desktop_name='secondapp', app_name='Second')
+        first = os.path.join(self.managed_dir, 'fakeapp.appimage')
+        second = os.path.join(self.managed_dir, 'secondapp.appimage')
+        probe = FakeProbe(processes=[(700, first), (701, second)])
+        with mock.patch.object(procs, '_PROBE', probe), \
+                mock.patch.object(cli.appimage_provider, 'is_app_running',
+                                  return_value=True):
+            out, err, code = self.run_cmd(cli.cmd_list_installed, ['--json'])
+        self.assertEqual(code, 0, err)
+        apps = json.loads(out)['installed']
+        self.assertEqual(len(apps), 2)
+        self.assertEqual([a['running_pids'] for a in apps], [1, 1])
+        self.assertEqual(probe.scans, 1)
 
 
 class ExecArgumentsCliTests(FakeXDGTestCase):
@@ -792,7 +813,7 @@ class InProcessUpdateCliTests(InProcessCliMixin, FakeXDGTestCase):
             out, err, code = self.run_cmd(cli.cmd_fetch_updates, ['--json'])
         self.assertEqual(json.loads(out)['notified'], False)
 
-    def test_update_skipped_while_running(self):
+    def test_update_reports_up_to_date_before_the_running_guard(self):
         appimage, _desktop, _icon = self.install_fake_app()
         # serve the exact local bytes: with --force the flow proceeds and
         # the size check answers up-to-date (no download needed)
@@ -815,8 +836,11 @@ class InProcessUpdateCliTests(InProcessCliMixin, FakeXDGTestCase):
                 cli.cmd_update, ['fakeapp', '--yes', '--json'])
         self.assertEqual(code, 0, err)
         payload = json.loads(out)
-        self.assertEqual(payload['result'], 'skipped-running')
-        self.assertIn('--force', payload['message'])
+        # ticket #28(A): the availability decision comes before the
+        # running guard, so a running app with nothing to install is up
+        # to date — never `skipped-running`, and nothing is closed for a
+        # no-op update
+        self.assertEqual(payload['result'], 'up-to-date')
         self.assertEqual(payload['app']['path'], appimage)
 
         # --force overrides the running check and proceeds to the
