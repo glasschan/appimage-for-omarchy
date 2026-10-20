@@ -330,6 +330,71 @@ const unsetSourceDoc = Model.parseActionJson(cap("unset-source.json"))
 check("unset-source passthrough", unsetSourceDoc.ok === true && unsetSourceDoc.result === "unset"
   && unsetSourceDoc.app.manager === "" && unsetSourceDoc.app.downloadSize === 0)
 
+// ---- F2 browse: --pick-file outcome documents (#19) -----------------------------
+// Contract shapes (backend/CONTRACT.md "### --pick-file [--json]"): picked /
+// cancelled / unavailable are exit-0 results, typed errors are exit-1
+// documents with a reason key. No captures here — every variant needs a
+// real dialog session (a portal reply, a user cancel), so they are inline
+// literals, same as the offline fetch-updates case above.
+const pickedPortal = Model.parsePickJson(
+  '{"schema_version": 1, "result": "picked", "path": "/home/user/Downloads/nvim-linux-x86_64.appimage", "backend": "portal"}')
+check("pick picked ok", pickedPortal.ok === true && pickedPortal.result === "picked")
+check("pick picked path", pickedPortal.path === "/home/user/Downloads/nvim-linux-x86_64.appimage",
+  pickedPortal.path)
+check("pick picked backend", pickedPortal.backend === "portal", pickedPortal.backend)
+
+const pickedZenity = Model.parsePickJson(
+  '{"schema_version": 1, "result": "picked", "path": "/opt/x.AppImage", "backend": "zenity"}')
+check("pick zenity backend", pickedZenity.ok === true && pickedZenity.backend === "zenity"
+  && pickedZenity.path === "/opt/x.AppImage", JSON.stringify(pickedZenity))
+
+const cancelled = Model.parsePickJson(
+  '{"schema_version": 1, "result": "cancelled", "backend": "zenity"}')
+check("pick cancelled ok", cancelled.ok === true && cancelled.result === "cancelled")
+check("pick cancelled has no path", cancelled.path === "", cancelled.path)
+
+const unavailable = Model.parsePickJson(
+  '{"schema_version": 1, "result": "unavailable", "message": '
+  + '"no file chooser is available (neither the desktop portal nor zenity); '
+  + 'type or paste the path instead"}')
+check("pick unavailable ok", unavailable.ok === true && unavailable.result === "unavailable")
+check("pick unavailable message surfaced", unavailable.message.includes("type or paste"),
+  unavailable.message)
+
+const pickTimeout = Model.parsePickJson(
+  '{"schema_version": 1, "result": "error", "reason": "timeout", '
+  + '"error": "the file dialog did not answer in time"}')
+check("pick timeout error", pickTimeout.ok === false && pickTimeout.result === "error"
+  && pickTimeout.reason === "timeout")
+check("pick timeout message surfaced", pickTimeout.error.includes("did not answer in time"),
+  pickTimeout.error)
+
+const pickBackendFailed = Model.parsePickJson(
+  '{"schema_version": 1, "result": "error", "reason": "backend-failed", '
+  + '"error": "the file dialog crashed"}')
+check("pick backend-failed reason", pickBackendFailed.ok === false
+  && pickBackendFailed.reason === "backend-failed")
+
+const pickNotLocal = Model.parsePickJson(
+  '{"schema_version": 1, "result": "error", "reason": "not-local", '
+  + '"error": "the file dialog returned a non-local location"}')
+check("pick not-local reason", pickNotLocal.ok === false && pickNotLocal.reason === "not-local")
+
+// Defensive mapping: unknown envelope keys are tolerated, unknown results
+// pass through like parseActionJson's (the QML layer routes on the named
+// results and treats everything else as a failure), and garbage is rejected.
+const pickUnknownKeys = Model.parsePickJson(
+  '{"schema_version": 1, "result": "picked", "path": "/x/a.appimage", '
+  + '"backend": "portal", "future_key": {"nested": true}}')
+check("pick unknown keys tolerated", pickUnknownKeys.ok === true
+  && pickUnknownKeys.path === "/x/a.appimage", JSON.stringify(pickUnknownKeys))
+const pickUnknownResult = Model.parsePickJson(
+  '{"schema_version": 1, "result": "something-new"}')
+check("pick unknown result passthrough", pickUnknownResult.ok === true
+  && pickUnknownResult.result === "something-new")
+check("pick garbage rejected", Model.parsePickJson("zenity: not found\n").ok === false
+  && Model.parsePickJson("zenity: not found\n").error !== "")
+
 // ---- Panel-side error mapping (mirrors reportFailure branches) ---------------
 // Timeout is its own message ("Backend timed out") — blaming python3 for a
 // slow update sent users hunting the wrong fix. A spawn failure only maps to
