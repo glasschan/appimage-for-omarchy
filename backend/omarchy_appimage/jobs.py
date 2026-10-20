@@ -1,4 +1,5 @@
 # jobs.py — background update-job documents (stdlib only).
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # One document per app at $XDG_STATE_HOME/io.github.glasschan.appimage/
 # jobs/<desktop id>.json, written by the detached --update --async runner

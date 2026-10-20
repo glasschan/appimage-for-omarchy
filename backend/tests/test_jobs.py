@@ -1,4 +1,5 @@
 # test_jobs.py — background update-job tests (--update --async).
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # Test suite written for this plugin. Covers: the job-document store and
 # its liveness classification (unit level), the JobWriter phase walk, the
