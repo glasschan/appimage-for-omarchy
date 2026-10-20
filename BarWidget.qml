@@ -50,6 +50,13 @@ BarWidget {
     ? bar.urgent
     : (bar ? bar.barForeground : Color.foreground)
 
+  // The tint the icon and the count share (single-sourced so the two can
+  // never drift): a drag hovering the widget wins over the badge urgency
+  // — the accent IS the affordance — otherwise the normal WidgetButton
+  // active/foreground chain.
+  readonly property color effectiveDropColor: dropHover ? Color.accent
+    : (button.active && button.useActiveColor ? button.activeColor : button.foreground)
+
   // The bar host injects no manifest, so the canonical third-party plugin
   // install location (~/.config/omarchy/plugins/<id>, PluginRegistry.qml)
   // is the best guess for the backend script at login. The panel later
@@ -170,18 +177,14 @@ BarWidget {
         name: "cube-unfolded"
         size: Style.bar.iconCanvas
         strokeWidth: 1.75
-        // Drop hover wins over the badge urgency: while a drag is over the
-        // widget, the accent IS the affordance.
-        color: root.dropHover ? Color.accent
-          : (button.active && button.useActiveColor ? button.activeColor : button.foreground)
+        color: root.effectiveDropColor
         anchors.verticalCenter: parent.verticalCenter
       }
 
       Text {
         visible: root.installedCount > 0
         text: root.installedCount
-        color: root.dropHover ? Color.accent
-          : (button.active && button.useActiveColor ? button.activeColor : button.foreground)
+        color: root.effectiveDropColor
         font.family: root.bar && root.bar.fontFamily ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.body
         renderType: Text.NativeRendering

@@ -147,6 +147,8 @@ preview and confirm; nothing is cached or trusted across the two).
   non-https `scheme://` URL (integrate's egress policy) produce the
   typed error document (exit 1).
 - Read-only, so `--json` does **not** require `--yes` here.
+- `--json` is the only option this verb takes: any other
+  `--`-prefixed argument is a usage error (exit 2), never ignored.
 
 Verification matrix — what integrate WILL verify, so a source that
 installs without a publisher-attested digest says so before the

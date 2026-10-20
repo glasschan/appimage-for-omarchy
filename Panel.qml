@@ -165,6 +165,16 @@ Panel {
   property string previewInput: ""
   property var previewDoc: null
 
+  // Single-source of the picker-owning composite — a browse dialog, a
+  // preview call or an integrate run in flight. Browse, Go and the
+  // Downloads quick-picks all disable on exactly this conjunction
+  // (#18/#19 guards), so it is combined once here instead of
+  // hand-assembled per control. Sites whose guard intentionally differs
+  // keep their extra terms separate: Go also requires a non-empty path,
+  // the preview card's Confirm/Cancel omit the pick term by design, and
+  // dropBusy()/confirmPreview() read the store flags directly.
+  readonly property bool pickerBusy: busyPick || busyIntegrate || busyPreview
+
   // Drop-to-integrate (#21): the bar widget converts its dropped URIs
   // through Model.dropUriToPath and hands the usable path over in the
   // summon payload; open() parks it here and tryConsumePendingDrop runs it
@@ -1219,14 +1229,19 @@ Panel {
           // A preview computed for the previous path is stale the moment
           // the fill lands (#18 confirm-before-integrate, browse flavor):
           // drop it so Confirm can never install anything other than what
-          // is on screen. The next explicit Enter/Go previews the picked
-          // path — a browse never integrates silently. Same-trimmed fills
-          // keep the shown card, matching the field's onEdited rule.
+          // is on screen. The picked path then rides the same preview flow
+          // as a drop or a Downloads quick-pick — seedDropPreview's
+          // mechanics minus openPicker (the card is already open): fill
+          // the field, request the offline preview, Confirm stays the only
+          // install path (ticket #19 acceptance). Same-trimmed fills keep
+          // the shown card via requestPreview's own guard, matching the
+          // field's onEdited rule.
           if (root.previewOpen && pick.path.trim() !== root.previewInput) {
             root.dismissPreview()
           }
           syncFromModel()
           focusPickerField()
+          root.requestPreview(pick.path)
           return
         }
         if (pick.result === "cancelled") {
@@ -2086,7 +2101,7 @@ Panel {
                   // Locked with Go/Downloads while a preview runs (#18):
                   // a fill mid-preview-call could only produce an answer
                   // the stale-drop has to throw away.
-                  enabled: !root.busyPick && !root.busyIntegrate && !root.busyPreview
+                  enabled: !root.pickerBusy
                   anchors.verticalCenter: parent.verticalCenter
                   foreground: root.foreground
                   accent: Color.accent
@@ -2105,8 +2120,7 @@ Panel {
                     : (root.busyPreview ? root.strings.previewChecking
                       : (root.previewOpen ? root.strings.previewConfirm
                         : root.strings.pickerGo))
-                  enabled: !root.busyIntegrate && !root.busyPreview && !root.busyPick
-                    && root.pickerPath.trim() !== ""
+                  enabled: !root.pickerBusy && root.pickerPath.trim() !== ""
                   anchors.verticalCenter: parent.verticalCenter
                   foreground: root.foreground
                   accent: Color.accent
@@ -2287,7 +2301,7 @@ Panel {
                       accent: Color.accent
                       fontFamily: root.fontFamily
                       fontSize: Style.font.caption
-                      enabled: !root.busyIntegrate && !root.busyPick && !root.busyPreview
+                      enabled: !root.pickerBusy
                       // Quick-picks ride the same confirm flow: seed the
                       // field so the preview (and a later Confirm) name
                       // the exact file, then preview — never integrate

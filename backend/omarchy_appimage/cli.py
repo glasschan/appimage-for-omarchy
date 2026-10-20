@@ -27,7 +27,7 @@ from .extractor import read_desktop_entry_in_place
 from .ini_config import Config
 from .provider import (AppImageListElement, AppImageProvider,
                        AppImageUpdateLogic, InternalError, InstalledStatus,
-                       _resolve_install_names)
+                       resolve_install_names)
 from .updaters import UpdateError, UpdateManagerChecker
 from .utils import get_file_hash, run_command
 
@@ -799,7 +799,7 @@ def _preview_destination(source_basename: str, desktop_name,
         existing_names = os.listdir(folder)
     except OSError:
         existing_names = []
-    filename, _prefix = _resolve_install_names(
+    filename, _prefix = resolve_install_names(
         source_basename=source_basename,
         desktop_name=desktop_name,
         version=version or '',
@@ -829,8 +829,16 @@ def cmd_preview_integrate(args: list) -> int:
     authority and re-classifies/re-verifies at its own runtime."""
     json_output = '--json' in args
 
-    positional = _remove_flag_value(args, ['--json'])
-    positional = [a for a in positional if not a.startswith('--')]
+    # CONTRACT.md's exit-code table: an unknown option is a usage error,
+    # never a silently ignored token — the preview verb accepts --json
+    # and nothing else.
+    positional = []
+    for a in args:
+        if a == '--json':
+            continue
+        if a.startswith('--'):
+            raise UsageError(f'unknown option: {a!r}')
+        positional.append(a)
     if not positional:
         raise UsageError(
             'missing argument: --preview-integrate <path-or-url>')

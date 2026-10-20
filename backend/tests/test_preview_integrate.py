@@ -340,6 +340,19 @@ class PreviewErrorTests(FakeXDGTestCase):
                               '--json')
         self.assertEqual(result.returncode, 2)
 
+    def test_unknown_option_exit_2(self):
+        # an unknown -- option is a usage error (CONTRACT.md exit-code
+        # table), never a silently ignored token
+        fake = self.put_fake_appimage('opt.appimage',
+                                      content=make_minimal_elf())
+        result = self.run_cli('--preview-integrate', fake, '--bogus',
+                              '--json')
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['schema_version'], 1)
+        self.assertEqual(payload['result'], 'error')
+        self.assertIn('--bogus', payload['error'])
+
     def test_json_stdout_is_pure(self):
         # exactly one JSON document, single trailing newline, nothing
         # else on stdout (CONTRACT.md output purity)
