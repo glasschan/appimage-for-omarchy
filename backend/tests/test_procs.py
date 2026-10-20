@@ -6,6 +6,8 @@
 # ONE exception is RealProcessTests, which copies /bin/sleep to a temp
 # "AppImage" path, spawns it as its own child and is the only test in the
 # suite allowed to signal anything — and only that child.
+#
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 
 import os
 import shutil

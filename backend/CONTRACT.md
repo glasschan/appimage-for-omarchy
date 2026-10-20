@@ -58,6 +58,10 @@ AppImage: <path> (remove it with --remove <desktop id>)`), so the user can
 reclaim the file — the record itself is removed only on an explicit
 `--remove <desktop id> --yes`.
 
+`running` and `running_pids` are computed per app from the process view
+(Process identity under Security model); `running_pids` is display-only
+and no command ever reads it back.
+
 **`runtime` block (fuse2).** Every successful JSON envelope also carries an
 additive `runtime` block: `{"fuse2": <state>}` with exactly one of
 
@@ -214,7 +218,7 @@ per-app errors are logged (stderr) and skipped.
 - JSON (real example output):
 
 ```json
-{"schema_version": 1, "updates": [{"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "exec_arguments": "%F"}]}
+{"schema_version": 1, "updates": [{"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "running_pids": 0, "exec_arguments": "%F"}]}
 ```
 
 ### `--update <target> [--yes] [--keep-both] [--force] [--kill-running] [--json]`
@@ -224,31 +228,31 @@ Downloads the new release through the app's update source and installs it.
 - `--json` requires `--yes` (exit 2 otherwise).
 - No update source configured: exit 1, error
   `No update method was found for this AppImage (set one with --set-update-source)`.
-- App currently running (the process-identity rule under Security model:
-  a live process whose `exe` is the AppImage path, or one running out of
-  a `fuse.*` mount attributed to it in `/proc/mounts`), and neither
+- App currently running (the `running` flag, `utils.is_app_running`: a
+  `ps` `exe` equal to the AppImage path, or a `fuse.*` mount in
+  `/proc/mounts` attributed to it — what may then actually be *signalled*
+  is narrower, see Process identity under Security model), and neither
   `--force` nor `--kill-running` given: exit 0, result `skipped-running`,
-  and **no process is signalled**. An interactive terminal is asked first
-  (see the two flags below); a non-TTY (`--async`'s grandchild, a script)
-  gets the result straight away with a message that names the fix:
+  and **no process is signalled**. An interactive terminal is asked one
+  `y/N` question first — the update pipeline's only interactive question,
+  skipped by `--yes` or `--json`; a non-TTY (`--async`'s grandchild, a
+  script) gets the result straight away with a message that names the fix:
   `... was skipped because the application is running; pass
   --kill-running to close it and update, or --force to replace it in
   place`.
 - **`--kill-running` vs `--force`** — the two ways past that guard, and
   they differ in exactly one respect: whether the running app is closed.
-  - `--kill-running` closes the app, then updates. The grant is
-    unconditional for the whole job and covers two moments: at job start
-    (fail fast — nothing is downloaded for an app that cannot be
-    replaced) and again immediately before the atomic replace, so a
+  - `--kill-running` closes the app, then updates, and **never asks**:
+    the flag is the consent, on a terminal as much as in a script. The
+    grant is unconditional for the whole job and covers two moments: at
+    job start (fail fast — nothing is downloaded for an app that cannot
+    be replaced) and again immediately before the atomic replace, so a
     process relaunched during the download is closed too. Processes are
-    found by the process-identity rule above and signalled `SIGTERM`
-    first, escalating to `SIGKILL` after a grace period
-    (`utils.is_app_running`'s identity rule, `procs.quit_app`). On a
-    terminal the command asks one `y/N` question first — the update
-    pipeline's only interactive question — and a no (or an abandoned
-    stdin) is the untouched `skipped-running` result. With `--json`
-    (which requires `--yes`) and with `--yes` no question is asked: the
-    flag itself is the consent.
+    picked by the process-identity rule (`procs.pids_for`) and signalled
+    `SIGTERM` first, escalating to `SIGKILL` after a grace period
+    (`procs.quit_app`). What was actually closed is recorded in the job
+    document as `force_quit` (see Job documents); the sync `--json`
+    result does not carry it.
   - `--force` replaces the AppImage **while the app keeps running**, in
     place, without closing anything. Existing processes keep the old
     inode open until they exit; the file on disk is the new release
@@ -273,13 +277,13 @@ Downloads the new release through the app's update source and installs it.
 Real example output (success):
 
 ```json
-{"schema_version": 1, "result": "updated", "message": "/home/user/AppImages/neovim.appimage was updated successfully", "app": {"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": null, "embedded_source": false, "running": false, "exec_arguments": "%F"}, "downloaded_bytes": 10996237}
+{"schema_version": 1, "result": "updated", "message": "/home/user/AppImages/neovim.appimage was updated successfully", "app": {"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": null, "embedded_source": false, "running": false, "running_pids": 0, "exec_arguments": "%F"}, "downloaded_bytes": 10996237}
 ```
 
 Real example output (up-to-date):
 
 ```json
-{"schema_version": 1, "result": "up-to-date", "app": {"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "exec_arguments": "%F"}}
+{"schema_version": 1, "result": "up-to-date", "app": {"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "running_pids": 0, "exec_arguments": "%F"}}
 ```
 
 Real example output (skipped-running, exit 0):
@@ -363,7 +367,7 @@ refresh at least every 2 s (`JOB_HEARTBEAT_INTERVAL_SECONDS`).
 | `status` | string or null | Terminal result: `updated` / `up-to-date` / `skipped-running` / `error`; `null` while running |
 | `new_version` | string or null | Installed release (`updated` jobs) |
 | `error` | string or null | Error text (`error` jobs); the traceback tail goes to the log, never into the document |
-| `force_quit` | object or absent | **Additive** record of the running-app grant: `{"count": n, "sigkill": bool}` — how many processes this job signalled and whether any needed `SIGKILL`. Present **only** when the job actually closed something (`--kill-running`, or the consented question); absent in every other document, including a granted job that found nothing to close. The count is the whole job's (both guards); the field never changes `status`, `phase` or `schema_version`, and the CLI's `--json` result does not carry it |
+| `force_quit` | object or absent | **Additive** record of the running-app grant: `{"count": n, "sigkill": bool}` — how many processes this job signalled and whether any needed `SIGKILL`. Present **only** when the job actually closed something (`--kill-running`, or the consented question); absent in every other document, including a granted job that found nothing to close. The count is the whole job's (both guards); the field never changes `status`, `phase` or `schema_version`, and the CLI's `--json` result does not carry it; when it is present the panel's done banner appends its closed-app clause (`Model.js` `jobDoneBanner`) |
 
 **Liveness rule:** a job is **ACTIVE** if and only if its phase is
 non-terminal **and** its `pid` is alive **and** its `heartbeat` is
@@ -514,7 +518,7 @@ Behaviour:
 Real example output (update available, first run, notification delivered):
 
 ```json
-{"schema_version": 1, "updates": [{"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "exec_arguments": "%F"}], "notified": true, "offline": false}
+{"schema_version": 1, "updates": [{"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "running_pids": 0, "exec_arguments": "%F"}], "notified": true, "offline": false}
 ```
 
 Second run with no change: same shape, `"notified": false`.
@@ -623,8 +627,8 @@ Real example output:
 | `--yes` / `-y` | Skip interactive confirmation (required with `--json` for `--integrate` / `--remove` / `--update`) |
 | `--replace` | Replace the conflicting app instead of keeping both (integrate) |
 | `--keep-both` | Keep the old version when updating |
-| `--force` | Update even while the app is running |
-| `--kill-running` | Close the running app, then update (asks on a terminal; on `--update` / `--update --async`) |
+| `--force` | Replace the AppImage even while the app is running, without closing it |
+| `--kill-running` | On `--update` / `--update --async`: close the running app instead of skipping it — the flag is the consent, no question is asked (see `--update`) |
 | `--async` | With `--update`: run the whole update as a detached background job and report `job-started` immediately (see the `--update --async` section) |
 | `--delete` | Bypass the trash (irreversible) |
 | `--help` / `-h` | Usage text, exit 0 |
@@ -736,7 +740,7 @@ No arguments prints usage and exits **2**.
 | `download_size` | int or null | Byte size of the available update (`null` unless filled by a check) |
 | `manager` | string or null | Update manager name (`StaticFileUpdater`, `GithubUpdater`, `GitlabUpdater`, `CodebergUpdater`, `ForgejoUpdater`) or `null` when no source exists |
 | `embedded_source` | boolean | True when the source comes from the AppImage's embedded `.upd_info` string (false for custom configs and for no source) |
-| `running` | boolean | True when the AppImage is currently running (a process whose `exe` is the AppImage path, or one running out of a `fuse.*` mount attributed to it in `/proc/mounts` — see Process identity under Security model) |
+| `running` | boolean | True when the AppImage is currently running (`utils.is_app_running`: a `ps` `exe` equal to the AppImage path, or a `fuse.*` mount in `/proc/mounts` attributed to it — see Process identity under Security model). The mount signal can outlive the processes, so `true` with `running_pids` 0 is possible |
 | `running_pids` | int | How many processes belong to this AppImage: the runtime parent (its `exe` is the AppImage path) **plus** the helpers running out of the `fuse.*` mount attributed to it — the set `--kill-running` would close (`procs.pids_for`). `0` when the app is not running (a non-running row is never scanned) and `0` when the count cannot be determined (a failed scan is never an error). **Display-only**: the panel's force-quit prompt names it; no command reads it back |
 | `exec_arguments` | string | The desktop entry's `Exec=` arguments, e.g. `"--no-sandbox %U"` or `"%U"`; `""` when the app has none. The desktop field codes (`%f %F %u %U %i %c %k`) stay **verbatim** — stripping them is the UI's job. The current desktop entry wins; when it carries no arguments, the install-time `default_exec_arguments` from `apps.ini` is used instead |
 
@@ -760,7 +764,7 @@ Real example output (app with an embedded `gh-releases-zsync` string; the
 custom-config case looks the same with `embedded_source: false`):
 
 ```json
-{"schema_version": 1, "installed": [{"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "GithubUpdater", "embedded_source": true, "running": false, "exec_arguments": "%F"}], "runtime": {"fuse2": "present"}}
+{"schema_version": 1, "installed": [{"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "GithubUpdater", "embedded_source": true, "running": false, "running_pids": 0, "exec_arguments": "%F"}], "runtime": {"fuse2": "present"}}
 ```
 
 Empty list:
