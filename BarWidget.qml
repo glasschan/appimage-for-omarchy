@@ -7,7 +7,10 @@ import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
 
 // Bar entry for the AppImage plugin: a tabler cube-unfolded icon plus the
-// installed count, and an urgent tint once updates are pending.
+// installed count, and an urgent tint once updates are pending. The icon
+// doubles as a drop-to-integrate target (#21): dropping an AppImage here
+// summons the panel seeded with the file and straight into the preview
+// flow — never an install (see the DropArea below).
 //
 // This plugin declares both "bar-widget" and "panel" kinds, so the panel
 // is owned by the shell's panel loader (summon path) rather than hosted
@@ -37,10 +40,22 @@ BarWidget {
 
   property bool popoutSwitchClosing: false
 
+  // Drop affordance (#21): while a file drag hovers the widget, the icon
+  // and count tint with the theme accent (the same "this will act" color
+  // the panel's controls use). BarWidget.qml owns the DropArea below.
+  readonly property bool dropHover: barDropArea.containsDrag
+
   // Badge urgency follows the theme's urgent color; nothing is hardcoded.
   readonly property color badgeColor: updateCount > 0 && bar && bar.urgent
     ? bar.urgent
     : (bar ? bar.barForeground : Color.foreground)
+
+  // The tint the icon and the count share (single-sourced so the two can
+  // never drift): a drag hovering the widget wins over the badge urgency
+  // — the accent IS the affordance — otherwise the normal WidgetButton
+  // active/foreground chain.
+  readonly property color effectiveDropColor: dropHover ? Color.accent
+    : (button.active && button.useActiveColor ? button.activeColor : button.foreground)
 
   // The bar host injects no manifest, so the canonical third-party plugin
   // install location (~/.config/omarchy/plugins/<id>, PluginRegistry.qml)
@@ -107,7 +122,8 @@ BarWidget {
       ["--list-installed", "--json"], {}, function(result) {
         if (result.ok) {
           var parsed = Model.parseListJson(result.stdout)
-          if (parsed.ok) Model.setItems(parsed.items)
+          // The runtime verdict (fuse2 probe) rides every listing.
+          if (parsed.ok) Model.setItems(parsed.items, parsed.runtime)
         }
       })
     syncCtx = ctx && ctx.active ? ctx : null
@@ -161,14 +177,14 @@ BarWidget {
         name: "cube-unfolded"
         size: Style.bar.iconCanvas
         strokeWidth: 1.75
-        color: button.active && button.useActiveColor ? button.activeColor : button.foreground
+        color: root.effectiveDropColor
         anchors.verticalCenter: parent.verticalCenter
       }
 
       Text {
         visible: root.installedCount > 0
         text: root.installedCount
-        color: button.active && button.useActiveColor ? button.activeColor : button.foreground
+        color: root.effectiveDropColor
         font.family: root.bar && root.bar.fontFamily ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.body
         renderType: Text.NativeRendering
@@ -178,6 +194,38 @@ BarWidget {
 
     onPressed: function(buttonCode) {
       root.togglePanel()
+    }
+  }
+
+  // ---- drop-to-integrate (#21) ----------------------------------------------
+  //
+  // A file drag dropped on the bar icon opens the integrate picker with
+  // the file prefilled and straight into the preview flow — a drop NEVER
+  // installs (the panel's Confirm stays the only install path). The URIs
+  // are converted and validated HERE through Model.dropUriToPath (pure,
+  // harness-pinned): only a usable .AppImage path is handed on, riding the
+  // summon payload ({drop_path, drop_ignored}) to Panel.open, whose
+  // tryConsumePendingDrop runs the flow once the panel's backend is idle.
+  // A rejected drop (web address, no AppImage in the selection) summons
+  // nothing — the drag simply does not register, like dropping anywhere
+  // else outside the panel. keys restricts the target to real file drags
+  // (text/uri-list), so a dragged web address never even lights the
+  // accent affordance above; URL-text drops are out of scope by the spec.
+  //
+  // Whether the shell's bar actually delivers drops to an embedded widget
+  // can only be proven live (compositor + embedding dependent); the spec
+  // accepts a panel-only fallback, decided at review.
+  DropArea {
+    id: barDropArea
+    anchors.fill: parent
+    keys: ["text/uri-list"]
+    onDropped: function(drop) {
+      var conv = Model.dropUriToPath(drop.hasUrls ? drop.urls : [])
+      if (!conv.ok) return
+      var payload = { drop_path: conv.path }
+      if (conv.ignored > 0) payload.drop_ignored = conv.ignored
+      var host = root.shellHost()
+      if (host) host.summon(root.moduleName, JSON.stringify(payload))
     }
   }
 

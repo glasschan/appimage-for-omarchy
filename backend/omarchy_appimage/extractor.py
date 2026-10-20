@@ -510,6 +510,45 @@ def _find_icon(source, icon_name: str) -> Optional[bytes]:
     return None
 
 
+def read_desktop_entry_in_place(appimage_path: str) -> tuple:
+    """(name, version) read straight from the embedded desktop entry,
+    fully in place: the pure-Python squashfs reader opens the image and
+    only the root-level *.desktop files are read (size-capped, in
+    memory) — nothing is extracted to disk, no external tool runs and
+    the AppImage is never executed. Used by --preview-integrate (the
+    offline pre-install preview).
+
+    The same superblock quota preflight as _open_source runs first, so a
+    hostile image is bounded by exactly the limits extraction would use.
+
+    Returns ('', '') when the image cannot be read in place (unsupported
+    compression, ELF malformations, no parseable root desktop entry):
+    preview metadata is advisory and never fatal."""
+    try:
+        offset = elf.get_squashfs_offset(appimage_path)
+        _enforce_quotas(*_superblock_quota(appimage_path, offset))
+    except Exception as e:
+        logging.info('in-place metadata read impossible for %s (%s)',
+                     appimage_path, e)
+        return '', ''
+
+    try:
+        source = _VfsSource(appimage_path)
+    except Exception as e:
+        logging.info('stdlib reader failed for %s (%s)', appimage_path, e)
+        return '', ''
+
+    try:
+        _desktop_name, entry = _find_desktop_file(source)
+    finally:
+        source.close()
+
+    if not entry:
+        return '', ''
+    return (entry.getName() or '',
+            entry.get('X-AppImage-Version') or '')
+
+
 def load_appimage_metadata(appimage_path: str) -> ExtractedAppImage:
     """Extract .desktop + icon from an AppImage into a temp folder.
 

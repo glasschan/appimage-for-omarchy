@@ -94,6 +94,13 @@ def _resolve_install_names(source_basename: str, desktop_name, version: str,
     return appimage_filename, os.path.splitext(appimage_filename)[0]
 
 
+# Public alias for cross-module callers: the preview's destination block
+# (cli.py) derives names through this helper, and cli.py must not import a
+# provider-internal name. The underscore-private spelling stays the
+# implementation — install_file() and the naming unit tests keep using it.
+resolve_install_names = _resolve_install_names
+
+
 def _atomic_install(src: str, dest: str, mode: int):
     """Descriptor-safe install of `src` at `dest` (marketplace review).
 
