@@ -22,7 +22,7 @@ import sys
 import tempfile
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from . import constants, net, settings
+from . import constants, extractor, net, settings
 from .ini_config import Config
 from .provider import AppImageProvider, AppImageUpdateLogic, InternalError
 from .updaters import UpdateError, UpdateManagerChecker
@@ -853,7 +853,94 @@ def cmd_list_updates(args: list) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------------ update core
+
+class UpdateResult:
+    """What run_update decided. Callers (cmd_update here, the async job
+    runner later) turn it into output; the core itself never writes
+    stdout. `status` uses the CLI's update result values:
+    'skipped-running' | 'up-to-date' | 'updated'."""
+
+    __slots__ = ('status', 'el', 'manager', 'message', 'downloaded_bytes')
+
+    def __init__(self, status: str, el, manager=None, message: str = '',
+                 downloaded_bytes: int = 0):
+        self.status = status
+        # the element to report: the old one for skipped-running /
+        # up-to-date, the freshly installed one for updated
+        self.el = el
+        self.manager = manager
+        # human-readable message for skipped-running / updated ('' for
+        # up-to-date: its plain-mode line is derived from el.file_path)
+        self.message = message
+        self.downloaded_bytes = downloaded_bytes
+
+
+def run_update(target: str, keep_both: bool = False,
+               force: bool = False) -> UpdateResult:
+    """The shared update pipeline: resolve target → update-source check →
+    running guard → availability check → download to temp → verify →
+    atomic replace → temp-dir cleanup → pending-notification drop.
+
+    Plain function: no argv parsing, no stdout writes. Raises the same
+    exceptions the CLI reported before this was extracted (OperationError
+    for an unresolvable target / missing update source, InternalError /
+    net.NetworkError / updater errors from download & install) — main()
+    maps them to error documents and exit codes exactly as before, and
+    cmd_update adds no behaviour of its own beyond the argv check.
+    Ticket 02's async job runner calls this too, so the sync and async
+    paths cannot drift.
+    """
+    el = _resolve_target(target)
+
+    manager = UpdateManagerChecker.check_url_for_app(el)
+    if not manager:
+        raise OperationError('No update method was found for this AppImage '
+                             '(set one with --set-update-source)')
+
+    if appimage_provider.is_app_running(el) and not force:
+        return UpdateResult(
+            status='skipped-running', el=el, manager=manager,
+            message=(f'{el.file_path} was skipped because the application '
+                     'is running; use --force to override'))
+
+    # tri-state: None (state not determinable) still attempts the download
+    if manager.is_update_available() is False:
+        return UpdateResult(status='up-to-date', el=el, manager=manager)
+
+    logging.debug('downloading update with %s', manager.name)
+
+    def _progress(fraction: float):
+        logging.debug('download: %d%%', round(fraction * 100))
+
+    try:
+        new_el = appimage_provider.update_from_url(
+            manager, el, keep_both=keep_both, progress_cb=_progress)
+    finally:
+        # the temp-dir lifecycle is core-owned: update_from_url creates
+        # its download dir via extractor.new_temp_dir(), this cleanup
+        # removes it on failure AND after a successful replace (main.py's
+        # process-exit finally-block stays as a no-op backstop)
+        extractor.cleanup_temp_dirs()
+
+    # the update was applied: drop the pending-notification marker so the
+    # next --fetch-updates does not re-notify for the (now installed) release
+    state = settings.load_updates_state()
+    key = _updates_state_key(el)
+    if key in state:
+        del state[key]
+        settings.save_updates_state(state)
+
+    return UpdateResult(
+        status='updated', el=new_el, manager=manager,
+        message=f'{el.file_path} was updated successfully',
+        downloaded_bytes=new_el.size or 0)
+
+
 def cmd_update(args: list) -> int:
+    """CLI wrapper over run_update: argv/flag parsing plus the result's
+    JSON document / plain line and exit code (byte-identical to the
+    pre-extraction inline pipeline)."""
     json_output = '--json' in args
     assume_yes = ('-y' in args) or ('--yes' in args)
     keep_both = '--keep-both' in args
@@ -873,67 +960,42 @@ def cmd_update(args: list) -> int:
     if not positional:
         raise UsageError('missing argument: --update <name-or-desktop-id>')
 
-    el = _resolve_target(positional[0])
+    result = run_update(positional[0], keep_both=keep_both, force=force)
 
-    manager = UpdateManagerChecker.check_url_for_app(el)
-    if not manager:
-        raise OperationError('No update method was found for this AppImage '
-                             '(set one with --set-update-source)')
-
-    if appimage_provider.is_app_running(el) and not force:
-        message = (f'{el.file_path} was skipped because the application is '
-                   'running; use --force to override')
+    if result.status == 'skipped-running':
         if json_output:
             _print_json({
                 'schema_version': constants.JSON_SCHEMA_VERSION,
                 'result': 'skipped-running',
-                'message': message,
-                'app': _make_app_json(el, manager=manager),
+                'message': result.message,
+                'app': _make_app_json(result.el, manager=result.manager),
             })
         else:
-            print(message)
+            print(result.message)
         return EXIT_OK
 
-    # tri-state: None (state not determinable) still attempts the download
-    if manager.is_update_available() is False:
+    if result.status == 'up-to-date':
         if json_output:
             _print_json({
                 'schema_version': constants.JSON_SCHEMA_VERSION,
                 'result': 'up-to-date',
-                'app': _make_app_json(el, manager=manager),
+                'app': _make_app_json(result.el, manager=result.manager),
             })
         else:
-            print(f'{el.file_path} is up to date')
+            print(f'{result.el.file_path} is up to date')
         return EXIT_OK
 
-    logging.debug('downloading update with %s', manager.name)
-
-    def _progress(fraction: float):
-        logging.debug('download: %d%%', round(fraction * 100))
-
-    new_el = appimage_provider.update_from_url(
-        manager, el, keep_both=keep_both, progress_cb=_progress)
-    downloaded_bytes = new_el.size or 0
-
-    # the update was applied: drop the pending-notification marker so the
-    # next --fetch-updates does not re-notify for the (now installed) release
-    state = settings.load_updates_state()
-    key = _updates_state_key(el)
-    if key in state:
-        del state[key]
-        settings.save_updates_state(state)
-
-    message = f'{el.file_path} was updated successfully'
+    # result.status == 'updated'
     if json_output:
         _print_json({
             'schema_version': constants.JSON_SCHEMA_VERSION,
             'result': 'updated',
-            'message': message,
-            'app': _make_app_json(new_el),
-            'downloaded_bytes': downloaded_bytes,
+            'message': result.message,
+            'app': _make_app_json(result.el),
+            'downloaded_bytes': result.downloaded_bytes,
         })
     else:
-        print(message)
+        print(result.message)
     return EXIT_OK
 
 
