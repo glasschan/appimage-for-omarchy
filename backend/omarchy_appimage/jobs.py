@@ -13,6 +13,7 @@
 #   starting | downloading | verifying | replacing | done | error
 # Terminal phases are `done` and `error` only.
 
+import fcntl
 import json
 import logging
 import os
@@ -47,7 +48,10 @@ JOB_HEARTBEAT_INTERVAL_SECONDS = 2.0
 # received and the source's digest verification is running.
 JOB_VERIFY_FRACTION = 0.999
 
-# The per-job log is truncated on open when it has grown past this.
+# The per-job log is truncated on open when it has grown past this, and
+# the running job drops it back to empty whenever it passes the same cap
+# (a verification/replace phase can log for as long as it likes; what the
+# log must never do is grow past this bound).
 JOB_LOG_MAX_BYTES = 256 * 1024
 
 # Desktop ids are basenames of .desktop files; the job file name must
@@ -57,6 +61,18 @@ _JOB_STEM_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 
 def jobs_dir() -> str:
     return os.path.join(constants.plugin_state_dir(), 'jobs')
+
+
+def is_usable_desktop_id(desktop_id) -> bool:
+    """Whether `desktop_id` can name a job file — the rule _job_stem
+    enforces, exposed so a caller can refuse EARLY (a .desktop filename
+    may legally hold a space or a non-ASCII char; a job file name may
+    not)."""
+    if not isinstance(desktop_id, str):
+        return False
+    stem = desktop_id[:-8] if desktop_id.endswith('.desktop') \
+        else desktop_id
+    return bool(_JOB_STEM_RE.match(stem or ''))
 
 
 def _job_stem(desktop_id) -> str:
@@ -150,19 +166,48 @@ def active_job(desktop_id: str):
 
 def open_job_log_fd(desktop_id: str) -> int:
     """Writable (append-mode) fd for the per-job log, living next to the
-    job document. Size-capped: an existing log over JOB_LOG_MAX_BYTES is
-    truncated on open, so a log can never grow unboundedly across job
-    runs. The caller owns the fd (the detached runner dup2s it onto
-    stdout/stderr; the spawning parent closes its copy)."""
+    job document — AND the job's atomic claim.
+
+    The claim is an exclusive, non-blocking flock on this very open file
+    description: the kernel grants it to exactly one live job, and drops
+    it when the last descriptor for that description closes (process
+    death included). There is deliberately no claim FILE, so there is
+    nothing that can go stale. The detached runner inherits this
+    description through the fork and keeps it alive for its whole life
+    via the dup2'd stdout/stderr; the spawning parent closes its copy.
+    That is what makes "--async refuses immediately" true even when two
+    starts race before either job has written a document (the active-job
+    document only exists once the grandchild writes it).
+
+    Raises BlockingIOError when another live job already holds the
+    claim. Size cap: the truncation runs only AFTER the claim is held,
+    so a refused second start can never wipe the log of the job that is
+    still writing it; while the job runs, JobWriter.enforce_log_cap
+    keeps the log inside the same bound.
+
+    The caller owns the fd (single owner: the spawner's caller closes it
+    once the grandchild has inherited it)."""
     path = job_log_path(desktop_id)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _truncate_log_over_cap(path)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _truncate_log_over_cap(path: str):
+    """Drop an over-cap log to empty. Must only be called by the holder
+    of the job claim (the flock in open_job_log_fd)."""
     try:
         if os.path.getsize(path) > JOB_LOG_MAX_BYTES:
             with open(path, 'w'):
                 pass
     except OSError as e:
         logging.debug('could not truncate job log %s: %s', path, e)
-    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
 
 
 class JobWriter:
@@ -270,6 +315,27 @@ class JobWriter:
 
     # ---------------------------------------------------------- heartbeat
 
+    def enforce_log_cap(self):
+        """Keep the log inside JOB_LOG_MAX_BYTES while the job runs.
+
+        Capping on open alone is not enough: one long run (a slow
+        download, a verification or replace phase that keeps talking)
+        writes past the cap and the log then grows without bound. Dropping
+        the log back to empty when it passes the cap keeps the bound
+        exact and leaves the most recent phase in it — the fd is
+        O_APPEND, so the job's next line lands at offset 0 again.
+
+        Safe only because this writer OWNS the job's claim (the flock
+        open_job_log_fd took): no second job can be interleaving lines
+        here."""
+        try:
+            path = job_log_path(self.desktop_id)
+            if os.path.getsize(path) > JOB_LOG_MAX_BYTES:
+                os.truncate(path, 0)
+        except OSError as e:
+            # a state dir that vanished mid-job must not kill the job
+            logging.debug('could not cap job log: %s', e)
+
     def start_heartbeat(self):
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread = threading.Thread(
@@ -282,6 +348,7 @@ class JobWriter:
                 JOB_HEARTBEAT_INTERVAL_SECONDS):
             try:
                 self._write()
+                self.enforce_log_cap()
             except OSError:
                 # state dir vanished mid-job: keep the job running, the
                 # document just stops refreshing (reads as interrupted)

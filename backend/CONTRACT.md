@@ -266,10 +266,29 @@ returns immediately.
 
 - Same target resolution and flags as plain `--update`; `--json` still
   requires `--yes` (exit 2 otherwise).
-- If an **active** job document already exists for the app (liveness rule
-  below), the command refuses before forking: exit 1, error document
+- The app's desktop id must be usable as a job file name
+  (`^[A-Za-z0-9][A-Za-z0-9._-]*$` after the `.desktop` suffix is
+  stripped). A **legal** `.desktop` filename may violate that (a space, a
+  non-ASCII char); plain `--update` accepts it, `--async` cannot name a
+  job file for it and refuses **before any side effect** (no sweep, no
+  fork) with exit 1 and the error document `<path> cannot be updated in
+  the background: its desktop id <id> is not usable as a job file name
+  (allowed: letters, digits, ".", "_" and "-", starting with a letter
+  or digit)`.
+- **Atomic claim, then the liveness check.** The parent opens the
+  per-job log and takes an exclusive non-blocking `flock` on that fd
+  *before* it consults any document; the claim is held by the live
+  grandchild (the inherited open file description survives the `dup2`
+  onto its stdout/stderr) and released by the kernel when it dies, so
+  there is no claim file to go stale. A second start is thereby refused
+  even when both start before either job document exists (two starts
+  used to pass the active-document check and truncate/write the same
+  log). If an **active** job document already exists for the app
+  (liveness rule below), the command refuses too: exit 1, error document
   `an update job is already active for <desktop id> (pid <pid>); refusing
-  to start a second one` — the running job's document is left untouched.
+  to start a second one` (pid omitted when only the claim said so) — the
+  running job's document is left untouched and its log is never reopened
+  for writing.
 - Otherwise the updater detaches as a grandchild (double `fork()`,
   `setsid`, stdin from `/dev/null`, stdout+stderr into the per-job log)
   and the parent reports `job-started` and exits **0** immediately; the
@@ -321,15 +340,32 @@ document that fails the rule (dead pid or stale heartbeat); unparsable
 documents classify the same way.
 
 The per-job log lives next to the document (`<stem>.log`, append mode)
-and is size-capped: a log over 256 KiB (`JOB_LOG_MAX_BYTES`) is truncated
-when the next job opens it.
+and is size-capped at 256 KiB (`JOB_LOG_MAX_BYTES`): an over-cap log is
+truncated by the next job that legitimately opens it (i.e. only under
+the held claim, so a refused start can never wipe a live job's log), and
+the running job drops it back to empty whenever it passes the cap
+(`JobWriter.enforce_log_cap`, driven by the 2 s heartbeat thread) — the
+log therefore always holds the most recent phase and never grows
+without bound.
 
 #### Document lifecycle (janitor sweep, additive)
 
 Every `--list-installed` and every async job start (in the spawning
 **parent**, before the fork — never inside the grandchild) runs a
-best-effort sweep (`janitor.sweep()`) that **never fails the command**
-and removes, silently (debug log only — there is no expiry notification):
+best-effort sweep that **never fails the command** and removes,
+silently (debug log only — there is no expiry notification):
+
+- **`--list-installed` is throttled**: it runs on the panel's 10 s poll
+  and a sweep is an unbounded `listdir` + `stat` walk of the shared temp
+  dir in the CLI's foreground, so the listing hook sweeps at most once
+  per `janitor.SWEEP_THROTTLE_SECONDS` = **300 s**
+  (`janitor.sweep_throttled()`, recorded in
+  `$XDG_STATE_HOME/io.github.glasschan.appimage/last-sweep` — the plugin
+  state dir, never the temp area the sweep cleans). A **missing or
+  corrupt marker sweeps** (the throttle is an optimisation, never a
+  precondition). An async job start still sweeps **unconditionally**
+  (`janitor.sweep()`), and both entry points share the same removal
+  semantics.
 
 - a **terminal** (`done`/`error`) or **`interrupted`** document — together
   with its `<stem>.log` — once `JOB_ACK_WINDOW_SECONDS` = **24 h** have

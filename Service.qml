@@ -303,7 +303,11 @@ Item {
     jobView.path = ""       // force a re-read even when the previous
     jobView.path = jobsDir + "/" + stem + ".json"  // candidate had this path
     var text = String(jobView.text() || "")
-    var adopted = JobDocs.adoptDocument(text, true, Date.now())
+    // `null`, not `true`: this service cannot probe a pid either (the
+    // third JobDocs state — "the caller cannot probe, lean on the
+    // heartbeat rule alone"). Passing `true` asserted a liveness probe
+    // that does not exist and made pidDead unreachable.
+    var adopted = JobDocs.adoptDocument(text, null, Date.now())
     // Missing/unreadable (empty text — includes documents the janitor
     // aged out, which vanish silently per the contract) or corrupt:
     // skip silently, exactly like the rest of the service's failures.

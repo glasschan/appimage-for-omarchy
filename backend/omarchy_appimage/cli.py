@@ -967,9 +967,12 @@ def cmd_list_installed(args: list) -> int:
     json_output = '--json' in args
     # janitor sweep (ticket 03): fossils — terminal/interrupted job
     # documents past the acknowledgement window and orphan update temp
-    # dirs past the grace window — go away on every listing. Best-effort
-    # by contract: sweep() never raises.
-    janitor.sweep()
+    # dirs past the grace window — go away on every listing. THROTTLED:
+    # the panel polls this every 10 s and each sweep is an unbounded
+    # listdir + stat walk of the shared temp dir in this process's
+    # foreground (the job-start hook in _cmd_update_async stays
+    # unthrottled). Best-effort by contract: never raises.
+    janitor.sweep_throttled()
     apps = appimage_provider.list_installed()
 
     if json_output:
@@ -1325,41 +1328,49 @@ _JOB_HANDSHAKE_TIMEOUT_SECONDS = 10
 def _cmd_update_async(target: str, keep_both: bool, force: bool,
                       json_output: bool) -> int:
     """Parent side of --update --async: validate the target (local name/id
-    resolution only), refuse when an active job document already exists
-    for the app, then spawn the detached grandchild (see
+    resolution only), take the job's atomic claim, refuse when a job is
+    running for the app, then spawn the detached grandchild (see
     _spawn_update_job) and report `job-started` immediately. The parent
     never runs the pipeline itself and never resolves the update manager:
     that is run_update's first step inside the grandchild, so a missing
     or broken source surfaces as a terminal `error` job document instead
     of a second, drifting manager resolution here."""
+    el = _resolve_target(target)
+    # fail closed BEFORE any side effect (no sweep, no fork): the id must
+    # be able to name a job file, or this path cannot honour its contract
+    desktop_id = _job_desktop_id(el)
+
     # janitor sweep (ticket 03), parent-side only — never in the
     # grandchild: stale terminal/interrupted documents age out and orphan
     # update temp dirs are reclaimed before a new job is spawned.
     # Best-effort by contract: sweep() never raises.
     janitor.sweep()
-    el = _resolve_target(target)
-    desktop_id = _updates_state_key(el)
 
-    active = jobs.active_job(desktop_id)
-    if active is not None:
-        message = (f'an update job is already active for {desktop_id} '
-                   f'(pid {active.get("pid")}); refusing to start a '
-                   f'second one')
-        if json_output:
-            _print_json({
-                'schema_version': constants.JSON_SCHEMA_VERSION,
-                'result': 'error',
-                'error': message,
-            })
-        else:
-            print(f'Error: {message}', file=sys.stderr)
-        return EXIT_ERROR
+    # The claim comes first, and it is atomic: two starts racing before
+    # either job document exists would otherwise both pass the active-job
+    # check and both write this log (TOCTOU). open_job_log_fd also owns
+    # the only legal truncation of an over-cap log, so a start that turns
+    # out to be refused cannot wipe a live job's log.
+    try:
+        log_fd = jobs.open_job_log_fd(desktop_id)
+    except BlockingIOError:
+        return _refuse_second_job(desktop_id, json_output)
 
     try:
-        pid, job_path, log_path = _spawn_update_job(
-            desktop_id, target, keep_both=keep_both, force=force)
-    except OSError as e:
-        raise OperationError(f'could not start the update job: {e}')
+        active = jobs.active_job(desktop_id)
+        if active is not None:
+            return _refuse_second_job(desktop_id, json_output, active)
+
+        try:
+            pid, job_path, log_path = _spawn_update_job(
+                desktop_id, target, keep_both=keep_both, force=force,
+                log_fd=log_fd)
+        except OSError as e:
+            raise OperationError(f'could not start the update job: {e}')
+    finally:
+        # single owner: the grandchild inherited the description (and the
+        # flock with it) through the fork, so this copy is done
+        os.close(log_fd)
 
     if json_output:
         _print_json({
@@ -1375,6 +1386,48 @@ def _cmd_update_async(target: str, keep_both: bool, force: bool,
               f'(pid {pid}, desktop id {desktop_id}); '
               f'job document: {job_path}')
     return EXIT_OK
+
+
+def _job_desktop_id(el) -> str:
+    """The app's job key, with the fail-closed precondition attached: an
+    id the job store cannot turn into a file name (a legal .desktop
+    filename may hold a space or a non-ASCII char) is an OperationError,
+    i.e. the contract's error shape — never a ValueError escaping to
+    main()'s catch-all as a generic "unexpected error" + traceback. Sync
+    --update accepts such an id, so the refusal has to name the reason."""
+    desktop_id = _updates_state_key(el)
+    if not jobs.is_usable_desktop_id(desktop_id):
+        raise OperationError(
+            f'{el.file_path} cannot be updated in the background: its '
+            f'desktop id {desktop_id!r} is not usable as a job file name '
+            f'(allowed: letters, digits, ".", "_" and "-", '
+            f'starting with a letter or digit)')
+    return desktop_id
+
+
+def _refuse_second_job(desktop_id: str, json_output: bool,
+                       active: dict = None) -> int:
+    """The --async refusal, one shape for both gates (the atomic claim
+    and the active-document check). Nothing of the running job is
+    touched: its document is not rewritten and its log is not opened for
+    writing."""
+    pid = (active or {}).get('pid')
+    if pid:
+        message = (f'an update job is already active for {desktop_id} '
+                   f'(pid {pid}); refusing to start a second one')
+    else:
+        message = (f'an update job is already active for {desktop_id}; '
+                   f'refusing to start a second one')
+    if json_output:
+        _print_json({
+            'schema_version': constants.JSON_SCHEMA_VERSION,
+            'result': 'error',
+            'desktop_id': desktop_id,
+            'error': message,
+        })
+    else:
+        print(f'Error: {message}', file=sys.stderr)
+    return EXIT_ERROR
 
 
 def _job_entrypoint(desktop_id: str, target: str, keep_both: bool,
@@ -1426,7 +1479,7 @@ def _finish_job_document(writer, result: UpdateResult) -> int:
 
 
 def _spawn_update_job(desktop_id: str, target: str, keep_both: bool,
-                      force: bool) -> tuple:
+                      force: bool, log_fd: int) -> tuple:
     """Detach the job runner as a grandchild: os.fork() twice (setsid in
     the intermediate, so the grandchild owns no controlling terminal and
     cannot reacquire one), stdio redirected into the size-capped per-job
@@ -1436,8 +1489,12 @@ def _spawn_update_job(desktop_id: str, target: str, keep_both: bool,
     can name it in the job-started document. The parent reaps only the
     intermediate; the grandchild is reparented and reaped by init.
 
+    `log_fd` is the caller's already-open (and flock-claimed) job log, not
+    something this function opens: the claim has to be held across the
+    active-job check and the fork, and only the caller can bracket that.
+    Ownership of the fd stays with the caller.
+
     Returns (grandchild_pid, job_document_path, job_log_path)."""
-    log_fd = jobs.open_job_log_fd(desktop_id)
     devnull_fd = os.open(os.devnull, os.O_RDONLY)
     job_path = jobs.job_document_path(desktop_id)
     log_path = jobs.job_log_path(desktop_id)
@@ -1513,7 +1570,6 @@ def _spawn_update_job(desktop_id: str, target: str, keep_both: bool,
     finally:
         os.close(read_fd)
         os.close(devnull_fd)
-        os.close(log_fd)
     # bounded above by the handshake deadline only via the pipe: the
     # intermediate's post-fork code is close/setsid/fork/write/_exit, so a
     # hang here would require a signal mid-sequence — reap is unblocking-free

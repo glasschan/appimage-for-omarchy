@@ -677,6 +677,12 @@ Panel {
   // repeat when two versions coexist, CONTRACT.md).
   function requestRemove(item) {
     if (!item) return
+    // A row whose detached update job is still downloading/replacing is
+    // not removable: the job installs where the AppImage sits, so a
+    // removal now would land the new release in a target that is already
+    // in the trash. Fail closed here as well as on the buttons (same
+    // shape as updateItem's per-app single-flight guard).
+    if (root.jobActive(item.id)) return
     if (confirmRemoveId !== item.id) {
       confirmRemoveId = item.id
       confirmResetTimer.restart()
@@ -1799,9 +1805,13 @@ Panel {
       root.jobReadingId = ""
       jobReadWatchdog.stop()
       // The path guard retires a superseded read: only the document the
-      // queue actually pointed at may adopt.
+      // queue actually pointed at may adopt. `null` is the pid argument
+      // this panel can actually stand behind: QML cannot probe a pid
+      // (the third JobDocs state, "caller cannot probe"), so the heartbeat
+      // rule decides alone — asserting `true` would claim a probe that
+      // never happened and make pidDead unreachable.
       if (id !== "" && jobFileView.path === JobDocs.jobDocumentPath(root.jobsDir, id)) {
-        root.adoptJob(id, JobDocs.adoptDocumentForPanel(jobFileView.text(), true, Date.now()))
+        root.adoptJob(id, JobDocs.adoptDocumentForPanel(jobFileView.text(), null, Date.now()))
       }
       root.pumpJobReads()
     }
@@ -3048,6 +3058,9 @@ Panel {
 
                             // Two-click inline remove (F3): first click arms
                             // "Remove?" on this row only, second click runs it.
+                            // Blocked while this row's update job runs: the
+                            // job is installing over the AppImage, so a
+                            // remove would delete the target under it.
                             Button {
                               visible: root.confirmRemoveId === rowOuter.modelData.id
                               text: root.strings.removeConfirm
@@ -3057,13 +3070,17 @@ Panel {
                               fontFamily: root.fontFamily
                               fontSize: Style.font.caption
                               implicitHeight: root.controlHeight
-                              enabled: !root.busyRemove
+                              enabled: !root.busyRemove && !root.jobActive(rowOuter.modelData.id)
                               onClicked: root.requestRemove(rowOuter.modelData)
                             }
 
                             PanelActionButton {
                               id: removeButton
                               visible: root.confirmRemoveId !== rowOuter.modelData.id
+                              // same per-row gate as the update button: only
+                              // THIS row dims while ITS job runs (other rows
+                              // stay removable)
+                              enabled: !root.jobActive(rowOuter.modelData.id)
                               tooltipText: root.strings.removeTooltip
                               foreground: root.foreground
                               hoverColor: root.urgent

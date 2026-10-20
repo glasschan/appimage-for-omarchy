@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -326,6 +327,84 @@ class JanitorHookTests(_DocSeedMixin, InProcessCliMixin, FakeXDGTestCase):
         self.assertEqual(code, 1)
         self.assertIn('already active', json.loads(out)['error'])
         self.assertEqual(jobs.read_job('fakeapp.desktop'), active)
+
+
+class SweepThrottleTests(_DocSeedMixin, InProcessCliMixin, FakeXDGTestCase):
+    """--list-installed runs on the panel's 10 s poll, and a sweep is an
+    unbounded os.listdir + stat walk of the shared temp dir in the CLI's
+    FOREGROUND — so the listing hook is throttled to one sweep per
+    janitor.SWEEP_THROTTLE_SECONDS through a marker file in the plugin
+    state dir (never /tmp). A job start still sweeps unconditionally."""
+
+    def test_first_call_sweeps(self):
+        with mock.patch.object(janitor, 'sweep') as sweep:
+            swept = janitor.sweep_throttled()
+        self.assertTrue(swept)
+        sweep.assert_called_once()
+
+    def test_second_call_inside_the_window_is_throttled(self):
+        with mock.patch.object(janitor, 'sweep') as sweep:
+            self.assertTrue(janitor.sweep_throttled(now=1000.0))
+            self.assertFalse(janitor.sweep_throttled(now=1000.0 + 60))
+        self.assertEqual(sweep.call_count, 1)
+
+    def test_call_after_the_window_sweeps_again(self):
+        start = 1000.0
+        with mock.patch.object(janitor, 'sweep') as sweep:
+            self.assertTrue(janitor.sweep_throttled(now=start))
+            self.assertTrue(janitor.sweep_throttled(
+                now=start + janitor.SWEEP_THROTTLE_SECONDS + 1))
+        self.assertEqual(sweep.call_count, 2)
+
+    def test_missing_marker_sweeps(self):
+        # the marker is an optimisation, never a precondition: a fresh
+        # sandbox (or a marker removed by hand) must still sweep
+        self.assertFalse(os.path.exists(janitor.sweep_marker_path()))
+        with mock.patch.object(janitor, 'sweep') as sweep:
+            self.assertTrue(janitor.sweep_throttled())
+        sweep.assert_called_once()
+
+    def test_corrupt_marker_sweeps(self):
+        Path(janitor.sweep_marker_path()).parent.mkdir(
+            parents=True, exist_ok=True)
+        Path(janitor.sweep_marker_path()).write_text('not-a-timestamp')
+        with mock.patch.object(janitor, 'sweep') as sweep:
+            self.assertTrue(janitor.sweep_throttled())
+        sweep.assert_called_once()
+        # …and the sweep re-stamped it, so the marker is healthy again
+        self.assertLessEqual(
+            abs(float(Path(janitor.sweep_marker_path()).read_text())
+                - time.time()), 60)
+
+    def test_marker_lives_in_the_plugin_state_dir(self):
+        # never bare in the temp area: the marker must sit inside the
+        # plugin's own state dir (namespaced, and not a name the sweep's
+        # temp cleanup could ever be asked to remove)
+        self.assertEqual(os.path.dirname(janitor.sweep_marker_path()),
+                         os.path.dirname(self.plugin_jobs_dir))
+        self.assertNotEqual(os.path.dirname(janitor.sweep_marker_path()),
+                            os.path.realpath(tempfile.gettempdir()))
+
+    def test_list_installed_sweeps_only_once_per_window(self):
+        with mock.patch.object(janitor, 'sweep') as sweep:
+            for _ in range(3):
+                out, err, code = self.run_cmd(
+                    cli.cmd_list_installed, ['--json'])
+                self.assertEqual(code, 0, err)
+        self.assertEqual(sweep.call_count, 1)
+
+    def test_job_start_sweeps_unconditionally(self):
+        # a fresh marker (the panel just listed) must not stop a job start
+        # from sweeping: that hook is not throttled
+        self.install_fake_app()
+        janitor.sweep_throttled()
+        with mock.patch.object(janitor, 'sweep') as sweep, \
+                mock.patch.object(cli, '_spawn_update_job',
+                                  return_value=(4242, '/j.json', '/j.log')):
+            out, err, code = self.run_cmd(
+                cli.cmd_update, ['fakeapp', '--yes', '--json', '--async'])
+        self.assertEqual(code, 0, err)
+        sweep.assert_called_once_with()
 
 
 if __name__ == '__main__':

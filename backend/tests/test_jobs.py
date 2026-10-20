@@ -100,6 +100,18 @@ class JobStoreTests(FakeXDGTestCase):
             with self.assertRaises(ValueError):
                 jobs.job_document_path(bad)
 
+    def test_desktop_id_usability_rule_is_probeable(self):
+        # the same rule _job_stem enforces, exposed so the CLI can refuse
+        # an unusable id with the contract's error shape BEFORE it writes
+        # anything (a legal .desktop filename may hold a space)
+        for good in ('fakeapp', 'fakeapp.desktop',
+                     'org.gnome.Calculator.desktop',
+                     'a_b-c.1.desktop'):
+            self.assertTrue(jobs.is_usable_desktop_id(good), good)
+        for bad in ('my app.desktop', 'caf\u00e9.desktop', '.hidden',
+                    '', '../evil.desktop', 'a/b', None, 42):
+            self.assertFalse(jobs.is_usable_desktop_id(bad), bad)
+
     def test_write_read_roundtrip_and_no_temp_residue(self):
         doc = {'schema_version': jobs.JOB_SCHEMA_VERSION,
                'desktop_id': 'fakeapp.desktop', 'phase': 'starting'}
@@ -201,6 +213,47 @@ class JobLogTests(FakeXDGTestCase):
         with open(path, 'rb') as f:
             self.assertEqual(f.read(), b'fresh\n')
 
+    def test_second_claim_is_refused(self):
+        # the open fd IS the claim: while one job holds it, a second open
+        # must not be granted (and must not touch the log it is writing).
+        # A TOCTOU-free claim is what makes "--async refuses immediately"
+        # true even when both starts race before either document exists.
+        fd = jobs.open_job_log_fd('fakeapp.desktop')
+        os.write(fd, b'live job output\n')
+        with self.assertRaises(BlockingIOError):
+            jobs.open_job_log_fd('fakeapp.desktop')
+        with open(jobs.job_log_path('fakeapp.desktop'), 'rb') as f:
+            self.assertEqual(f.read(), b'live job output\n')
+        os.close(fd)
+
+    def test_claim_is_released_when_the_holder_closes(self):
+        # the kernel drops a flock with the last descriptor for that open
+        # file description: process death and an explicit close alike
+        # leave no stale claim file behind (there is no claim file)
+        os.close(jobs.open_job_log_fd('fakeapp.desktop'))
+        fd = jobs.open_job_log_fd('fakeapp.desktop')
+        os.close(fd)
+        self.assertEqual(sorted(os.listdir(self.plugin_jobs_dir)),
+                         ['fakeapp.log'])
+
+    def test_oversized_log_is_not_truncated_without_the_claim(self):
+        # truncating an over-cap log only under the held claim is what
+        # keeps a refused second start from wiping the running job's log
+        path = jobs.job_log_path('fakeapp.desktop')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(b'x' * (jobs.JOB_LOG_MAX_BYTES + 1))
+        holder = jobs.open_job_log_fd('fakeapp.desktop')
+        try:
+            with open(path, 'wb') as f:
+                f.write(b'y' * (jobs.JOB_LOG_MAX_BYTES + 1))
+            with self.assertRaises(BlockingIOError):
+                jobs.open_job_log_fd('fakeapp.desktop')
+            self.assertEqual(os.path.getsize(path),
+                             jobs.JOB_LOG_MAX_BYTES + 1)
+        finally:
+            os.close(holder)
+
 
 class JobWriterTests(FakeXDGTestCase):
     """JobWriter: the document walk the grandchild publishes."""
@@ -293,6 +346,49 @@ class JobWriterTests(FakeXDGTestCase):
         self.assertEqual(self._doc()['heartbeat'], third)
 
 
+class JobWriterLogCapTests(FakeXDGTestCase):
+    """The log cap is enforced DURING the run, not only on open: one long
+    verification/replace phase would otherwise grow the log past
+    JOB_LOG_MAX_BYTES without bound, which the size-capped-log contract
+    does not allow."""
+
+    def setUp(self):
+        super().setUp()
+        self.writer = jobs.JobWriter('fakeapp.desktop', pid=4242)
+        self.log_path = jobs.job_log_path('fakeapp.desktop')
+
+    def test_under_cap_log_is_left_alone(self):
+        Path(self.log_path).write_bytes(b'still here\n')
+        self.writer.enforce_log_cap()
+        with open(self.log_path, 'rb') as f:
+            self.assertEqual(f.read(), b'still here\n')
+
+    def test_over_cap_log_is_dropped_while_the_job_runs(self):
+        Path(self.log_path).write_bytes(b'x' * (jobs.JOB_LOG_MAX_BYTES + 1))
+        self.writer.enforce_log_cap()
+        self.assertEqual(os.path.getsize(self.log_path), 0)
+
+    def test_enforcement_survives_a_vanished_log(self):
+        # a state dir that goes away mid-job must not kill the job
+        Path(self.log_path).write_bytes(b'gone soon\n')
+        os.unlink(self.log_path)
+        self.writer.enforce_log_cap()
+
+    def test_heartbeat_thread_enforces_the_cap(self):
+        # the heartbeat thread is the natural owner of the periodic cap
+        with mock.patch.object(jobs, 'JOB_HEARTBEAT_INTERVAL_SECONDS',
+                               0.02):
+            Path(self.log_path).write_bytes(
+                b'x' * (jobs.JOB_LOG_MAX_BYTES + 1))
+            self.writer.start_heartbeat()
+            deadline = time.time() + 3
+            while (os.path.getsize(self.log_path) and
+                   time.time() < deadline):
+                time.sleep(0.01)
+            self.writer.stop_heartbeat()
+        self.assertEqual(os.path.getsize(self.log_path), 0)
+
+
 class AsyncJobCliTests(InProcessCliMixin, FakeXDGTestCase):
     """Parent-side --async CLI behaviour (spawn mocked or refused
     pre-fork — the test process never forks) and the grandchild
@@ -333,8 +429,12 @@ class AsyncJobCliTests(InProcessCliMixin, FakeXDGTestCase):
             'log_path': '/jobs/fakeapp.log',
             'pid': 4242,
         })
+        # the claim fd opened by the parent is handed to the spawner (the
+        # grandchild dup2s it onto stdout/stderr, which keeps the flock
+        # alive for the job's whole life)
         spawn.assert_called_once_with('fakeapp.desktop', 'fakeapp',
-                                      keep_both=False, force=False)
+                                      keep_both=False, force=False,
+                                      log_fd=mock.ANY)
 
     def test_job_started_plain_text(self):
         with mock.patch.object(cli, '_spawn_update_job',
@@ -362,8 +462,93 @@ class AsyncJobCliTests(InProcessCliMixin, FakeXDGTestCase):
         self.assertIn('fakeapp.desktop', payload['error'])
         # the first job's document is untouched and nothing was spawned
         self.assertEqual(jobs.read_job('fakeapp.desktop'), seeded)
-        self.assertFalse(os.path.exists(
-            jobs.job_log_path('fakeapp.desktop')))
+        # the refusal took (and released) the claim, so the log exists but
+        # is EMPTY: nothing a second start does may reach the first job's
+        # log, and it never reopens it for writing
+        log_path = jobs.job_log_path('fakeapp.desktop')
+        self.assertEqual(os.path.getsize(log_path), 0)
+
+    def _assert_refused(self, out, code):
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertEqual(payload['schema_version'], 1)
+        self.assertEqual(payload['result'], 'error')
+        self.assertEqual(payload['desktop_id'], 'fakeapp.desktop')
+        return payload['error']
+
+    def test_second_start_is_refused_while_the_claim_is_held(self):
+        # TOCTOU: the first job's document only appears once its grandchild
+        # writes it, so two simultaneous starts used to both pass the
+        # active-job check and both write the same log. The claim is now
+        # taken first, atomically, so the loser is refused immediately.
+        seeded = self._seed_active_job()
+        holder = jobs.open_job_log_fd('fakeapp.desktop')
+        os.write(holder, b'first job output\n')
+        try:
+            with mock.patch.object(cli, '_spawn_update_job') as spawn:
+                out, err, code = self.run_cmd(
+                    cli.cmd_update,
+                    ['fakeapp', '--yes', '--json', '--async'])
+            spawn.assert_not_called()
+        finally:
+            os.close(holder)
+        error = self._assert_refused(out, code)
+        self.assertIn('already active', error)
+        self.assertIn('fakeapp.desktop', error)
+        # the first job's log and document are untouched
+        with open(jobs.job_log_path('fakeapp.desktop'), 'rb') as f:
+            self.assertEqual(f.read(), b'first job output\n')
+        self.assertEqual(jobs.read_job('fakeapp.desktop'), seeded)
+
+    def test_claim_refusal_is_a_contract_error_on_the_plain_path(self):
+        self._seed_active_job()
+        holder = jobs.open_job_log_fd('fakeapp.desktop')
+        try:
+            out, err, code = self.run_cmd(
+                cli.cmd_update, ['fakeapp', '--yes', '--async'])
+        finally:
+            os.close(holder)
+        self.assertEqual(code, 1)
+        self.assertEqual(out, '')
+        self.assertIn('Error:', err)
+        self.assertIn('already active', err)
+
+    def test_unusable_desktop_id_is_a_contract_error_document(self):
+        # a .desktop filename may legally hold a space or a non-ASCII
+        # char, but the job file name may not. The sync path accepts such
+        # an id, so --async must refuse it with the contract's error shape
+        # (never a ValueError escaping as "unexpected error" + traceback)
+        # and must stay side-effect free. Driven through main(), because
+        # that is the layer whose catch-all used to swallow it.
+        self.install_fake_app(desktop_name='my app', app_name='Spaced')
+        with mock.patch.object(cli.janitor, 'sweep') as sweep, \
+                mock.patch.object(cli, '_spawn_update_job') as spawn:
+            out, err, code = self.run_cmd(
+                cli.main,
+                ['appimage', '--update', 'my app', '--yes', '--json',
+                 '--async'])
+        sweep.assert_not_called()
+        spawn.assert_not_called()
+        self.assertEqual(code, 1, err)
+        payload = json.loads(out)
+        self.assertEqual(payload['schema_version'], 1)
+        self.assertEqual(payload['result'], 'error')
+        self.assertIn('my app.desktop', payload['error'])
+        # the reason is named, and nothing was created in the jobs dir
+        self.assertIn('not usable as a job file name', payload['error'])
+        self.assertFalse(os.path.exists(self.plugin_jobs_dir))
+        self.assertNotIn('Traceback', err)
+
+    def test_unusable_desktop_id_is_a_plain_error_too(self):
+        self.install_fake_app(desktop_name='caf\u00e9', app_name='Cafe')
+        out, err, code = self.run_cmd(
+            cli.main,
+            ['appimage', '--update', 'caf\u00e9', '--yes', '--async'])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, '')
+        self.assertIn('Error:', err)
+        self.assertIn('not usable as a job file name', err)
+        self.assertNotIn('Traceback', err)
 
     def _set_source(self, url):
         el = cli.appimage_provider.list_installed()[0]

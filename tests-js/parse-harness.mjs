@@ -1090,6 +1090,24 @@ const adopt = (f, pidAlive, offsetSec) =>
   // heartbeat-only panels pass true and accept the <=120 s blind window
   check("dead-pid capture + pidAlive=true stays active (caller's word)",
     adopt("job-dead-pid.json", true).decision.state === "active")
+
+  // …and the state both production readers actually pass: `null`, the
+  // documented "cannot probe". Identical classification to `true` (no
+  // behaviour change), but pidDead must stay unreachable — it means "a
+  // real probe said dead", which a null caller never said.
+  check("pidAlive=null classifies exactly like true (heartbeat alone)",
+    adopt("job-downloading.json", null).decision.state === "active"
+    && adopt("job-dead-pid.json", null).decision.state === "active")
+  check("pidAlive=null never claims pidDead",
+    adopt("job-dead-pid.json", null).decision.pidDead === false
+    && adopt("job-downloading.json", null).decision.pidDead === false)
+  check("pidAlive=null still interrupts on a stale heartbeat",
+    adopt("job-stale-heartbeat.json", null, 310).decision.state === "interrupted"
+    && adopt("job-stale-heartbeat.json", null, 310).decision.stale === true
+    && adopt("job-stale-heartbeat.json", null, 310).decision.pidDead === false)
+  check("adoptDocumentForPanel accepts the null probe state",
+    JobDocs.adoptDocumentForPanel(cap("job-downloading.json"), null,
+      at("job-downloading.json", 5)).decision.state === "active")
 }
 
 // -- malformed / truncated / empty: safe fallback, never an exception ----------

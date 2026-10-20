@@ -24,7 +24,7 @@ import stat
 import tempfile
 import time
 
-from . import jobs
+from . import constants, jobs, utils
 
 # A terminal (done|error) or interrupted document is removed — together
 # with its per-job log — once this window has passed since its last
@@ -177,6 +177,59 @@ def sweep(now: float = None, temp_area: str = None) -> dict:
     except Exception:
         logging.exception('janitor: temp-dir sweep failed')
     return counts
+
+
+# --list-installed runs on the panel's 10 s poll, and each sweep is an
+# UNBOUNDED os.listdir + stat walk of the shared temp dir (every other
+# user's temp entries land in that same walk) in the CLI's FOREGROUND —
+# the listing hook must not pay that every tick. Job starts keep
+# sweeping unconditionally: they are rare, and a fossil document must be
+# gone before the new job's document appears.
+SWEEP_THROTTLE_SECONDS = 5 * 60
+
+
+def sweep_marker_path() -> str:
+    """The throttle marker: plugin state dir, NEVER /tmp.
+
+    A /tmp marker would be (a) wiped by the very cleanup the sweep does
+    and (b) shared with every other process on the box."""
+    return os.path.join(constants.plugin_state_dir(), 'last-sweep')
+
+
+def sweep_throttled(interval_seconds: float = SWEEP_THROTTLE_SECONDS,
+                    now: float = None) -> bool:
+    """sweep(), at most once per `interval_seconds`.
+
+    For the high-frequency hook (--list-installed) only; sweep() itself
+    keeps its semantics for every direct caller. The marker holds the
+    epoch of the last sweep; a MISSING or CORRUPT marker means "never
+    swept" and sweeps (the throttle is an optimisation, never a
+    precondition — a janitor that stops running because its bookkeeping
+    broke is worse than one extra sweep). A marker timestamped in the
+    future (clock skew) is treated the same way.
+
+    Returns True when this call swept, False when it was throttled.
+    Never raises."""
+    if now is None:
+        now = time.time()
+    last = None
+    try:
+        with open(sweep_marker_path(), 'r', encoding='utf-8') as f:
+            last = float(f.read().strip())
+    except (OSError, ValueError):
+        last = None
+    if last is not None and 0 <= now - last < interval_seconds:
+        return False
+
+    # stamp BEFORE sweeping: a sweep that is interrupted (or that dies in
+    # a crash loop) must not be retried on every single poll
+    try:
+        utils.atomic_write(sweep_marker_path(),
+                           repr(float(now)).encode('utf-8'))
+    except OSError as e:
+        logging.debug('janitor: could not stamp the sweep marker: %s', e)
+    sweep(now=now)
+    return True
 
 
 # ----------------------------------------------------------------- helpers

@@ -291,10 +291,13 @@ small document on disk (`$XDG_STATE_HOME/io.github.glasschan.appimage/
 jobs/`), so closing the panel — or restarting the shell mid-download —
 loses nothing: reopening shows the job still running, and a job whose
 updater died (or whose heartbeat went quiet) shows an interrupted notice
-with the Update button ready to retry. Outcomes surface in the panel as
+with the Update button ready to retry. Outcomes show in the panel as
 they finish, and the background checker announces new updates and
 outcomes with desktop notifications. A janitor sweep expires settled job
-documents (and their logs) after 24 h.
+documents (and their logs) after 24 h. While a row's job is still
+running its Remove button stays disabled — the job installs over that
+AppImage, so removing it mid-flight would leave the new release with no
+target (the armed "Remove?" confirm honours the same block).
 
 ## Plugin layout
 
@@ -337,6 +340,8 @@ published.
   and removes orphaned partial downloads.
 - The background checker announces job outcomes (updated / failed /
   interrupted) with desktop notifications.
+- The row's Remove button is blocked while that row's update job is
+  still running (the job installs over the AppImage it would delete).
 - New CLI surface: `--update <target> --async` (job-started document),
   documented in `backend/CONTRACT.md` together with the job-document
   schema and the job liveness rule.
