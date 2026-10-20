@@ -5,7 +5,8 @@
 [![CI](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml/badge.svg)](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml)
 
 Manage AppImages from the Omarchy bar: integrate new ones into your app
-menu — from a local file or straight from a release URL — see what is
+menu — from a local file (through a Browse dialog, a pasted path, or a
+drag-and-drop) or straight from a release URL — see what is
 installed (and running), launch, update, and remove them — all in a
 native Quickshell panel. No daemon, no extra runtime: the
 panel is plain QML and the backend is a Python-stdlib CLI that runs only
@@ -26,6 +27,13 @@ badge turns urgent and counts them.
 Errors are never silent: a hung backend or invalid JSON surfaces as a
 dismissible banner in the panel, and a missing `python3` swaps the panel
 body for an authorized-install card (see *Install → Python dependency*).
+A launch that never comes up — checked against the process list after a
+short grace, since a spawn either starts or dies within moments — raises
+its own banner; when the backend's best-effort probe reports the fuse2
+runtime library (`libfuse.so.2`) missing, that banner adds one text-only
+line naming it as the most common cause. No command, no button: the hint
+names the library and nothing more, and a `present` or `unknown` probe
+never adds it.
 Status messages auto-clear after 5 s; errors stay until dismissed. A
 backend call that overruns its watchdog reports a timeout — never a
 misleading "python3 missing" hint.
@@ -39,6 +47,13 @@ misleading "python3 missing" hint.
 - `notify-send` (libnotify) for the background-check desktop notification —
   present on Omarchy; a missing binary just means no notification, never
   a failure.
+- `fuse2` (the `libfuse.so.2` shared library) to *launch* type-2
+  AppImages — some systems ship without it. Managing AppImages never
+  needs it: the backend reads metadata without executing anything. The
+  installed listing carries a best-effort probe (`present` / `missing` /
+  `unknown`); a launch failure while the probe says `missing` names the
+  library in the banner as the most common cause — a text-only hint,
+  never an install action.
 - Nothing else is required: `unsquashfs`/`bsdtar` (optional fallbacks for
   exotic squashfs compressions), `zstd` (zstd AppImages on Python < 3.14),
   `ps` and `update-desktop-database` are best-effort and their absence is
@@ -134,6 +149,8 @@ The QML layer talks to `backend/main.py` over a stable JSON contract
 python3 backend/main.py --list-installed --json
 python3 backend/main.py --integrate /path/to/App.AppImage --yes --json
 python3 backend/main.py --integrate https://github.com/<owner>/<repo>/releases/download/<tag>/<file> --yes --json
+python3 backend/main.py --preview-integrate /path/to/App.AppImage --json
+python3 backend/main.py --pick-file --json
 python3 backend/main.py --remove <desktop-id> --yes --json
 python3 backend/main.py --list-updates --json
 python3 backend/main.py --update <desktop-id> --yes --json
@@ -150,6 +167,62 @@ stderr); `--json` requires `--yes` for integrate/remove/update.
 `--get-update-source` reads a configured source back — the configured
 manager + config, or `no-source` — which is what the panel's source
 editor pre-fills from when it opens.
+
+### Integrate picker
+
+The Integrate card takes a pasted path or release URL, quick-picks from
+`~/Downloads`, or a **Browse…** button. Browse runs `--pick-file`: the
+backend opens a native single-file, AppImage-filtered dialog — the
+desktop portal first, `zenity` as the fallback — orchestrating it as an
+isolated child process under one absolute 600 s whole-operation
+deadline, so a crashed or hung dialog can never take the panel down.
+A picked file fills the panel's path field ready to integrate; the fill
+itself integrates nothing (and dismisses any preview of a different
+path) — the next Enter or **Integrate** press runs the preview flow
+below. A cancel is a quiet notice; a missing file chooser reports itself
+and the paste-a-path flow keeps working exactly as before. Timeout and
+dialog failures surface as dismissible banners. The result documents
+(`picked` / `cancelled` / `unavailable`, typed `timeout` /
+`backend-failed` / `not-local` errors) are mapped defensively and
+pinned by `tests-js/parse-harness.mjs`.
+
+### Drop to integrate
+
+Dragging an AppImage file from a file manager onto the bar icon or onto
+the panel window opens the Integrate picker with that file already
+filled in and its preview card showing — the same confirm-before-install
+flow as every other route, so a drop never installs anything by itself.
+Only local AppImage files are accepted (a dragged web address is not a
+drop here); a selection without an AppImage reports itself as a status,
+and a multi-file drop uses the first AppImage and says how many others
+were ignored. Hovering a drag over either surface highlights it — the
+panel shows a veil with a "Drop to integrate" chip, the bar icon tints
+with the theme accent.
+
+### Integrate: preview before install
+
+The panel's Integrate picker is not a one-press commit. Every route into
+it — a typed or pasted path/URL (Enter), the picker's **Integrate**
+button, a Downloads quick-pick, or a dropped file — first shows a
+**preview card** built
+by the offline `--preview-integrate` verb: the app name and version read
+from the file itself (URL sources show "unknown until download" — the
+preview fetches nothing), the destination path, and how the artifact
+will be verified at integrate time. A source that publishes no digest
+says so up front with a prominent **will install with reduced
+assurance** line — before anything is downloaded; an already-integrated
+file shows a notice that confirming changes nothing, and a same-app
+version conflict says integrate keeps both.
+
+**Confirm** (Enter or the button) then runs the real integrate command —
+which re-classifies and re-verifies from scratch, so a file that changed
+between preview and confirm is still caught. **Esc** (or Cancel) goes
+back to the picker with zero side effects. When the preview itself
+fails (bad path, non-AppImage file), the panel shows the error banner
+and the picker stays usable.
+
+The preview is advisory: it makes no network requests, never executes
+the AppImage, and installs nothing on its own.
 
 ### Install from a URL
 

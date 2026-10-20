@@ -17,7 +17,12 @@ python3 <plugin_dir>/backend/main.py [OPTION]...
   `zstd` CLI is used only on Python < 3.14 for zstd-compressed AppImages;
   `update-desktop-database` and `ps` are called best-effort and failures are
   ignored. `notify-send` is used best-effort by `--fetch-updates` only
-  (a missing binary just means no notification, never a failure).
+  (a missing binary just means no notification, never a failure), and
+  `ldconfig -p` is used best-effort by `--list-installed` only (a missing
+  binary or a non-zero exit just degrades the fuse2 probe to the library
+  directory globs — never a failure). `gdbus` and `zenity` are probed and
+  used by `--pick-file` only (a missing binary is a typed `unavailable`
+  result, never a failure).
 - The AppImage is **never executed** (metadata is read with a built-in
   squashfs reader; updates download and re-integrate the new file).
 - `OMARCHY_APPIMAGE_DEBUG=1` enables debug logging (stderr), including
@@ -50,6 +55,28 @@ is gone is **not** listed as installed. It is logged on stderr instead
 AppImage: <path> (remove it with --remove <desktop id>)`), so the user can
 reclaim the file — the record itself is removed only on an explicit
 `--remove <desktop id> --yes`.
+
+**`runtime` block (fuse2).** Every successful JSON envelope also carries an
+additive `runtime` block: `{"fuse2": <state>}` with exactly one of
+
+| State | Meaning |
+|---|---|
+| `present` | the `libfuse.so.2` shared object was found (type-2 AppImages can launch) |
+| `missing` | the probe ran to a decision and the library is absent |
+| `unknown` | the probe could not decide (see below) — never an error |
+
+The probe is best-effort and cheap (one linker-cache read + a few globs,
+once per call, never per app). Signal order: the dynamic-linker cache
+(`ldconfig -p`) first — a `libfuse.so.2` entry is decisive; otherwise the
+standard library directories (`lib/x86_64-linux-gnu`, `lib64`, `lib` under
+`/`, `/usr`, `/usr/local`) are globbed for `libfuse.so.2*` — a hit is
+decisive too (even when the cache phase failed). No glob hit after a
+*successful* cache read reports `missing`; a failed cache phase (binary
+absent, non-zero exit) with no glob hit reports `unknown`. Probing never
+errors the call: the block is always present and any unexpected probe
+failure is logged and reported as `unknown`. Consumers must treat
+`unknown` as "no claim" (no fuse2 hint may be shown unless the state is
+exactly `missing`).
 
 ### `--integrate <path> [--yes] [--replace] [--json]`
 
@@ -100,6 +127,52 @@ cases 3–5 fails (404/network) the pasted URL is installed as a case-6
 static source instead of erroring. **`--update` and the update managers are
 unaffected**: they keep the strict mandatory-digest policy below, and the
 auto-populated cases 3–5 sources therefore still refuse to install updates.
+
+### `--preview-integrate <path-or-url> [--json]`
+
+The offline pre-install preview document: what `--integrate` would do,
+without installing, downloading or executing anything. Read-only and
+**advisory** — the integrate command remains the single authority and
+re-classifies/re-verifies at its own runtime (a file can change between
+preview and confirm; nothing is cached or trusted across the two).
+
+- **Zero network**: classification is by URL shape (the exact classifier
+  of `--integrate <url>`, first match wins, same source `kind` values)
+  and no request is ever made — release metadata, digests and `.zsync`
+  control files are only fetched at integrate time. Fully usable offline.
+- **The AppImage is never executed.** For local files the embedded
+  desktop entry is read in place (stdlib squashfs reader, bounded by the
+  same superblock quotas extraction uses, nothing written to disk).
+- A missing path, a non-regular file, a non-AppImage file and a
+  non-https `scheme://` URL (integrate's egress policy) produce the
+  typed error document (exit 1).
+- Read-only, so `--json` does **not** require `--yes` here.
+- `--json` is the only option this verb takes: any other
+  `--`-prefixed argument is a usage error (exit 2), never ignored.
+
+Verification matrix — what integrate WILL verify, so a source that
+installs without a publisher-attested digest says so before the
+download starts:
+
+| source `kind` | `verification.method` | `reduced_assurance` |
+|---|---|---|
+| `local` | `none` | `false` — no download; the AppImage magic-byte check only |
+| `github` | `github-sha256` | `false` — API digest mandatory at integrate time |
+| `zsync` | `zsync-sha1` | `false` — SHA-1 when the control file publishes one, else the reduced checks; the control file is only readable at integrate time |
+| `gitlab` / `codeberg` / `forgejo` / `static` | `none` | `true` — reduced assurance |
+
+Flags: `already_integrated` is true when the file's content already
+matches an installed AppImage (integrate would print
+`already-integrated` and change nothing; `destination.path` is then the
+installed file itself). `name_conflict` is true when another version of
+the same app is installed (integrate keeps both — the derived
+`destination` already carries the version-suffixed, non-clobbering file
+name — or replaces it with `--replace`).
+
+Plain text (no `--json`): a short human-readable preview block.
+
+The document schema is under "JSON schemas" below; keys are additive
+within `schema_version` 1 (same policy as `exec_arguments`).
 
 ### `--remove <target> [--yes] [--delete] [--json]`
 
@@ -277,6 +350,75 @@ Real example output (update available, first run, notification delivered):
 
 Second run with no change: same shape, `"notified": false`.
 
+### `--pick-file [--json]`
+
+Opens a native **single-file, AppImage-filtered** file dialog and prints
+the picked file. The backend **orchestrates, it does not dialog**: the
+dialog lives in child processes, so a crashed or hung dialog can never
+take down the caller (the panel's backend process). This verb never
+mutates anything, so it works with or without `--yes`.
+
+Probe order (first available wins):
+
+1. **Desktop portal** — `org.freedesktop.portal.FileChooser.OpenFile`
+   through the glib DBus CLI, when `gdbus` exists and introspection of
+   `/org/freedesktop/portal/desktop` exposes the FileChooser interface
+   (the probe is side-effect free: probing never opens a dialog). The
+   call is **monitor-then-call**: a `gdbus monitor --session --dest
+   org.freedesktop.portal.Desktop` child is started first, then the
+   `gdbus call` runs — the method reply only carries the request handle
+   (an object path, pinned by a constant `handle_token`), the actual
+   answer arrives as the `Request.Response` signal on the monitored
+   stream, matched by that handle. Portal response code 1 (user cancel)
+   → `cancelled`; any other non-zero code is a typed error.
+2. **zenity** — `zenity --file-selection` (single file: no `--multiple`)
+   with an `AppImage | *.AppImage *.appimage` file filter. Exit 1 =
+   `cancelled`.
+
+A portal **error** falls through to zenity (a broken portal must not cost
+the user the feature); an explicit user **cancel** never does (reopening
+a second dialog after a cancel is never wanted). Neither backend
+available → typed `unavailable` result (exit 0) so the panel keeps
+today's path-field UX.
+
+**Discipline** (same as every other child process, see the security
+model): one absolute whole-operation deadline of **600 s**
+(`DEFAULT_DEADLINE_SECONDS` in `omarchy_appimage/pick_file.py`) covers
+probe, call, signal wait and zenity together — a stuck dialog yields a
+typed timeout error, never a hang. One-shot children run through the
+bounded-output `run_command` (10 MiB/stream cap, own process group,
+killpg reap); the monitor child also runs in its own process group, is
+always reaped (killpg) and its stream is read line-by-line with a
+per-line cap of 1 MiB. Subprocess argv is fully constant — the dialog
+title is a constant, nothing user-controlled is ever interpolated, no
+shell is involved; the picked path is returned as JSON data only.
+
+The picked portal URI is validated: `file://` scheme only, empty or
+`localhost` host, percent-decoded to an absolute plain path. Anything
+else (https, remote share) is a typed `not-local` error.
+
+Result payloads (all exit 0 except `error`):
+
+```json
+{"schema_version": 1, "result": "picked", "path": "/home/user/Downloads/nvim-linux-x86_64.appimage", "backend": "portal"}
+{"schema_version": 1, "result": "cancelled", "backend": "zenity"}
+{"schema_version": 1, "result": "unavailable", "message": "no file chooser is available (neither the desktop portal nor zenity); type or paste the path instead"}
+```
+
+`backend` is `"portal"` or `"zenity"` (on `picked` / `cancelled`).
+
+Typed error documents (exit 1) add a `reason` key — `timeout`
+(whole-operation deadline exceeded), `backend-failed` (the dialog
+crashed, ended without answering, returned nothing, or its binary is
+gone) or `not-local` (non-`file://` or remote selection):
+
+```json
+{"schema_version": 1, "result": "error", "reason": "timeout", "error": "the file dialog did not answer in time"}
+```
+
+Plain text (no `--json`): `picked` prints the path, `cancelled` /
+`unavailable` print their message, errors go to stderr.
+
 ### `--settings [--json]`
 
 Current settings (defaults merged with `settings.json`).
@@ -385,8 +527,8 @@ Real example output:
 
 | Code | Meaning |
 |---|---|
-| 0 | Success (including `--help`, "already integrated", `up-to-date`, `skipped-running`, and any `--fetch-updates` outcome) |
-| 1 | Operation error (invalid file, not installed, extraction failed, download failed, ...) |
+| 0 | Success (including `--help`, "already integrated", `up-to-date`, `skipped-running`, any `--fetch-updates` outcome, and `--pick-file` `cancelled` / `unavailable` results) |
+| 1 | Operation error (invalid file, not installed, extraction failed, download failed, file-dialog timeout/crash, ...) |
 | 2 | Usage error (unknown option, missing argument, `--json` without `--yes`, invalid setting/manager config) |
 
 No arguments prints usage and exits **2**.
@@ -416,20 +558,25 @@ No arguments prints usage and exits **2**.
 ### `--list-installed --json`
 
 ```json
-{"schema_version": 1, "installed": [<app>, ...]}
+{"schema_version": 1, "installed": [<app>, ...], "runtime": {"fuse2": "present" | "missing" | "unknown"}}
 ```
+
+> `runtime` is an **additive** envelope key (see the `runtime` block
+> section under `--list-installed` above): every other key keeps its
+> meaning and a reader that ignores unknown keys is unaffected —
+> `schema_version` therefore stays **1**.
 
 Real example output (app with an embedded `gh-releases-zsync` string; the
 custom-config case looks the same with `embedded_source: false`):
 
 ```json
-{"schema_version": 1, "installed": [{"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "GithubUpdater", "embedded_source": true, "running": false, "exec_arguments": "%F"}]}
+{"schema_version": 1, "installed": [{"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "GithubUpdater", "embedded_source": true, "running": false, "exec_arguments": "%F"}], "runtime": {"fuse2": "present"}}
 ```
 
 Empty list:
 
 ```json
-{"schema_version": 1, "installed": []}
+{"schema_version": 1, "installed": [], "runtime": {"fuse2": "missing"}}
 ```
 
 ### `--integrate <path> --yes --json` (success)
@@ -439,6 +586,28 @@ Empty list:
 ```
 
 Other `result` values: `already-integrated` (exit 0, app unchanged).
+
+### `--preview-integrate <path-or-url> --json`
+
+```json
+{"schema_version": 1, "result": "preview", "source": {"kind": "local", "input": "<path-or-url as given>"}, "verification": {"method": "github-sha256|zsync-sha1|none", "reduced_assurance": true|false, "note": "<human-readable sentence for the panel>"}, "destination": {"folder": "<managed folder, absolute>", "filename": "<file name integrate would pick>" | null, "path": "<folder>/<filename>" | null}, "app": {"name": "...", "version": "..."} | null, "already_integrated": false, "name_conflict": false, "advisory": true}
+```
+
+| Key | Meaning |
+|---|---|
+| `source.kind` | `local`, `github`, `zsync`, `gitlab`, `codeberg`, `forgejo` or `static` — the same classification `--integrate <url>` uses |
+| `verification` | The matrix above; `note` is the exact sentence the panel may render verbatim |
+| `destination` | For a local file: folder + exact file name + full path, derived with the install-time naming helper (conflict suffixing included; `path` is the installed file itself when `already_integrated`). For a URL: only `folder` is known — `filename`/`path` are `null`, the final name comes from the artifact's embedded desktop entry at integrate time |
+| `app` | Local files only: `name`/`version` read in place from the embedded desktop entry; `null` when the entry cannot be read in place (the preview stays valid) or for URLs (nothing was downloaded) |
+| `already_integrated` | Content already matches an installed AppImage |
+| `name_conflict` | Another version of the same app is installed |
+| `advisory` | Always `true`; the integrate command re-classifies/re-verifies at its own runtime |
+
+Real example output (local file):
+
+```json
+{"schema_version": 1, "result": "preview", "source": {"kind": "local", "input": "/home/user/Downloads/nvim.appimage"}, "verification": {"method": "none", "reduced_assurance": false, "note": "no download: the local file itself is integrated (AppImage magic-byte check only)"}, "destination": {"folder": "/home/user/AppImages", "filename": "neovim.appimage", "path": "/home/user/AppImages/neovim.appimage"}, "app": {"name": "Neovim", "version": "v0.11.3"}, "already_integrated": false, "name_conflict": false, "advisory": true}
+```
 
 ### `--remove <target> --yes --json` (success)
 
@@ -457,6 +626,11 @@ Real example output:
 ```json
 {"schema_version": 1, "result": "error", "error": "AppImage not integrated: 'ghost' (see --list-installed for valid names/ids)"}
 ```
+
+`--pick-file` error documents additionally carry a typed `reason` key
+(`timeout` / `backend-failed` / `not-local`); every other key keeps its
+meaning, so readers that ignore unknown keys are unaffected
+(`schema_version` stays 1).
 
 ## Filesystem layout
 

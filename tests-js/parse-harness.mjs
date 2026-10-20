@@ -48,6 +48,76 @@ check("empty list ok", empty.ok === true && empty.items.length === 0)
 const garbage = Model.parseListJson("python3: not found\n")
 check("garbage rejected", garbage.ok === false && garbage.error !== "")
 
+// ---- runtime block on the installed-list envelope (fuse2 probe) -------------
+// CONTRACT.md (--list-installed): every successful JSON envelope carries an
+// additive `runtime` block, { fuse2: "present" | "missing" | "unknown" }.
+// The mapping is defensive: absent or non-object blocks and foreign values
+// all normalize to "unknown" (the contract's "no claim" — never an error),
+// and unknown keys anywhere are tolerated and ignored. The frozen capture
+// above predates the block, so it doubles as the absence case.
+check("runtime block absent → unknown", !!list.runtime
+  && list.runtime.fuse2 === "unknown", JSON.stringify(list.runtime))
+const runtimeOf = (doc) => Model.parseListJson(doc).runtime.fuse2
+check("runtime present", runtimeOf(
+  '{"schema_version":1,"installed":[],"runtime":{"fuse2":"present"}}') === "present")
+check("runtime missing", runtimeOf(
+  '{"schema_version":1,"installed":[],"runtime":{"fuse2":"missing"}}') === "missing")
+check("runtime unknown passthrough", runtimeOf(
+  '{"schema_version":1,"installed":[],"runtime":{"fuse2":"unknown"}}') === "unknown")
+check("runtime foreign value → unknown", runtimeOf(
+  '{"schema_version":1,"installed":[],"runtime":{"fuse2":"banana"}}') === "unknown")
+check("runtime block not an object → unknown", runtimeOf(
+  '{"schema_version":1,"installed":[],"runtime":"present"}') === "unknown")
+check("runtime block null → unknown", runtimeOf(
+  '{"schema_version":1,"installed":[],"runtime":null}') === "unknown")
+check("runtime array form → unknown", runtimeOf(
+  '{"schema_version":1,"installed":[],"runtime":["present"]}') === "unknown")
+check("runtime unknown keys tolerated", runtimeOf(
+  '{"schema_version":1,"installed":[],'
+  + '"runtime":{"fuse2":"missing","probe":"ldconfig","extra":[1,2]}}') === "missing")
+check("envelope unknown keys tolerated", runtimeOf(
+  '{"schema_version":1,"installed":[],'
+  + '"runtime":{"fuse2":"present"},"future_key":{"x":1}}') === "present")
+check("bare array envelope → runtime unknown", runtimeOf('[{"name":"X"}]') === "unknown")
+
+// The store keeps the latest listing's verdict, from every listing surface.
+// A listing without the block (older backend) resets it, so a stale
+// "missing" can never survive into a hint.
+Model.setItems(list.items, Model.parseListJson(
+  '{"schema_version":1,"installed":[],"runtime":{"fuse2":"missing"}}').runtime)
+check("setItems stores runtime", Model.state.runtime.fuse2 === "missing")
+Model.setItems(list.items, list.runtime)
+check("setItems keeps unknown runtime", Model.state.runtime.fuse2 === "unknown")
+
+// ---- launch-failure banner (fuse2 hint) --------------------------------------
+// A launch is only known to have failed when the post-launch settle listing
+// says the app never came up (execDetached cannot report the AppImage
+// runtime's own death — a type-2 AppImage without fuse2 exits right after
+// spawn). Model.launchFailureBanner is that banner's pure text mapping:
+// the fuse2 hint line is appended ONLY for fuse2 "missing" — present,
+// unknown and any foreign state keep the banner about the failure alone.
+// Text only: the hint names the library, never a command, never a button
+// (repo wording rule; the security gates scan install-command sources).
+const failedName = "Neovim (v0.11.3)"
+const bannerBase = Model.launchFailureBanner(failedName, "present")
+check("banner strings present", !!Model.strings.launchFailed && !!Model.strings.launchFuse2Hint)
+check("banner base line names the app", bannerBase.indexOf(failedName) !== -1
+  && bannerBase.indexOf("\n") === -1, JSON.stringify(bannerBase))
+for (const quiet of ["present", "unknown", "banana", "", null, undefined]) {
+  const base = Model.launchFailureBanner(failedName, quiet)
+  check("banner no hint on " + String(quiet),
+    base === bannerBase && base.indexOf("fuse2") === -1, JSON.stringify(base))
+}
+const hinted = Model.launchFailureBanner(failedName, "missing")
+check("banner hint line on missing", hinted.split("\n").length === 2
+  && hinted.split("\n")[0] === bannerBase
+  && hinted.split("\n")[1].indexOf("fuse2") !== -1
+  && hinted.split("\n")[1].indexOf("libfuse.so.2") !== -1, JSON.stringify(hinted))
+check("banner is text only", hinted.indexOf("/") === -1 && hinted.indexOf("`") === -1
+  && hinted.indexOf("$") === -1 && hinted.indexOf("=") === -1, JSON.stringify(hinted))
+check("banner tolerates an empty name", Model.launchFailureBanner("", "missing")
+  .split("\n")[0] === Model.formatCount("", Model.strings.launchFailed))
+
 // ---- F2: --integrate outcomes ----------------------------------------------
 const integ = Model.parseActionJson(cap("integrated.json"))
 check("integrated result", integ.ok === true && integ.result === "integrated")
@@ -64,6 +134,97 @@ check("error doc message", errDoc.error.includes("AppImage not integrated"), err
 
 const noYes = Model.parseActionJson(cap("noyes.json"))
 check("json-without-yes doc", noYes.ok === false && noYes.error.includes("--yes"), noYes.error)
+
+// ---- #18: --preview-integrate document mapping -------------------------------
+// The picker's confirm-before-integrate flow maps the offline preview
+// document through Model.parsePreviewJson. Both captures are real
+// `--preview-integrate --json` output. The panel renders appName/appVersion
+// (null app → its "unknown" copy), the destination (full path for local
+// files, folder-only for URLs) and the verification note, and rides its
+// prominent reduced-assurance / already-integrated / name-conflict
+// treatments on exactly the flags below.
+const previewLocal = Model.parsePreviewJson(cap("preview-local.json"))
+check("preview local ok", previewLocal.ok === true)
+check("preview local source", previewLocal.preview.sourceKind === "local"
+  && previewLocal.preview.sourceInput.indexOf("escrcpy.appimage") !== -1)
+check("preview local app", previewLocal.preview.appName === "Escrcpy (3.3.1)"
+  && previewLocal.preview.appVersion === "3.3.1")
+check("preview local destination path", previewLocal.preview.destinationPath
+  === "/home/glasschan/AppImages/escrcpy.appimage")
+check("preview local verification", previewLocal.preview.verificationMethod === "none"
+  && previewLocal.preview.reducedAssurance === false
+  && previewLocal.preview.verificationNote.includes("magic-byte"))
+check("preview local already integrated", previewLocal.preview.alreadyIntegrated === true
+  && previewLocal.preview.nameConflict === false)
+check("preview advisory flag", previewLocal.preview.advisory === true)
+
+const previewUrl = Model.parsePreviewJson(cap("preview-url.json"))
+check("preview url ok", previewUrl.ok === true)
+check("preview url github kind", previewUrl.preview.sourceKind === "github")
+check("preview url app null → unknown", previewUrl.preview.appName === ""
+  && previewUrl.preview.appVersion === "")
+check("preview url destination folder only", previewUrl.preview.destinationFolder !== ""
+  && previewUrl.preview.destinationFilename === ""
+  && previewUrl.preview.destinationPath === "")
+check("preview url github-sha256 verified", previewUrl.preview.verificationMethod === "github-sha256"
+  && previewUrl.preview.reducedAssurance === false)
+
+// gitlab/codeberg/forgejo/static publish no digest: reduced_assurance true —
+// the prominent "will install with reduced assurance" line rides on this
+// flag alone, and it shows BEFORE any download starts (the preview is
+// offline).
+const previewReduced = Model.parsePreviewJson(
+  '{"schema_version": 1, "result": "preview", "source": {"kind": "static", "input": "https://host/app.AppImage"}, '
+  + '"verification": {"method": "none", "reduced_assurance": true, "note": "no publisher digest exists for this source"}, '
+  + '"destination": {"folder": "/h/AppImages", "filename": null, "path": null}, '
+  + '"app": null, "already_integrated": false, "name_conflict": false, "advisory": true}')
+check("preview reduced assurance flagged", previewReduced.ok === true
+  && previewReduced.preview.reducedAssurance === true
+  && previewReduced.preview.verificationMethod === "none")
+
+// Another version of the same app installed: integrate keeps both (the
+// derived name is version-suffixed) — the panel notices from this flag.
+const previewConflict = Model.parsePreviewJson(
+  '{"schema_version": 1, "result": "preview", "source": {"kind": "local", "input": "/h/dl/app-2.AppImage"}, '
+  + '"verification": {"method": "none", "reduced_assurance": false, "note": "n"}, '
+  + '"destination": {"folder": "/h/AppImages", "filename": "app-2.appimage", "path": "/h/AppImages/app-2.appimage"}, '
+  + '"app": {"name": "App", "version": "2.0"}, "already_integrated": false, "name_conflict": true, "advisory": true}')
+check("preview name conflict flagged", previewConflict.ok === true
+  && previewConflict.preview.nameConflict === true
+  && previewConflict.preview.alreadyIntegrated === false)
+
+// Unknown-key tolerance (contract: keys are additive within schema_version
+// 1): future keys anywhere are ignored, missing keys normalize to defaults,
+// null sub-fields become empty strings — never crashes, never undefined.
+const previewFuture = Model.parsePreviewJson(
+  '{"schema_version": 2, "result": "preview", "future_top": {"x": 1}, '
+  + '"source": {"kind": "zsync", "input": "https://host/app.zsync", "future_src": true}, '
+  + '"verification": {"method": "zsync-sha1", "reduced_assurance": false, "future_verf": 1}, '
+  + '"destination": {"folder": "/h/AppImages", "future_dest": null}, '
+  + '"already_integrated": false, "name_conflict": false, "advisory": true, "future_flag": "yes"}')
+check("preview unknown keys tolerated", previewFuture.ok === true
+  && previewFuture.preview.sourceKind === "zsync"
+  && previewFuture.preview.destinationFilename === ""
+  && previewFuture.preview.appName === "")
+check("preview missing keys default", previewFuture.preview.verificationNote === ""
+  && previewFuture.preview.destinationPath === ""
+  && previewFuture.preview.reducedAssurance === false
+  && previewFuture.preview.alreadyIntegrated === false
+  && previewFuture.preview.nameConflict === false)
+
+// Documents that must never render as a preview: the backend's error
+// document (what a bad path returns, exit 1), garbage stdout, and a
+// well-formed JSON that is not a preview document. All fail with a
+// message so the panel can degrade to a status + usable picker.
+const previewError = Model.parsePreviewJson(
+  '{"schema_version": 1, "result": "error", "error": "no such file: /x"}')
+check("preview error document rejected", previewError.ok === false
+  && previewError.preview === null && previewError.error !== "")
+check("preview garbage rejected", Model.parsePreviewJson("python3: not found\n").ok === false)
+const previewWrongShape = Model.parsePreviewJson(
+  '{"schema_version": 1, "result": "integrated", "message": "x"}')
+check("preview non-preview document rejected", previewWrongShape.ok === false
+  && previewWrongShape.preview === null)
 
 // ---- F3: --remove success shape (CONTRACT.md sample) ------------------------
 const removed = Model.parseActionJson(
@@ -259,6 +420,134 @@ check("set-source passthrough", setSourceDoc.ok === true && setSourceDoc.result 
 const unsetSourceDoc = Model.parseActionJson(cap("unset-source.json"))
 check("unset-source passthrough", unsetSourceDoc.ok === true && unsetSourceDoc.result === "unset"
   && unsetSourceDoc.app.manager === "" && unsetSourceDoc.app.downloadSize === 0)
+
+// ---- F2 browse: --pick-file outcome documents (#19) -----------------------------
+// Contract shapes (backend/CONTRACT.md "### --pick-file [--json]"): picked /
+// cancelled / unavailable are exit-0 results, typed errors are exit-1
+// documents with a reason key. No captures here — every variant needs a
+// real dialog session (a portal reply, a user cancel), so they are inline
+// literals, same as the offline fetch-updates case above.
+const pickedPortal = Model.parsePickJson(
+  '{"schema_version": 1, "result": "picked", "path": "/home/user/Downloads/nvim-linux-x86_64.appimage", "backend": "portal"}')
+check("pick picked ok", pickedPortal.ok === true && pickedPortal.result === "picked")
+check("pick picked path", pickedPortal.path === "/home/user/Downloads/nvim-linux-x86_64.appimage",
+  pickedPortal.path)
+check("pick picked backend", pickedPortal.backend === "portal", pickedPortal.backend)
+
+const pickedZenity = Model.parsePickJson(
+  '{"schema_version": 1, "result": "picked", "path": "/opt/x.AppImage", "backend": "zenity"}')
+check("pick zenity backend", pickedZenity.ok === true && pickedZenity.backend === "zenity"
+  && pickedZenity.path === "/opt/x.AppImage", JSON.stringify(pickedZenity))
+
+const cancelled = Model.parsePickJson(
+  '{"schema_version": 1, "result": "cancelled", "backend": "zenity"}')
+check("pick cancelled ok", cancelled.ok === true && cancelled.result === "cancelled")
+check("pick cancelled has no path", cancelled.path === "", cancelled.path)
+
+const unavailable = Model.parsePickJson(
+  '{"schema_version": 1, "result": "unavailable", "message": '
+  + '"no file chooser is available (neither the desktop portal nor zenity); '
+  + 'type or paste the path instead"}')
+check("pick unavailable ok", unavailable.ok === true && unavailable.result === "unavailable")
+check("pick unavailable message surfaced", unavailable.message.includes("type or paste"),
+  unavailable.message)
+
+const pickTimeout = Model.parsePickJson(
+  '{"schema_version": 1, "result": "error", "reason": "timeout", '
+  + '"error": "the file dialog did not answer in time"}')
+check("pick timeout error", pickTimeout.ok === false && pickTimeout.result === "error"
+  && pickTimeout.reason === "timeout")
+check("pick timeout message surfaced", pickTimeout.error.includes("did not answer in time"),
+  pickTimeout.error)
+
+const pickBackendFailed = Model.parsePickJson(
+  '{"schema_version": 1, "result": "error", "reason": "backend-failed", '
+  + '"error": "the file dialog crashed"}')
+check("pick backend-failed reason", pickBackendFailed.ok === false
+  && pickBackendFailed.reason === "backend-failed")
+
+const pickNotLocal = Model.parsePickJson(
+  '{"schema_version": 1, "result": "error", "reason": "not-local", '
+  + '"error": "the file dialog returned a non-local location"}')
+check("pick not-local reason", pickNotLocal.ok === false && pickNotLocal.reason === "not-local")
+
+// Defensive mapping: unknown envelope keys are tolerated, unknown results
+// pass through like parseActionJson's (the QML layer routes on the named
+// results and treats everything else as a failure), and garbage is rejected.
+const pickUnknownKeys = Model.parsePickJson(
+  '{"schema_version": 1, "result": "picked", "path": "/x/a.appimage", '
+  + '"backend": "portal", "future_key": {"nested": true}}')
+check("pick unknown keys tolerated", pickUnknownKeys.ok === true
+  && pickUnknownKeys.path === "/x/a.appimage", JSON.stringify(pickUnknownKeys))
+const pickUnknownResult = Model.parsePickJson(
+  '{"schema_version": 1, "result": "something-new"}')
+check("pick unknown result passthrough", pickUnknownResult.ok === true
+  && pickUnknownResult.result === "something-new")
+check("pick garbage rejected", Model.parsePickJson("zenity: not found\n").ok === false
+  && Model.parsePickJson("zenity: not found\n").error !== "")
+
+// ---- Drop-to-integrate: dropUriToPath (#21) ----------------------------------
+// The bar widget's and the panel's DropAreas hand their URI lists through
+// this pure helper before anything touches the picker: only file:// URIs
+// are usable (URL-text drops are out of scope by the spec), the local path
+// is percent-decoded, a multi-URI selection picks the FIRST entry ending
+// in .AppImage (case-insensitive) and reports the rest as ignored, and
+// every unusable input is a typed rejection (reason "empty" / "not-file" /
+// "no-appimage") — a drop can never manufacture an install path.
+const drop = (uris) => Model.dropUriToPath(uris)
+
+const dropOk = drop(["file:///home/u/Tools/My.AppImage"])
+check("drop valid file URI", dropOk.ok === true
+  && dropOk.path === "/home/u/Tools/My.AppImage"
+  && dropOk.ignored === 0 && dropOk.reason === "", JSON.stringify(dropOk))
+
+const dropEncoded = drop(["file:///home/u/My%20Tools/App%20One.appimage"])
+check("drop URL-encoded path decodes", dropEncoded.ok === true
+  && dropEncoded.path === "/home/u/My Tools/App One.appimage", JSON.stringify(dropEncoded))
+check("drop lowercase extension accepted", /\.appimage$/i.test(dropEncoded.path))
+
+const dropString = drop("file:///x/Solo.AppImage")
+check("drop single string input accepted", dropString.ok === true
+  && dropString.path === "/x/Solo.AppImage", JSON.stringify(dropString))
+
+check("drop empty list → empty", JSON.stringify(drop([]))
+  === JSON.stringify({ ok: false, path: "", ignored: 0, reason: "empty" }))
+check("drop empty string → empty", drop("").ok === false && drop("").reason === "empty")
+check("drop whitespace-only entries → empty",
+  drop(["", "   "]).ok === false && drop(["", "   "]).reason === "empty")
+
+check("drop bare-root URI → no-appimage",
+  drop(["file:///"]).ok === false && drop(["file:///"]).reason === "no-appimage")
+check("drop trailing-slash dir URI → no-appimage",
+  drop(["file:///home/u/dir/"]).ok === false
+  && drop(["file:///home/u/dir/"]).reason === "no-appimage")
+
+check("drop https rejected", drop(["https://example.com/app.AppImage"]).ok === false
+  && drop(["https://example.com/app.AppImage"]).reason === "not-file")
+check("drop http rejected", drop(["http://example.com/app.AppImage"]).ok === false
+  && drop(["http://example.com/app.AppImage"]).reason === "not-file")
+check("drop plain text garbage rejected", drop(["hello world"]).ok === false
+  && drop(["hello world"]).reason === "not-file")
+check("drop file://host path rejected (not a local path)",
+  drop(["file://server/share/App.AppImage"]).ok === false
+  && drop(["file://server/share/App.AppImage"]).reason === "not-file")
+check("drop malformed percent rejected", drop(["file:///a/%zz.AppImage"]).ok === false
+  && drop(["file:///a/%zz.AppImage"]).reason === "not-file")
+
+const dropMulti = drop([
+  "file:///home/u/notes.txt",
+  "file:///home/u/First%20App.AppImage",
+  "file:///home/u/Second.AppImage",
+  "https://example.com/third.AppImage"
+])
+check("drop multi-URI first-AppImage policy", dropMulti.ok === true
+  && dropMulti.path === "/home/u/First App.AppImage"
+  && dropMulti.ignored === 3 && dropMulti.reason === "", JSON.stringify(dropMulti))
+
+const dropNone = drop(["file:///home/u/notes.txt", "file:///home/u/readme.md"])
+check("drop no-AppImage list typed", dropNone.ok === false
+  && dropNone.reason === "no-appimage" && dropNone.path === ""
+  && dropNone.ignored === 2, JSON.stringify(dropNone))
 
 // ---- Panel-side error mapping (mirrors reportFailure branches) ---------------
 // Timeout is its own message ("Backend timed out") — blaming python3 for a
@@ -538,6 +827,17 @@ const FAKE_APPIMAGE = Buffer.concat([
   Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x41, 0x49, 0x02]),
   Buffer.from("padding")
 ])
+// Minimal type-2 AppImage for the preview verb (--preview-integrate runs
+// the ELF arch probe, so the header must be a full ELF64 header with the
+// AppImage magic at offset 8). No embedded squashfs/desktop entry — exactly
+// the contract's "app is null, the preview stays valid" case.
+const PREVIEW_APPIMAGE = (() => {
+  const header = Buffer.alloc(64)
+  Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]).copy(header, 0)
+  header[8] = 0x41; header[9] = 0x49; header[10] = 0x02
+  header.writeUInt16LE(0x3e, 0x12) // e_machine = x86-64
+  return Buffer.concat([header, Buffer.from("no-desktop-entry")])
+})()
 
 const sandbox = mkdtempSync(join(tmpdir(), "appimage-harness-"))
 const home = join(sandbox, "home")
@@ -618,6 +918,21 @@ if (liveOk) {
   check("live backend document parses in Model", liveList.ok === true
     && liveList.items.length === 2, JSON.stringify(liveList.items))
 
+  // The merged fuse2 probe (#17): every live listing carries the additive
+  // runtime block with exactly the contract's states, and the Model maps it
+  // through untouched (the host's real fuse2 state is never depended on).
+  check("live backend carries the runtime block", !!liveDoc
+    && !!liveDoc.runtime && typeof liveDoc.runtime === "object"
+    && !Array.isArray(liveDoc.runtime)
+    && ["present", "missing", "unknown"].indexOf(liveDoc.runtime.fuse2) !== -1,
+    JSON.stringify(liveDoc && liveDoc.runtime))
+  check("live runtime block maps in Model", liveList.ok === true
+    && ["present", "missing", "unknown"].indexOf(liveList.runtime.fuse2) !== -1,
+    JSON.stringify(liveList.runtime))
+  check("live setItems stores the mapped runtime",
+    (Model.setItems(liveList.items, liveList.runtime),
+      ["present", "missing", "unknown"].indexOf(Model.state.runtime.fuse2) !== -1))
+
   // the stale record: no crash, and it is REPORTED, not silently dropped
   check("stale record does not crash the listing", listRun.status === 0)
   check("stale record is not listed as installed",
@@ -639,6 +954,27 @@ if (liveOk) {
   check("stale removal deletes the record",
     readFileSync(appsIni, "utf8").indexOf("stale") === -1,
     readFileSync(appsIni, "utf8"))
+
+  // #18: the preview verb through the same live plumbing. The fixture has
+  // no embedded desktop entry, so app is null while the preview stays
+  // valid (CONTRACT.md) — the panel renders its "unknown" copy for it.
+  const previewFixture = join(home, "preview-fixture.appimage")
+  writeFileSync(previewFixture, PREVIEW_APPIMAGE)
+  const previewRun = runBackend(["--preview-integrate", previewFixture, "--json"])
+  check("live preview exits 0", previewRun.status === 0, previewRun.stderr)
+  const livePreview = Model.parsePreviewJson(previewRun.stdout)
+  check("live preview parses", livePreview.ok === true
+    && livePreview.preview.sourceKind === "local"
+    && livePreview.preview.alreadyIntegrated === false
+    && livePreview.preview.nameConflict === false
+    && livePreview.preview.appName === ""
+    && livePreview.preview.appVersion === ""
+    && livePreview.preview.reducedAssurance === false
+    && livePreview.preview.verificationMethod === "none"
+    && livePreview.preview.destinationFilename !== ""
+    && livePreview.preview.destinationPath !== ""
+    && livePreview.preview.advisory === true,
+    JSON.stringify(livePreview))
 }
 rmSync(sandbox, { recursive: true, force: true })
 

@@ -25,10 +25,13 @@ import "lib/Backend.js" as Backend
 // own Process pair so it can never stomp a short call in flight —
 // F1 list (cache-first, the
 // store renders instantly and refreshes in the background), F2 integrate
-// (inline picker: Quickshell ships no file dialog, so a path field plus
-// Downloads quick-picks stands in), F3 remove (two-click inline confirm,
-// keyed on desktop_id), F4 launch (detached exec of the AppImage path),
-// F5 bar badge (observer over the same Model store).
+// (inline picker: Quickshell ships no file dialog, so a path field, a
+// Browse button, Downloads quick-picks and drop-to-integrate stand in;
+// every action previews first through the offline --preview-integrate
+// verb and installs only on explicit confirm — #18, #19, #21), F3 remove
+// (two-click inline confirm, keyed on desktop_id), F4 launch (detached
+// exec of the AppImage path), F5 bar badge (observer over the same Model
+// store).
 //
 // M2 wiring: F6 check updates (--list-updates with a long watchdog; the
   // offline error document surfaces its own message), F7 one-click update
@@ -62,10 +65,26 @@ Panel {
   // F7 downloads can be a full AppImage; the backend replaces the file in
   // place, so the watchdog must outlast the transfer, not the UI.
   readonly property int updateTimeoutMs: 600000
+  // --pick-file: the backend bounds probe + portal dialog + zenity under
+  // one 600 s whole-operation deadline (CONTRACT.md); the watchdog matches
+  // it instead of undercutting it, so a slow portal is never reaped while
+  // the backend still considers the dialog alive.
+  readonly property int pickTimeoutMs: 600000
   // How long the two-click remove confirmation stays armed.
   readonly property int confirmResetMs: 4000
   // Grace before the post-launch refresh so `ps` can see the new process.
   readonly property int launchSettleMs: 1500
+  // Launch-failure banner (F4): the id of the app awaiting its post-launch
+  // settle verdict ("" when none) and the moment the launch was clicked.
+  // execDetached cannot report the AppImage runtime's own death (a type-2
+  // AppImage without fuse2 exits right after spawn), so the verdict comes
+  // from the first completed listing that STARTED after the click — a
+  // listing already in flight at click time has a pre-spawn ps snapshot
+  // and must never judge the launch. On a failed verdict the banner gets
+  // the fuse2 hint line only when that same listing's runtime block says
+  // "missing" (Model.launchFailureBanner decides).
+  property string settleLaunchId: ""
+  property real settleLaunchMs: 0
   // Status notices fade on their own after this long (matching the
   // backend's desktop-notification expire time); errors never auto-hide.
   readonly property int statusTimeoutMs: 5000
@@ -113,6 +132,7 @@ Panel {
   property var items: []
   property bool busyList: false
   property bool busyIntegrate: false
+  property bool busyPick: false
   property bool busyRemove: false
   property bool busyUpdates: false
   // desktop_id of the in-flight --update ("" when idle) — rows compare it
@@ -124,11 +144,47 @@ Panel {
 
   // Integrate picker (F2): Quickshell has no FileDialog type (checked
   // against /usr/lib/qt6/qml/Quickshell — no dialog types ship with it),
-  // so the picker is a path field plus AppImages found in ~/Downloads and
-  // ~/downloads.
+  // so the picker is a path field, a Browse button backed by the backend's
+  // crash-isolated --pick-file dialog (portal first, zenity fallback), and
+  // AppImages found in ~/Downloads and ~/downloads.
   property bool pickerOpen: false
   property string pickerPath: ""
   property var pickerFiles: []
+
+  // Confirm-before-integrate preview (#18): pressing the integrate action
+  // (field Enter, Go button, Downloads row) first runs --preview-integrate
+  // — offline and fast, so its watchdog is a short budget — and renders the
+  // preview card; Confirm then runs the existing integrate command and
+  // Esc/Cancel dismisses back to the picker with zero side effects.
+  // previewInput pins the exact input the shown document was computed from:
+  // editing the path dismisses the card, so Confirm can only ever install
+  // what the user actually saw previewed.
+  readonly property int previewTimeoutMs: 10000
+  property bool previewOpen: false
+  property bool busyPreview: false
+  property string previewInput: ""
+  property var previewDoc: null
+
+  // Single-source of the picker-owning composite — a browse dialog, a
+  // preview call or an integrate run in flight. Browse, Go and the
+  // Downloads quick-picks all disable on exactly this conjunction
+  // (#18/#19 guards), so it is combined once here instead of
+  // hand-assembled per control. Sites whose guard intentionally differs
+  // keep their extra terms separate: Go also requires a non-empty path,
+  // the preview card's Confirm/Cancel omit the pick term by design, and
+  // dropBusy()/confirmPreview() read the store flags directly.
+  readonly property bool pickerBusy: busyPick || busyIntegrate || busyPreview
+
+  // Drop-to-integrate (#21): the bar widget converts its dropped URIs
+  // through Model.dropUriToPath and hands the usable path over in the
+  // summon payload; open() parks it here and tryConsumePendingDrop runs it
+  // once the store is idle (the panel's own DropArea path checks the same
+  // guard live and reports a busy drop with a status line instead). The
+  // panel window DropArea never queues — this pending pair is transport
+  // for a gesture that happened before the panel existed. Closing the
+  // panel cancels a still-pending drop (onOpenedChanged).
+  property string pendingDropPath: ""
+  property int pendingDropIgnored: 0
 
   // desktop_id whose Remove button is armed for the second click (F3).
   property string confirmRemoveId: ""
@@ -220,11 +276,17 @@ Panel {
     items = Model.state.items.slice()
     busyList = Model.state.busy.list === true
     busyIntegrate = Model.state.busy.integrate === true
+    busyPick = Model.state.busy.pick === true
     busyRemove = Model.state.busy.remove === true
     busyUpdates = Model.state.busy.updates === true
     updatingId = String(Model.state.busy.update || "")
     lastError = Model.state.lastError
     statusText = Model.state.status
+    // A bar-widget drop waits here for an idle store (see
+    // tryConsumePendingDrop): every busy flag flip announces itself
+    // through changed(), so the sync after the last in-flight call lands
+    // is the moment the pending preview can start.
+    tryConsumePendingDrop()
   }
 
   // True while any editor inside the panel should own raw keys instead of
@@ -243,6 +305,11 @@ Panel {
   function open(payloadJson) {
     Model.setMockMode(false)
     if (backendCommand.length > 0) Model.configureBackend(backendCommand)
+    // Bar-widget drop handoff (#21): the payload carries the file the user
+    // dropped on the bar icon (already converted and validated there).
+    // Parked, not run: the cache-first refresh below may occupy the shared
+    // backend process, and tryConsumePendingDrop waits that out.
+    readDropPayload(payloadJson)
     syncFromModel()
     // Settle the python3 state first: with it missing, refresh() below is
     // a no-op and the install card takes over the body instead.
@@ -258,6 +325,10 @@ Panel {
     Qt.callLater(function() {
       if (root.opened && keyCatcher) keyCatcher.forceActiveFocus()
     })
+    // Idle-store backstop: if nothing was in flight and nothing starts,
+    // no syncFromModel fires after the one above — consume the pending
+    // drop once more from the event loop (a no-op when already taken).
+    Qt.callLater(root.tryConsumePendingDrop)
   }
 
   // User-initiated close (Escape, outside click): tell the shell so its
@@ -471,6 +542,7 @@ Panel {
       syncFromModel()
       return
     }
+    var refreshStartedMs = Date.now()
     Model.setBusy("list", true)
     syncFromModel()
     callBackend(["--list-installed", "--json"], null, function(result) {
@@ -478,8 +550,9 @@ Panel {
       if (result.ok) {
         var parsed = Model.parseListJson(result.stdout)
         if (parsed.ok) {
-          Model.setItems(parsed.items)
+          Model.setItems(parsed.items, parsed.runtime)
           Model.clearError()
+          root.settleLaunch(parsed, refreshStartedMs)
         } else {
           Model.setError(parsed.error)
         }
@@ -507,6 +580,11 @@ Panel {
       .filter(function(a) { return a && !/^%[fFuUicdk]$/.test(a) })
     Quickshell.execDetached(["env", "DESKTOPINTEGRATION=1", item.path].concat(args))
     Model.markRunning(item.id, true)
+    // Arm the launch verdict: the settle listing decides whether the app
+    // really came up (see settleLaunch below — spawn success says nothing
+    // about the AppImage runtime).
+    root.settleLaunchId = item.id
+    root.settleLaunchMs = Date.now()
     launchSettleTimer.restart()
     // The panel is a full-screen overlay with exclusive keyboard focus, so
     // a freshly launched app would sit behind it and the user would have
@@ -515,6 +593,31 @@ Panel {
     // consistent. A pinned panel is a compact floating window that is
     // meant to stay open.
     if (!root.pinned) root.requestClose()
+  }
+
+  // Consume the armed launch verdict on a completed listing. Only a
+  // listing that started AFTER the launch click may judge it — its ps
+  // snapshot is the first one that can see the new process; anything
+  // already in flight at click time (or any earlier snapshot) would read
+  // a false "not running" and blame a healthy launch. App gone from the
+  // list (removed elsewhere) and running apps are silent: a missing row
+  // is no claim, and a successful launch must never show a banner. A
+  // failed verdict raises the launch-failure banner, whose fuse2 hint
+  // line appears only when that same listing's runtime block reports
+  // "missing" (Model.launchFailureBanner; text only — no command, no
+  // button). The store-side error means the banner also survives the
+  // post-launch panel close and greets the next open.
+  function settleLaunch(parsed, startedMs) {
+    if (root.settleLaunchId === "") return
+    if (startedMs < root.settleLaunchMs) return
+    var item = null
+    for (var i = 0; i < parsed.items.length; i++) {
+      if (parsed.items[i].id === root.settleLaunchId) { item = parsed.items[i]; break }
+    }
+    root.settleLaunchId = ""
+    root.settleLaunchMs = 0
+    if (!item || item.running) return
+    Model.setError(Model.launchFailureBanner(item.name, parsed.runtime.fuse2))
   }
 
   // F3: first click arms the inline confirmation, second click runs
@@ -694,7 +797,11 @@ Panel {
       closeSourceEditor()
       return
     }
-    pickerOpen = false
+    // A browse in flight keeps the picker card (closePicker guards it);
+    // opening settings under it would recreate the width/focus fight the
+    // cards' mutual exclusion exists to prevent.
+    if (Model.state.busy.pick) return
+    closePicker()
     settingsOpen = true
     mirrorEditFields()
     loadSettingsCard()
@@ -936,12 +1043,132 @@ Panel {
     // settings gear and Integrate close each other.
     settingsOpen = false
     closeSourceEditor()
+    // A preview computed for a previous session is stale: re-entering the
+    // picker starts at the plain path field.
+    clearPreview()
     pickerOpen = true
     rebuildPickerFiles()
   }
 
   function closePicker() {
+    // A browse in flight owns the card: its answer lands in pickerPath, so
+    // the card must not be dismissed out from under the pending dialog.
+    // Idempotent-open paths (openPicker, settings toggling back) are
+    // unaffected; the dialog itself is bounded by the pick watchdog.
+    if (Model.state.busy.pick) return
     pickerOpen = false
+    clearPreview()
+  }
+
+  // Preview lifecycle (#18). clearPreview resets all card state; it never
+  // calls the backend or touches the store — dismissing has zero side
+  // effects, by contract.
+  function clearPreview() {
+    previewOpen = false
+    busyPreview = false
+    previewDoc = null
+    previewInput = ""
+  }
+
+  // Step 1 of the flow: ask the backend what --integrate WOULD do. The
+  // preview verb is offline (URL classification by shape, local entries
+  // read in place) and advisory — nothing here integrates anything. Failure
+  // lands in the error banner and the picker stays usable.
+  function requestPreview(path) {
+    var trimmed = String(path || "").trim()
+    if (trimmed === "") return
+    if (Model.state.busy.integrate || root.busyPreview) return
+    if (backendCommand.length === 0) {
+      Model.setError(strings.backendMissing)
+      syncFromModel()
+      return
+    }
+    // Same input, card already showing it: nothing to refresh (this is
+    // also what a second Enter on the focused field lands on).
+    if (root.previewOpen && root.previewInput === trimmed) return
+    Model.clearError()
+    root.busyPreview = true
+    syncFromModel()
+    callBackend(["--preview-integrate", trimmed, "--json"],
+        { timeoutMs: previewTimeoutMs }, function(result) {
+      root.busyPreview = false
+      // The path moved on while the call ran (kept typing, quick-pick,
+      // picker closed): the answer is stale — drop it silently. Without
+      // this, the card could preview one path while Confirm installs
+      // another. The field's next Enter re-previews the new text.
+      if (String(root.pickerPath).trim() !== trimmed) {
+        syncFromModel()
+        return
+      }
+      if (result.ok) {
+        var parsed = Model.parsePreviewJson(result.stdout)
+        if (parsed.ok) {
+          root.previewDoc = parsed.preview
+          root.previewInput = trimmed
+          root.previewOpen = true
+          Model.clearError()
+        } else {
+          clearPreview()
+          Model.setError(parsed.error)
+        }
+      } else {
+        clearPreview()
+        reportFailure(result, "preview")
+      }
+      syncFromModel()
+      // The confirm step owns the keyboard (Enter confirms, Escape
+      // dismisses): pull focus back to the panel-level key catcher so the
+      // SafeTextField stops blocking it.
+      Qt.callLater(function() {
+        if (root.opened && keyCatcher) keyCatcher.forceActiveFocus()
+      })
+    })
+  }
+
+  // Step 2: the explicit confirmation. Runs the existing integrate command
+  // unchanged (integratePath re-classifies and re-verifies from scratch —
+  // the preview document was advisory). The card is dropped first so a
+  // failure leaves the plain picker with the banner, not a stale preview.
+  function confirmPreview() {
+    if (!root.previewOpen || root.busyPreview) return
+    // A browse in flight owns the backend the integrate command would
+    // share (#19's pick-busy invariant, applied to the keyboard's confirm
+    // path too — the Go button is already disabled during a pick).
+    if (Model.state.busy.integrate || Model.state.busy.pick) return
+    clearPreview()
+    integratePath(root.pickerPath)
+  }
+
+  // Esc / Cancel: back to the picker, nothing was run, nothing changed.
+  function dismissPreview() {
+    if (!root.previewOpen) return
+    clearPreview()
+    // Hand focus back to the path field so the user can edit what they
+    // typed (formEditing re-blocks the key catcher while it holds focus).
+    Qt.callLater(function() {
+      if (root.pickerOpen && pickerFieldLoader.item) {
+        pickerFieldLoader.item.forceActiveFocus()
+      }
+    })
+  }
+
+  // Preview card display lines. An empty appName means the backend could
+  // not know yet (URL sources download nothing; a local file without an
+  // embedded desktop entry stays unreadable in place) — the copy says so
+  // instead of showing blank, per CONTRACT.md's "the preview stays valid".
+  function previewAppLine() {
+    if (!previewDoc) return ""
+    if (previewDoc.appName !== "") return previewDoc.appName
+    return previewDoc.sourceKind === "local"
+      ? strings.previewAppUnknown : strings.previewAppUnknownUrl
+  }
+
+  function previewDestinationLine() {
+    if (!previewDoc) return ""
+    if (previewDoc.destinationPath !== "") return previewDoc.destinationPath
+    return previewDoc.destinationFolder !== ""
+      ? previewDoc.destinationFolder + " — " + strings.previewDestinationLater
+      : strings.previewDestinationLater
   }
 
   // FolderListModel.filePath comes back as a plain path on some Qt builds
@@ -971,6 +1198,173 @@ Panel {
     pickerFiles = picks
   }
 
+  // F2 browse: run --pick-file through the shared watchdog plumbing. The
+  // backend orchestrates a crash-isolated native dialog (portal first,
+  // zenity fallback) under its own 600 s whole-operation deadline; result
+  // mapping per CONTRACT.md — picked (exit 0 + path) fills the field,
+  // cancelled/unavailable are exit-0 statuses, typed errors (reason key)
+  // and a watchdog overrun surface through reportFailure like every other
+  // backend failure. A busy browse is a no-op (and the Go/Downloads paths
+  // are disabled meanwhile), so the dialog can never stack.
+  function browseForFile() {
+    if (Model.state.busy.pick) return
+    if (Model.state.busy.integrate) return
+    if (backendCommand.length === 0) {
+      Model.setError(strings.backendMissing)
+      syncFromModel()
+      return
+    }
+    Model.clearError()
+    Model.setBusy("pick", true)
+    Model.setStatus(strings.pickerBrowsing)
+    syncFromModel()
+    callBackend(["--pick-file", "--json"], { timeoutMs: pickTimeoutMs },
+        function(result) {
+      Model.setBusy("pick", false)
+      if (result.ok) {
+        var pick = Model.parsePickJson(result.stdout)
+        if (pick.result === "picked" && pick.path !== "") {
+          Model.clearStatus()
+          pickerPath = pick.path
+          // A preview computed for the previous path is stale the moment
+          // the fill lands (#18 confirm-before-integrate, browse flavor):
+          // drop it so Confirm can never install anything other than what
+          // is on screen. The picked path then rides the same preview flow
+          // as a drop or a Downloads quick-pick — seedDropPreview's
+          // mechanics minus openPicker (the card is already open): fill
+          // the field, request the offline preview, Confirm stays the only
+          // install path (ticket #19 acceptance). Same-trimmed fills keep
+          // the shown card via requestPreview's own guard, matching the
+          // field's onEdited rule.
+          if (root.previewOpen && pick.path.trim() !== root.previewInput) {
+            root.dismissPreview()
+          }
+          syncFromModel()
+          focusPickerField()
+          root.requestPreview(pick.path)
+          return
+        }
+        if (pick.result === "cancelled") {
+          Model.setStatus(strings.pickCanceled)
+        } else if (pick.result === "unavailable") {
+          // The backend's own copy wins; the local string is the fallback.
+          // Status, not error: the path field keeps working exactly as
+          // before (this is today's UX, not a failure).
+          Model.setStatus(pick.message !== "" ? pick.message
+            : strings.pickerUnavailable)
+        } else {
+          Model.setError(pick.result === "error" && pick.error !== ""
+            ? pick.error : strings.pickerPickFailed)
+        }
+      } else {
+        reportFailure(result, "pick-file")
+      }
+      syncFromModel()
+    })
+  }
+
+  // Put focus into the picker's path field (Loader-created — it exists
+  // only while the card is open) so a picked path can be integrated with
+  // Enter right away. Defensive: a browse that outlived the card is a
+  // quiet store update.
+  function focusPickerField() {
+    var field = pickerFieldLoader.item
+    if (field) field.forceActiveFocus()
+  }
+
+  // ---- drop-to-integrate (#21) ------------------------------------------------
+  //
+  // Two entries, one flow. The panel window's DropArea (live drop) and the
+  // bar widget's summon-payload handoff both end in seedDropPreview, which
+  // is exactly the Downloads quick-pick mechanics plus openPicker(): seed
+  // the field, request the offline preview — a drop NEVER integrates
+  // directly, Confirm stays the only install path.
+
+  // True while the shared backend process or a picker-owning flow is busy —
+  // the same states during which Go/Browse/Downloads are disabled (#18/#19
+  // guards). A drop racing any of them is IGNORED with a status line,
+  // never queued: a field fill mid-call could only produce an answer the
+  // stale-drop logic would have to throw away (the same reasoning that
+  // disables Browse during a preview), and every flag here is
+  // watchdog-bounded, so "drop again" is always short-lived advice.
+  function dropBusy() {
+    return Model.isBusy() || root.busyPreview || root.settingsBusy || root.sourceBusy
+  }
+
+  // The shared handoff. openPicker() closes the settings/source cards and
+  // drops a stale preview first, so a drop works from any panel state and
+  // the card that appears is always computed from the dropped file. An
+  // ignored-extras report is a status (accent banner, 5 s auto-clear) set
+  // before the preview request so both notices coexist.
+  function seedDropPreview(path, ignored) {
+    openPicker()
+    root.pickerPath = path
+    if (ignored > 0) {
+      Model.setStatus(ignored === 1 ? strings.dropIgnoredOne
+        : Model.formatCount(ignored, strings.dropIgnoredMany))
+    }
+    root.requestPreview(path)
+  }
+
+  // Panel DropArea entry: convert the dropped URI list (typed result —
+  // see Model.dropUriToPath), report rejections as a status with the
+  // picker untouched, refuse busy races, otherwise run the flow.
+  function handleDropUris(uris) {
+    var conv = Model.dropUriToPath(uris)
+    if (!conv.ok) {
+      // reason "empty" means nothing usable was dropped at all — silent.
+      if (conv.reason === "not-file") Model.setStatus(strings.dropNotFile)
+      else if (conv.reason === "no-appimage") Model.setStatus(strings.dropNoAppImage)
+      syncFromModel()
+      return
+    }
+    if (dropBusy()) {
+      Model.setStatus(strings.dropBusy)
+      syncFromModel()
+      return
+    }
+    seedDropPreview(conv.path, conv.ignored)
+  }
+
+  // Summon-payload parser (bar-widget handoff). Only BarWidget's own drop
+  // handler writes this shape ({drop_path, drop_ignored}); every other
+  // summon payload ("{}", garbage) leaves the pending pair empty. The path
+  // is picker-field DATA exactly like a typed path — it reaches nothing
+  // but the preview flow, never a shell.
+  function readDropPayload(payloadJson) {
+    root.pendingDropPath = ""
+    root.pendingDropIgnored = 0
+    if (!payloadJson || payloadJson === "{}") return
+    var payload = null
+    try { payload = JSON.parse(String(payloadJson)) } catch (e) { payload = null }
+    if (!payload || typeof payload !== "object") return
+    var dropped = String(payload.drop_path || "").trim()
+    if (dropped === "") return
+    root.pendingDropPath = dropped
+    var extras = payload.drop_ignored
+    root.pendingDropIgnored = typeof extras === "number" && extras > 0
+      ? Math.round(extras) : 0
+  }
+
+  // Consume the parked bar-widget drop. Runs on every store sync (and once
+  // more from open() via callLater as the idle-store backstop): while any
+  // backend call is in flight the drop stays pending — a preview request
+  // started now would only die on the shared process's single-flight
+  // guard — and the sync after the last busy flag clears runs it. The
+  // wait is bounded (every busy flag is watchdog-released) and closing
+  // the panel cancels the drop outright (onOpenedChanged). Deferral here
+  // is transport, not queueing: the gesture happened before the panel
+  // existed, so ignoring it would kill the only reason the panel opened.
+  function tryConsumePendingDrop() {
+    if (root.pendingDropPath === "" || !root.opened) return
+    if (dropBusy()) return
+    var dropped = root.pendingDropPath
+    var ignored = root.pendingDropIgnored
+    root.pendingDropPath = ""
+    root.pendingDropIgnored = 0
+    seedDropPreview(dropped, ignored)
+  }
+
   Component.onCompleted: {
     syncFromModel()
     unsubscribe = Model.subscribe(syncFromModel)
@@ -988,7 +1382,13 @@ Panel {
   // shell's lifetime. open() re-probes on every open, and a fresh Install
   // press re-arms recovery.
   onOpenedChanged: {
-    if (!root.opened) pythonSlowPoll.stop()
+    if (!root.opened) {
+      pythonSlowPoll.stop()
+      // A bar-widget drop not yet consumed dies with the panel: a later
+      // open must never surface a stale gesture as a fresh preview card.
+      root.pendingDropPath = ""
+      root.pendingDropIgnored = 0
+    }
   }
 
   Process {
@@ -1206,7 +1606,8 @@ Panel {
     interval: 10000
     repeat: true
     running: root.opened && !root.busyList && !root.busyIntegrate && !root.busyRemove
-      && !root.busyUpdates && root.updatingId === "" && !root.settingsBusy && !root.sourceBusy
+      && !root.busyPick && !root.busyUpdates && root.updatingId === ""
+      && !root.settingsBusy && !root.sourceBusy
     onTriggered: root.refresh()
   }
 
@@ -1313,8 +1714,26 @@ Panel {
         // dropdown's popup — root.sourceDropdownOpen mirrors its popupOpen
         // because the popup list is not in this panel's item tree.
         blocked: root.formEditing
-        onCloseRequested: root.requestClose()
+        // The confirm step owns Escape first: Esc dismisses the preview
+        // back to the picker with zero side effects; a second Esc (no
+        // preview showing) closes the panel as before.
+        onCloseRequested: {
+          if (root.previewOpen) root.dismissPreview()
+          else root.requestClose()
+        }
+        // Enter on the catcher confirms the shown preview (while the path
+        // field holds focus, its own Enter reaches requestPreview through
+        // SafeTextField.accepted instead).
+        onActivateRequested: {
+          if (root.previewOpen) root.confirmPreview()
+        }
         onTextKey: function(t) {
+          // Behind the confirm card the single-letter shortcuts would fire
+          // blind actions (refresh/integrate/checks); the preview owns the
+          // keyboard from the moment its call starts until it is confirmed
+          // or dismissed (a refresh racing the fetch would only earn the
+          // shared-process "busy" banner).
+          if (root.previewOpen || root.busyPreview) return
           if (t === "r" || t === "R") root.refresh()
           else if (t === "i" || t === "I") root.integrateRequested()
           else if (t === "u" || t === "U") root.checkUpdates()
@@ -1670,21 +2089,181 @@ Panel {
                 Loader {
                   id: pickerFieldLoader
                   active: root.pickerOpen
-                  width: parent.width - pickerGoButton.width - Style.spacing.xs
+                  width: parent.width - pickerGoButton.width
+                    - pickerBrowseButton.width - Style.spacing.xs * 2
                   sourceComponent: pickerFieldComp
                 }
 
                 Button {
-                  id: pickerGoButton
-                  text: root.busyIntegrate ? root.strings.integrateWorking : root.strings.pickerGo
-                  enabled: !root.busyIntegrate && root.pickerPath.trim() !== ""
+                  id: pickerBrowseButton
+                  text: root.busyPick ? root.strings.pickerBrowsing
+                    : root.strings.pickerBrowse
+                  // Locked with Go/Downloads while a preview runs (#18):
+                  // a fill mid-preview-call could only produce an answer
+                  // the stale-drop has to throw away.
+                  enabled: !root.pickerBusy
                   anchors.verticalCenter: parent.verticalCenter
                   foreground: root.foreground
                   accent: Color.accent
                   fontFamily: root.fontFamily
                   fontSize: Style.font.bodySmall
                   implicitHeight: root.controlHeight
-                  onClicked: root.integratePath(root.pickerPath)
+                  onClicked: root.browseForFile()
+                }
+
+                // The row's primary action tracks the flow's step (#18):
+                // Go previews a fresh path, Confirm confirms the shown
+                // preview; both show their in-flight copy while busy.
+                Button {
+                  id: pickerGoButton
+                  text: root.busyIntegrate ? root.strings.integrateWorking
+                    : (root.busyPreview ? root.strings.previewChecking
+                      : (root.previewOpen ? root.strings.previewConfirm
+                        : root.strings.pickerGo))
+                  enabled: !root.pickerBusy && root.pickerPath.trim() !== ""
+                  anchors.verticalCenter: parent.verticalCenter
+                  foreground: root.foreground
+                  accent: Color.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  implicitHeight: root.controlHeight
+                  onClicked: root.previewOpen
+                    ? root.confirmPreview() : root.requestPreview(root.pickerPath)
+                }
+              }
+
+              // ---- Preview card (#18): confirm before anything installs --
+              // Rendered from Model.parsePreviewJson's defensive mapping
+              // (unknown keys tolerated, null app/destination normalize to
+              // empty). The reduced-assurance line is deliberately
+              // prominent — bold and urgent-colored: informing BEFORE the
+              // download is the whole point of the preview. Enter confirms,
+              // Escape goes back (PanelKeyCatcher wiring above).
+              BorderSurface {
+                id: previewCard
+                width: parent.width
+                visible: root.previewOpen
+                implicitHeight: visible ? previewCol.implicitHeight + Style.spacing.sm * 2 : 0
+                color: Util.alpha(Color.accent, 0.09)
+                borderSpec: Border.flat(Util.alpha(Color.accent, 0.45), Math.max(1, Style.normalBorderWidth))
+                radius: Style.cornerRadius
+
+                Column {
+                  id: previewCol
+                  width: parent.width - Style.spacing.sm * 2
+                  anchors.centerIn: parent
+                  spacing: Style.spacing.xs
+
+                  Text {
+                    text: root.strings.previewTitle
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                  }
+
+                  Text {
+                    text: root.previewAppLine()
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                    width: parent.width
+                  }
+
+                  Text {
+                    visible: root.previewDoc && root.previewDoc.appVersion !== ""
+                    text: root.previewDoc
+                      ? Model.formatCount(root.previewDoc.appVersion,
+                          root.strings.previewVersion) : ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    text: root.previewDestinationLine()
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+
+                  Text {
+                    visible: root.previewDoc && root.previewDoc.reducedAssurance
+                    text: root.strings.previewReducedAssurance
+                    color: root.urgent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+
+                  // The backend's own sentence, rendered verbatim (the
+                  // contract designates `note` as panel-copy).
+                  Text {
+                    text: root.previewDoc ? root.previewDoc.verificationNote : ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+
+                  Text {
+                    visible: root.previewDoc && root.previewDoc.alreadyIntegrated
+                    text: root.strings.previewAlreadyIntegrated
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+
+                  Text {
+                    visible: root.previewDoc && root.previewDoc.nameConflict
+                    text: root.strings.previewNameConflict
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+
+                  Row {
+                    spacing: Style.spacing.xs
+
+                    Button {
+                      text: root.strings.previewConfirm
+                      enabled: !root.busyIntegrate && !root.busyPreview
+                      foreground: root.foreground
+                      accent: Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.bodySmall
+                      implicitHeight: root.controlHeight
+                      onClicked: root.confirmPreview()
+                    }
+
+                    Button {
+                      text: root.strings.pickerCancel
+                      enabled: !root.busyIntegrate && !root.busyPreview
+                      foreground: root.foreground
+                      accent: Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.bodySmall
+                      implicitHeight: root.controlHeight
+                      onClicked: root.dismissPreview()
+                    }
+                  }
+
+                  Text {
+                    text: root.strings.previewKeysHint
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
               }
 
@@ -1722,8 +2301,15 @@ Panel {
                       accent: Color.accent
                       fontFamily: root.fontFamily
                       fontSize: Style.font.caption
-                      enabled: !root.busyIntegrate
-                      onClicked: root.integratePath(modelData.path)
+                      enabled: !root.pickerBusy
+                      // Quick-picks ride the same confirm flow: seed the
+                      // field so the preview (and a later Confirm) name
+                      // the exact file, then preview — never integrate
+                      // directly.
+                      onClicked: {
+                        root.pickerPath = modelData.path
+                        root.requestPreview(modelData.path)
+                      }
                     }
                   }
                 }
@@ -2326,6 +2912,61 @@ Panel {
         }
       }
     }
+
+    // ---- drop-to-integrate (#21): the whole window is a drop target -----
+    // Dropping an AppImage opens the picker seeded with the file and
+    // straight into the preview flow (handleDropUris — never an install).
+    // keys restricts the target to real file drags (text/uri-list), so a
+    // dragged web address never even lights the affordance — URL-text
+    // drops are out of scope by the spec. The veil + chip below are the
+    // hover affordance; theme-derived like every other surface here.
+    DropArea {
+      id: panelDropArea
+      anchors.fill: parent
+      enabled: root.opened
+      keys: ["text/uri-list"]
+      onDropped: function(drop) {
+        root.handleDropUris(drop.hasUrls ? drop.urls : [])
+      }
+    }
+
+    Rectangle {
+      anchors.fill: parent
+      visible: panelDropArea.containsDrag
+      color: Util.alpha(Color.accent, 0.10)
+
+      BorderSurface {
+        anchors.centerIn: parent
+        implicitWidth: dropChipRow.implicitWidth + Style.spacing.md * 2
+        implicitHeight: dropChipRow.implicitHeight + Style.spacing.sm * 2
+        color: Color.popups.background
+        borderSpec: Border.flat(Color.accent, Math.max(1, Style.normalBorderWidth))
+        radius: Style.cornerRadius
+
+        Row {
+          id: dropChipRow
+          anchors.centerIn: parent
+          spacing: Style.spacing.xs
+
+          ThemeIcon {
+            name: "cube-unfolded"
+            size: Style.font.icon
+            strokeWidth: 1.75
+            color: Color.accent
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          Text {
+            text: root.strings.dropHint
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            anchors.verticalCenter: parent.verticalCenter
+          }
+        }
+      }
+    }
   }
 
   // Source editor field templates (F9): one Loader per MANAGERS field in
@@ -2394,8 +3035,7 @@ Panel {
   // so the field type itself carries the guarantee; the Loader gates keep
   // dead instances from piling up at all). The picker field is a
   // SafeTextField: `value` mirrors pickerPath, `edited` writes it back,
-  // Enter integrates the current path — behavior identical to the old
-  // native field, seeding included (the value binding seeds on creation).
+  // Enter previews the current path (#18 confirm-before-integrate).
   Component {
     id: pickerFieldComp
 
@@ -2407,10 +3047,18 @@ Panel {
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
       implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
-      enabled: !root.busyIntegrate
+      enabled: !root.busyIntegrate && !root.busyPreview
       value: root.pickerPath
-      onEdited: function(v) { root.pickerPath = v }
-      onAccepted: root.integratePath(root.pickerPath)
+      onEdited: function(v) {
+        root.pickerPath = v
+        // A preview computed for the old text is stale the moment the
+        // path changes: drop it so Confirm can never install anything
+        // other than what is on screen (same-trimmed edits keep it).
+        if (root.previewOpen && v.trim() !== root.previewInput) {
+          root.dismissPreview()
+        }
+      }
+      onAccepted: root.requestPreview(root.pickerPath)
     }
   }
 
