@@ -26,6 +26,13 @@ badge turns urgent and counts them.
 Errors are never silent: a hung backend or invalid JSON surfaces as a
 dismissible banner in the panel, and a missing `python3` swaps the panel
 body for an authorized-install card (see *Install → Python dependency*).
+A launch that never comes up — checked against the process list after a
+short grace, since a spawn either starts or dies within moments — raises
+its own banner; when the backend's best-effort probe reports the fuse2
+runtime library (`libfuse.so.2`) missing, that banner adds one text-only
+line naming it as the most common cause. No command, no button: the hint
+names the library and nothing more, and a `present` or `unknown` probe
+never adds it.
 Status messages auto-clear after 5 s; errors stay until dismissed. A
 backend call that overruns its watchdog reports a timeout — never a
 misleading "python3 missing" hint.
@@ -39,6 +46,13 @@ misleading "python3 missing" hint.
 - `notify-send` (libnotify) for the background-check desktop notification —
   present on Omarchy; a missing binary just means no notification, never
   a failure.
+- `fuse2` (the `libfuse.so.2` shared library) to *launch* type-2
+  AppImages — some systems ship without it. Managing AppImages never
+  needs it: the backend reads metadata without executing anything. The
+  installed listing carries a best-effort probe (`present` / `missing` /
+  `unknown`); a launch failure while the probe says `missing` names the
+  library in the banner as the most common cause — a text-only hint,
+  never an install action.
 - Nothing else is required: `unsquashfs`/`bsdtar` (optional fallbacks for
   exotic squashfs compressions), `zstd` (zstd AppImages on Python < 3.14),
   `ps` and `update-desktop-database` are best-effort and their absence is

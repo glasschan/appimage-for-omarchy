@@ -201,7 +201,8 @@ Item {
         if (result.ok) {
           var parsed = Model.parseListJson(result.stdout)
           if (parsed.ok) {
-            Model.setItems(parsed.items)
+            // The runtime verdict (fuse2 probe) rides every listing.
+            Model.setItems(parsed.items, parsed.runtime)
             Model.applyUpdates(updates)
           } else {
             console.warn("appimage service: badge heal list unparsable:", parsed.error)
