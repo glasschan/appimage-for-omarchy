@@ -26,7 +26,9 @@ import "lib/Backend.js" as Backend
 // F1 list (cache-first, the
 // store renders instantly and refreshes in the background), F2 integrate
 // (inline picker: Quickshell ships no file dialog, so a path field plus
-// Downloads quick-picks stands in), F3 remove (two-click inline confirm,
+// Downloads quick-picks stands in; every action previews first through the
+// offline --preview-integrate verb and installs only on explicit confirm —
+// #18), F3 remove (two-click inline confirm,
 // keyed on desktop_id), F4 launch (detached exec of the AppImage path),
 // F5 bar badge (observer over the same Model store).
 //
@@ -129,6 +131,20 @@ Panel {
   property bool pickerOpen: false
   property string pickerPath: ""
   property var pickerFiles: []
+
+  // Confirm-before-integrate preview (#18): pressing the integrate action
+  // (field Enter, Go button, Downloads row) first runs --preview-integrate
+  // — offline and fast, so its watchdog is a short budget — and renders the
+  // preview card; Confirm then runs the existing integrate command and
+  // Esc/Cancel dismisses back to the picker with zero side effects.
+  // previewInput pins the exact input the shown document was computed from:
+  // editing the path dismisses the card, so Confirm can only ever install
+  // what the user actually saw previewed.
+  readonly property int previewTimeoutMs: 10000
+  property bool previewOpen: false
+  property bool busyPreview: false
+  property string previewInput: ""
+  property var previewDoc: null
 
   // desktop_id whose Remove button is armed for the second click (F3).
   property string confirmRemoveId: ""
@@ -936,12 +952,124 @@ Panel {
     // settings gear and Integrate close each other.
     settingsOpen = false
     closeSourceEditor()
+    // A preview computed for a previous session is stale: re-entering the
+    // picker starts at the plain path field.
+    clearPreview()
     pickerOpen = true
     rebuildPickerFiles()
   }
 
   function closePicker() {
     pickerOpen = false
+    clearPreview()
+  }
+
+  // Preview lifecycle (#18). clearPreview resets all card state; it never
+  // calls the backend or touches the store — dismissing has zero side
+  // effects, by contract.
+  function clearPreview() {
+    previewOpen = false
+    busyPreview = false
+    previewDoc = null
+    previewInput = ""
+  }
+
+  // Step 1 of the flow: ask the backend what --integrate WOULD do. The
+  // preview verb is offline (URL classification by shape, local entries
+  // read in place) and advisory — nothing here integrates anything. Failure
+  // lands in the error banner and the picker stays usable.
+  function requestPreview(path) {
+    var trimmed = String(path || "").trim()
+    if (trimmed === "") return
+    if (Model.state.busy.integrate || root.busyPreview) return
+    if (backendCommand.length === 0) {
+      Model.setError(strings.backendMissing)
+      syncFromModel()
+      return
+    }
+    // Same input, card already showing it: nothing to refresh (this is
+    // also what a second Enter on the focused field lands on).
+    if (root.previewOpen && root.previewInput === trimmed) return
+    Model.clearError()
+    root.busyPreview = true
+    syncFromModel()
+    callBackend(["--preview-integrate", trimmed, "--json"],
+        { timeoutMs: previewTimeoutMs }, function(result) {
+      root.busyPreview = false
+      // The path moved on while the call ran (kept typing, quick-pick,
+      // picker closed): the answer is stale — drop it silently. Without
+      // this, the card could preview one path while Confirm installs
+      // another. The field's next Enter re-previews the new text.
+      if (String(root.pickerPath).trim() !== trimmed) {
+        syncFromModel()
+        return
+      }
+      if (result.ok) {
+        var parsed = Model.parsePreviewJson(result.stdout)
+        if (parsed.ok) {
+          root.previewDoc = parsed.preview
+          root.previewInput = trimmed
+          root.previewOpen = true
+          Model.clearError()
+        } else {
+          clearPreview()
+          Model.setError(parsed.error)
+        }
+      } else {
+        clearPreview()
+        reportFailure(result, "preview")
+      }
+      syncFromModel()
+      // The confirm step owns the keyboard (Enter confirms, Escape
+      // dismisses): pull focus back to the panel-level key catcher so the
+      // SafeTextField stops blocking it.
+      Qt.callLater(function() {
+        if (root.opened && keyCatcher) keyCatcher.forceActiveFocus()
+      })
+    })
+  }
+
+  // Step 2: the explicit confirmation. Runs the existing integrate command
+  // unchanged (integratePath re-classifies and re-verifies from scratch —
+  // the preview document was advisory). The card is dropped first so a
+  // failure leaves the plain picker with the banner, not a stale preview.
+  function confirmPreview() {
+    if (!root.previewOpen || root.busyPreview) return
+    if (Model.state.busy.integrate) return
+    clearPreview()
+    integratePath(root.pickerPath)
+  }
+
+  // Esc / Cancel: back to the picker, nothing was run, nothing changed.
+  function dismissPreview() {
+    if (!root.previewOpen) return
+    clearPreview()
+    // Hand focus back to the path field so the user can edit what they
+    // typed (formEditing re-blocks the key catcher while it holds focus).
+    Qt.callLater(function() {
+      if (root.pickerOpen && pickerFieldLoader.item) {
+        pickerFieldLoader.item.forceActiveFocus()
+      }
+    })
+  }
+
+  // Preview card display lines. An empty appName means the backend could
+  // not know yet (URL sources download nothing; a local file without an
+  // embedded desktop entry stays unreadable in place) — the copy says so
+  // instead of showing blank, per CONTRACT.md's "the preview stays valid".
+  function previewAppLine() {
+    if (!previewDoc) return ""
+    if (previewDoc.appName !== "") return previewDoc.appName
+    return previewDoc.sourceKind === "local"
+      ? strings.previewAppUnknown : strings.previewAppUnknownUrl
+  }
+
+  function previewDestinationLine() {
+    if (!previewDoc) return ""
+    if (previewDoc.destinationPath !== "") return previewDoc.destinationPath
+    return previewDoc.destinationFolder !== ""
+      ? previewDoc.destinationFolder + " — " + strings.previewDestinationLater
+      : strings.previewDestinationLater
   }
 
   // FolderListModel.filePath comes back as a plain path on some Qt builds
@@ -1313,8 +1441,26 @@ Panel {
         // dropdown's popup — root.sourceDropdownOpen mirrors its popupOpen
         // because the popup list is not in this panel's item tree.
         blocked: root.formEditing
-        onCloseRequested: root.requestClose()
+        // The confirm step owns Escape first: Esc dismisses the preview
+        // back to the picker with zero side effects; a second Esc (no
+        // preview showing) closes the panel as before.
+        onCloseRequested: {
+          if (root.previewOpen) root.dismissPreview()
+          else root.requestClose()
+        }
+        // Enter on the catcher confirms the shown preview (while the path
+        // field holds focus, its own Enter reaches requestPreview through
+        // SafeTextField.accepted instead).
+        onActivateRequested: {
+          if (root.previewOpen) root.confirmPreview()
+        }
         onTextKey: function(t) {
+          // Behind the confirm card the single-letter shortcuts would fire
+          // blind actions (refresh/integrate/checks); the preview owns the
+          // keyboard from the moment its call starts until it is confirmed
+          // or dismissed (a refresh racing the fetch would only earn the
+          // shared-process "busy" banner).
+          if (root.previewOpen || root.busyPreview) return
           if (t === "r" || t === "R") root.refresh()
           else if (t === "i" || t === "I") root.integrateRequested()
           else if (t === "u" || t === "U") root.checkUpdates()
@@ -1674,17 +1820,160 @@ Panel {
                   sourceComponent: pickerFieldComp
                 }
 
+                // The row's primary action tracks the flow's step (#18):
+                // Go previews a fresh path, Confirm confirms the shown
+                // preview; both show their in-flight copy while busy.
                 Button {
                   id: pickerGoButton
-                  text: root.busyIntegrate ? root.strings.integrateWorking : root.strings.pickerGo
-                  enabled: !root.busyIntegrate && root.pickerPath.trim() !== ""
+                  text: root.busyIntegrate ? root.strings.integrateWorking
+                    : (root.busyPreview ? root.strings.previewChecking
+                      : (root.previewOpen ? root.strings.previewConfirm
+                        : root.strings.pickerGo))
+                  enabled: !root.busyIntegrate && !root.busyPreview
+                    && root.pickerPath.trim() !== ""
                   anchors.verticalCenter: parent.verticalCenter
                   foreground: root.foreground
                   accent: Color.accent
                   fontFamily: root.fontFamily
                   fontSize: Style.font.bodySmall
                   implicitHeight: root.controlHeight
-                  onClicked: root.integratePath(root.pickerPath)
+                  onClicked: root.previewOpen
+                    ? root.confirmPreview() : root.requestPreview(root.pickerPath)
+                }
+              }
+
+              // ---- Preview card (#18): confirm before anything installs --
+              // Rendered from Model.parsePreviewJson's defensive mapping
+              // (unknown keys tolerated, null app/destination normalize to
+              // empty). The reduced-assurance line is deliberately
+              // prominent — bold and urgent-colored: informing BEFORE the
+              // download is the whole point of the preview. Enter confirms,
+              // Escape goes back (PanelKeyCatcher wiring above).
+              BorderSurface {
+                id: previewCard
+                width: parent.width
+                visible: root.previewOpen
+                implicitHeight: visible ? previewCol.implicitHeight + Style.spacing.sm * 2 : 0
+                color: Util.alpha(Color.accent, 0.09)
+                borderSpec: Border.flat(Util.alpha(Color.accent, 0.45), Math.max(1, Style.normalBorderWidth))
+                radius: Style.cornerRadius
+
+                Column {
+                  id: previewCol
+                  width: parent.width - Style.spacing.sm * 2
+                  anchors.centerIn: parent
+                  spacing: Style.spacing.xs
+
+                  Text {
+                    text: root.strings.previewTitle
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                  }
+
+                  Text {
+                    text: root.previewAppLine()
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                    width: parent.width
+                  }
+
+                  Text {
+                    visible: root.previewDoc && root.previewDoc.appVersion !== ""
+                    text: root.previewDoc
+                      ? Model.formatCount(root.previewDoc.appVersion,
+                          root.strings.previewVersion) : ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    text: root.previewDestinationLine()
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+
+                  Text {
+                    visible: root.previewDoc && root.previewDoc.reducedAssurance
+                    text: root.strings.previewReducedAssurance
+                    color: root.urgent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+
+                  // The backend's own sentence, rendered verbatim (the
+                  // contract designates `note` as panel-copy).
+                  Text {
+                    text: root.previewDoc ? root.previewDoc.verificationNote : ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+
+                  Text {
+                    visible: root.previewDoc && root.previewDoc.alreadyIntegrated
+                    text: root.strings.previewAlreadyIntegrated
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+
+                  Text {
+                    visible: root.previewDoc && root.previewDoc.nameConflict
+                    text: root.strings.previewNameConflict
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+
+                  Row {
+                    spacing: Style.spacing.xs
+
+                    Button {
+                      text: root.strings.previewConfirm
+                      enabled: !root.busyIntegrate && !root.busyPreview
+                      foreground: root.foreground
+                      accent: Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.bodySmall
+                      implicitHeight: root.controlHeight
+                      onClicked: root.confirmPreview()
+                    }
+
+                    Button {
+                      text: root.strings.pickerCancel
+                      enabled: !root.busyIntegrate && !root.busyPreview
+                      foreground: root.foreground
+                      accent: Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.bodySmall
+                      implicitHeight: root.controlHeight
+                      onClicked: root.dismissPreview()
+                    }
+                  }
+
+                  Text {
+                    text: root.strings.previewKeysHint
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
               }
 
@@ -1722,8 +2011,15 @@ Panel {
                       accent: Color.accent
                       fontFamily: root.fontFamily
                       fontSize: Style.font.caption
-                      enabled: !root.busyIntegrate
-                      onClicked: root.integratePath(modelData.path)
+                      enabled: !root.busyIntegrate && !root.busyPreview
+                      // Quick-picks ride the same confirm flow: seed the
+                      // field so the preview (and a later Confirm) name
+                      // the exact file, then preview — never integrate
+                      // directly.
+                      onClicked: {
+                        root.pickerPath = modelData.path
+                        root.requestPreview(modelData.path)
+                      }
                     }
                   }
                 }
@@ -2394,8 +2690,7 @@ Panel {
   // so the field type itself carries the guarantee; the Loader gates keep
   // dead instances from piling up at all). The picker field is a
   // SafeTextField: `value` mirrors pickerPath, `edited` writes it back,
-  // Enter integrates the current path — behavior identical to the old
-  // native field, seeding included (the value binding seeds on creation).
+  // Enter previews the current path (#18 confirm-before-integrate).
   Component {
     id: pickerFieldComp
 
@@ -2407,10 +2702,18 @@ Panel {
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
       implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
-      enabled: !root.busyIntegrate
+      enabled: !root.busyIntegrate && !root.busyPreview
       value: root.pickerPath
-      onEdited: function(v) { root.pickerPath = v }
-      onAccepted: root.integratePath(root.pickerPath)
+      onEdited: function(v) {
+        root.pickerPath = v
+        // A preview computed for the old text is stale the moment the
+        // path changes: drop it so Confirm can never install anything
+        // other than what is on screen (same-trimmed edits keep it).
+        if (root.previewOpen && v.trim() !== root.previewInput) {
+          root.dismissPreview()
+        }
+      }
+      onAccepted: root.requestPreview(root.pickerPath)
     }
   }
 

@@ -65,6 +65,97 @@ check("error doc message", errDoc.error.includes("AppImage not integrated"), err
 const noYes = Model.parseActionJson(cap("noyes.json"))
 check("json-without-yes doc", noYes.ok === false && noYes.error.includes("--yes"), noYes.error)
 
+// ---- #18: --preview-integrate document mapping -------------------------------
+// The picker's confirm-before-integrate flow maps the offline preview
+// document through Model.parsePreviewJson. Both captures are real
+// `--preview-integrate --json` output. The panel renders appName/appVersion
+// (null app → its "unknown" copy), the destination (full path for local
+// files, folder-only for URLs) and the verification note, and rides its
+// prominent reduced-assurance / already-integrated / name-conflict
+// treatments on exactly the flags below.
+const previewLocal = Model.parsePreviewJson(cap("preview-local.json"))
+check("preview local ok", previewLocal.ok === true)
+check("preview local source", previewLocal.preview.sourceKind === "local"
+  && previewLocal.preview.sourceInput.indexOf("escrcpy.appimage") !== -1)
+check("preview local app", previewLocal.preview.appName === "Escrcpy (3.3.1)"
+  && previewLocal.preview.appVersion === "3.3.1")
+check("preview local destination path", previewLocal.preview.destinationPath
+  === "/home/glasschan/AppImages/escrcpy.appimage")
+check("preview local verification", previewLocal.preview.verificationMethod === "none"
+  && previewLocal.preview.reducedAssurance === false
+  && previewLocal.preview.verificationNote.includes("magic-byte"))
+check("preview local already integrated", previewLocal.preview.alreadyIntegrated === true
+  && previewLocal.preview.nameConflict === false)
+check("preview advisory flag", previewLocal.preview.advisory === true)
+
+const previewUrl = Model.parsePreviewJson(cap("preview-url.json"))
+check("preview url ok", previewUrl.ok === true)
+check("preview url github kind", previewUrl.preview.sourceKind === "github")
+check("preview url app null → unknown", previewUrl.preview.appName === ""
+  && previewUrl.preview.appVersion === "")
+check("preview url destination folder only", previewUrl.preview.destinationFolder !== ""
+  && previewUrl.preview.destinationFilename === ""
+  && previewUrl.preview.destinationPath === "")
+check("preview url github-sha256 verified", previewUrl.preview.verificationMethod === "github-sha256"
+  && previewUrl.preview.reducedAssurance === false)
+
+// gitlab/codeberg/forgejo/static publish no digest: reduced_assurance true —
+// the prominent "will install with reduced assurance" line rides on this
+// flag alone, and it shows BEFORE any download starts (the preview is
+// offline).
+const previewReduced = Model.parsePreviewJson(
+  '{"schema_version": 1, "result": "preview", "source": {"kind": "static", "input": "https://host/app.AppImage"}, '
+  + '"verification": {"method": "none", "reduced_assurance": true, "note": "no publisher digest exists for this source"}, '
+  + '"destination": {"folder": "/h/AppImages", "filename": null, "path": null}, '
+  + '"app": null, "already_integrated": false, "name_conflict": false, "advisory": true}')
+check("preview reduced assurance flagged", previewReduced.ok === true
+  && previewReduced.preview.reducedAssurance === true
+  && previewReduced.preview.verificationMethod === "none")
+
+// Another version of the same app installed: integrate keeps both (the
+// derived name is version-suffixed) — the panel notices from this flag.
+const previewConflict = Model.parsePreviewJson(
+  '{"schema_version": 1, "result": "preview", "source": {"kind": "local", "input": "/h/dl/app-2.AppImage"}, '
+  + '"verification": {"method": "none", "reduced_assurance": false, "note": "n"}, '
+  + '"destination": {"folder": "/h/AppImages", "filename": "app-2.appimage", "path": "/h/AppImages/app-2.appimage"}, '
+  + '"app": {"name": "App", "version": "2.0"}, "already_integrated": false, "name_conflict": true, "advisory": true}')
+check("preview name conflict flagged", previewConflict.ok === true
+  && previewConflict.preview.nameConflict === true
+  && previewConflict.preview.alreadyIntegrated === false)
+
+// Unknown-key tolerance (contract: keys are additive within schema_version
+// 1): future keys anywhere are ignored, missing keys normalize to defaults,
+// null sub-fields become empty strings — never crashes, never undefined.
+const previewFuture = Model.parsePreviewJson(
+  '{"schema_version": 2, "result": "preview", "future_top": {"x": 1}, '
+  + '"source": {"kind": "zsync", "input": "https://host/app.zsync", "future_src": true}, '
+  + '"verification": {"method": "zsync-sha1", "reduced_assurance": false, "future_verf": 1}, '
+  + '"destination": {"folder": "/h/AppImages", "future_dest": null}, '
+  + '"already_integrated": false, "name_conflict": false, "advisory": true, "future_flag": "yes"}')
+check("preview unknown keys tolerated", previewFuture.ok === true
+  && previewFuture.preview.sourceKind === "zsync"
+  && previewFuture.preview.destinationFilename === ""
+  && previewFuture.preview.appName === "")
+check("preview missing keys default", previewFuture.preview.verificationNote === ""
+  && previewFuture.preview.destinationPath === ""
+  && previewFuture.preview.reducedAssurance === false
+  && previewFuture.preview.alreadyIntegrated === false
+  && previewFuture.preview.nameConflict === false)
+
+// Documents that must never render as a preview: the backend's error
+// document (what a bad path returns, exit 1), garbage stdout, and a
+// well-formed JSON that is not a preview document. All fail with a
+// message so the panel can degrade to a status + usable picker.
+const previewError = Model.parsePreviewJson(
+  '{"schema_version": 1, "result": "error", "error": "no such file: /x"}')
+check("preview error document rejected", previewError.ok === false
+  && previewError.preview === null && previewError.error !== "")
+check("preview garbage rejected", Model.parsePreviewJson("python3: not found\n").ok === false)
+const previewWrongShape = Model.parsePreviewJson(
+  '{"schema_version": 1, "result": "integrated", "message": "x"}')
+check("preview non-preview document rejected", previewWrongShape.ok === false
+  && previewWrongShape.preview === null)
+
 // ---- F3: --remove success shape (CONTRACT.md sample) ------------------------
 const removed = Model.parseActionJson(
   '{"schema_version": 1, "result": "removed", "message": "/x/n.appimage was removed successfully", '
@@ -538,6 +629,17 @@ const FAKE_APPIMAGE = Buffer.concat([
   Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x41, 0x49, 0x02]),
   Buffer.from("padding")
 ])
+// Minimal type-2 AppImage for the preview verb (--preview-integrate runs
+// the ELF arch probe, so the header must be a full ELF64 header with the
+// AppImage magic at offset 8). No embedded squashfs/desktop entry — exactly
+// the contract's "app is null, the preview stays valid" case.
+const PREVIEW_APPIMAGE = (() => {
+  const header = Buffer.alloc(64)
+  Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]).copy(header, 0)
+  header[8] = 0x41; header[9] = 0x49; header[10] = 0x02
+  header.writeUInt16LE(0x3e, 0x12) // e_machine = x86-64
+  return Buffer.concat([header, Buffer.from("no-desktop-entry")])
+})()
 
 const sandbox = mkdtempSync(join(tmpdir(), "appimage-harness-"))
 const home = join(sandbox, "home")
@@ -639,6 +741,27 @@ if (liveOk) {
   check("stale removal deletes the record",
     readFileSync(appsIni, "utf8").indexOf("stale") === -1,
     readFileSync(appsIni, "utf8"))
+
+  // #18: the preview verb through the same live plumbing. The fixture has
+  // no embedded desktop entry, so app is null while the preview stays
+  // valid (CONTRACT.md) — the panel renders its "unknown" copy for it.
+  const previewFixture = join(home, "preview-fixture.appimage")
+  writeFileSync(previewFixture, PREVIEW_APPIMAGE)
+  const previewRun = runBackend(["--preview-integrate", previewFixture, "--json"])
+  check("live preview exits 0", previewRun.status === 0, previewRun.stderr)
+  const livePreview = Model.parsePreviewJson(previewRun.stdout)
+  check("live preview parses", livePreview.ok === true
+    && livePreview.preview.sourceKind === "local"
+    && livePreview.preview.alreadyIntegrated === false
+    && livePreview.preview.nameConflict === false
+    && livePreview.preview.appName === ""
+    && livePreview.preview.appVersion === ""
+    && livePreview.preview.reducedAssurance === false
+    && livePreview.preview.verificationMethod === "none"
+    && livePreview.preview.destinationFilename !== ""
+    && livePreview.preview.destinationPath !== ""
+    && livePreview.preview.advisory === true,
+    JSON.stringify(livePreview))
 }
 rmSync(sandbox, { recursive: true, force: true })
 

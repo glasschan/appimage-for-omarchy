@@ -134,6 +134,7 @@ The QML layer talks to `backend/main.py` over a stable JSON contract
 python3 backend/main.py --list-installed --json
 python3 backend/main.py --integrate /path/to/App.AppImage --yes --json
 python3 backend/main.py --integrate https://github.com/<owner>/<repo>/releases/download/<tag>/<file> --yes --json
+python3 backend/main.py --preview-integrate /path/to/App.AppImage --json
 python3 backend/main.py --remove <desktop-id> --yes --json
 python3 backend/main.py --list-updates --json
 python3 backend/main.py --update <desktop-id> --yes --json
@@ -150,6 +151,30 @@ stderr); `--json` requires `--yes` for integrate/remove/update.
 `--get-update-source` reads a configured source back — the configured
 manager + config, or `no-source` — which is what the panel's source
 editor pre-fills from when it opens.
+
+### Integrate: preview before install
+
+The panel's Integrate picker is not a one-press commit. Every route into
+it — a typed or pasted path/URL (Enter), the picker's **Integrate**
+button, or a Downloads quick-pick — first shows a **preview card** built
+by the offline `--preview-integrate` verb: the app name and version read
+from the file itself (URL sources show "unknown until download" — the
+preview fetches nothing), the destination path, and how the artifact
+will be verified at integrate time. A source that publishes no digest
+says so up front with a prominent **will install with reduced
+assurance** line — before anything is downloaded; an already-integrated
+file shows a notice that confirming changes nothing, and a same-app
+version conflict says integrate keeps both.
+
+**Confirm** (Enter or the button) then runs the real integrate command —
+which re-classifies and re-verifies from scratch, so a file that changed
+between preview and confirm is still caught. **Esc** (or Cancel) goes
+back to the picker with zero side effects. When the preview itself
+fails (bad path, non-AppImage file), the panel shows the error banner
+and the picker stays usable.
+
+The preview is advisory: it makes no network requests, never executes
+the AppImage, and installs nothing on its own.
 
 ### Install from a URL
 
