@@ -100,6 +100,43 @@ class IsFuseMountedTests(MountsTestCase):
         self.assertFalse(utils.is_fuse_mounted('', self.mounts))
 
 
+# The real /proc/mounts shape for an AppImage's FUSE mount: the source
+# field holds the AppImage's BASENAME, never the absolute path (measured
+# on a live host: `escrcpy.appimage /tmp/.mount_escrcpPC9VbJ
+# fuse.escrcpy.appimage`).
+BASENAME_MOUNTS = '''\
+/dev/sda2 / ext4 rw,relatime 0 0
+foo.appimage /tmp/.mount_fooXq8zW fuse.foo.appimage rw,nosuid,nodev 0 0
+plain.iso /mnt/iso iso9660 ro,relatime 0 0
+'''
+
+
+class IsFuseMountedBasenameTests(unittest.TestCase):
+    """Regression: the fuse branch compared the absolute AppImage path to
+    a field that only ever holds a basename, so it never matched on a real
+    host. A basename source now attributes its mount to the AppImage."""
+
+    def setUp(self):
+        fd, self.mounts = tempfile.mkstemp(prefix='mounts-basename-')
+        with os.fdopen(fd, 'w') as f:
+            f.write(BASENAME_MOUNTS)
+        self.addCleanup(os.unlink, self.mounts)
+
+    def test_absolute_appimage_path_matches_a_basename_source(self):
+        self.assertTrue(utils.is_fuse_mounted(FUSE_APP, self.mounts))
+
+    def test_mount_is_attributed_through_is_app_running_too(self):
+        # the `ps` signal cannot answer for this path; only the mount can
+        self.assertTrue(utils.is_app_running(FUSE_APP, self.mounts))
+
+    def test_other_appimage_is_not_mounted(self):
+        self.assertFalse(utils.is_fuse_mounted(
+            '/home/user/AppImages/bar.appimage', self.mounts))
+
+    def test_non_fuse_source_with_the_basename_still_does_not_match(self):
+        self.assertFalse(utils.is_fuse_mounted('/mnt/plain.iso', self.mounts))
+
+
 class IsAppRunningTests(MountsTestCase):
     """The two signals are OR-ed: ps exe match (original GearLever
     detection) + FUSE mount source match (new for type-2 AppImages)."""
