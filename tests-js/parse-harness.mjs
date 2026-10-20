@@ -486,6 +486,69 @@ check("pick unknown result passthrough", pickUnknownResult.ok === true
 check("pick garbage rejected", Model.parsePickJson("zenity: not found\n").ok === false
   && Model.parsePickJson("zenity: not found\n").error !== "")
 
+// ---- Drop-to-integrate: dropUriToPath (#21) ----------------------------------
+// The bar widget's and the panel's DropAreas hand their URI lists through
+// this pure helper before anything touches the picker: only file:// URIs
+// are usable (URL-text drops are out of scope by the spec), the local path
+// is percent-decoded, a multi-URI selection picks the FIRST entry ending
+// in .AppImage (case-insensitive) and reports the rest as ignored, and
+// every unusable input is a typed rejection (reason "empty" / "not-file" /
+// "no-appimage") — a drop can never manufacture an install path.
+const drop = (uris) => Model.dropUriToPath(uris)
+
+const dropOk = drop(["file:///home/u/Tools/My.AppImage"])
+check("drop valid file URI", dropOk.ok === true
+  && dropOk.path === "/home/u/Tools/My.AppImage"
+  && dropOk.ignored === 0 && dropOk.reason === "", JSON.stringify(dropOk))
+
+const dropEncoded = drop(["file:///home/u/My%20Tools/App%20One.appimage"])
+check("drop URL-encoded path decodes", dropEncoded.ok === true
+  && dropEncoded.path === "/home/u/My Tools/App One.appimage", JSON.stringify(dropEncoded))
+check("drop lowercase extension accepted", /\.appimage$/i.test(dropEncoded.path))
+
+const dropString = drop("file:///x/Solo.AppImage")
+check("drop single string input accepted", dropString.ok === true
+  && dropString.path === "/x/Solo.AppImage", JSON.stringify(dropString))
+
+check("drop empty list → empty", JSON.stringify(drop([]))
+  === JSON.stringify({ ok: false, path: "", ignored: 0, reason: "empty" }))
+check("drop empty string → empty", drop("").ok === false && drop("").reason === "empty")
+check("drop whitespace-only entries → empty",
+  drop(["", "   "]).ok === false && drop(["", "   "]).reason === "empty")
+
+check("drop bare-root URI → no-appimage",
+  drop(["file:///"]).ok === false && drop(["file:///"]).reason === "no-appimage")
+check("drop trailing-slash dir URI → no-appimage",
+  drop(["file:///home/u/dir/"]).ok === false
+  && drop(["file:///home/u/dir/"]).reason === "no-appimage")
+
+check("drop https rejected", drop(["https://example.com/app.AppImage"]).ok === false
+  && drop(["https://example.com/app.AppImage"]).reason === "not-file")
+check("drop http rejected", drop(["http://example.com/app.AppImage"]).ok === false
+  && drop(["http://example.com/app.AppImage"]).reason === "not-file")
+check("drop plain text garbage rejected", drop(["hello world"]).ok === false
+  && drop(["hello world"]).reason === "not-file")
+check("drop file://host path rejected (not a local path)",
+  drop(["file://server/share/App.AppImage"]).ok === false
+  && drop(["file://server/share/App.AppImage"]).reason === "not-file")
+check("drop malformed percent rejected", drop(["file:///a/%zz.AppImage"]).ok === false
+  && drop(["file:///a/%zz.AppImage"]).reason === "not-file")
+
+const dropMulti = drop([
+  "file:///home/u/notes.txt",
+  "file:///home/u/First%20App.AppImage",
+  "file:///home/u/Second.AppImage",
+  "https://example.com/third.AppImage"
+])
+check("drop multi-URI first-AppImage policy", dropMulti.ok === true
+  && dropMulti.path === "/home/u/First App.AppImage"
+  && dropMulti.ignored === 3 && dropMulti.reason === "", JSON.stringify(dropMulti))
+
+const dropNone = drop(["file:///home/u/notes.txt", "file:///home/u/readme.md"])
+check("drop no-AppImage list typed", dropNone.ok === false
+  && dropNone.reason === "no-appimage" && dropNone.path === ""
+  && dropNone.ignored === 2, JSON.stringify(dropNone))
+
 // ---- Panel-side error mapping (mirrors reportFailure branches) ---------------
 // Timeout is its own message ("Backend timed out") — blaming python3 for a
 // slow update sent users hunting the wrong fix. A spawn failure only maps to
