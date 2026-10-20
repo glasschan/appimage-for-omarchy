@@ -252,6 +252,22 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.8.0
+
+- Updates run as **detached background jobs**: the row's Update button
+  spawns `--update --async`, the panel stays responsive, several apps
+  update in parallel, and a job survives closing the panel or restarting
+  the shell — reopening shows live progress, an interrupted notice with
+  a working retry, or the finished outcome. Job state is a small
+  per-app document under `$XDG_STATE_HOME/io.github.glasschan.appimage/jobs/`;
+  a janitor sweep expires settled documents (and their logs) after 24 h
+  and removes orphaned partial downloads.
+- The background checker announces job outcomes (updated / failed /
+  interrupted) with desktop notifications.
+- New CLI surface: `--update <target> --async` (job-started document),
+  documented in `backend/CONTRACT.md` together with the job-document
+  schema and the job liveness rule.
+
 ### 0.7.0
 
 - Exec arguments are forwarded on launch: the backend reports each app's

@@ -2,14 +2,14 @@
   "desktop_id": "fakeapp.desktop",
   "downloaded_bytes": 10996216,
   "error": null,
-  "heartbeat": 1792494753.7783785,
-  "message": "/tmp/omarchy-appimage-test-r1981u7t/home/AppImages/fakeapp.appimage was updated successfully",
+  "heartbeat": 1792500481.5943499,
+  "message": "/tmp/omarchy-appimage-test-b9ex10g1/home/AppImages/fakeapp.appimage was updated successfully",
   "new_version": "v0.11.3",
   "phase": "done",
-  "pid": 3102379,
+  "pid": 3432883,
   "progress": 1.0,
   "schema_version": 1,
-  "started": 1792494753.705237,
+  "started": 1792500481.506212,
   "status": "updated",
   "total_bytes": 106
 }
