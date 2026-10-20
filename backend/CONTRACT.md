@@ -184,6 +184,71 @@ Real example output (skipped-running, exit 0):
 {"schema_version": 1, "result": "skipped-running", "message": "/home/user/AppImages/neovim.appimage was skipped because the application is running; use --force to override", "app": <app>}
 ```
 
+### `--update <target> --async [--yes] [--keep-both] [--force] [--json]`
+
+Runs the whole `--update` pipeline as a **detached background job** and
+returns immediately.
+
+- Same target resolution and flags as plain `--update`; `--json` still
+  requires `--yes` (exit 2 otherwise).
+- If an **active** job document already exists for the app (liveness rule
+  below), the command refuses before forking: exit 1, error document
+  `an update job is already active for <desktop id> (pid <pid>); refusing
+  to start a second one` — the running job's document is left untouched.
+- Otherwise the updater detaches as a grandchild (double `fork()`,
+  `setsid`, stdin from `/dev/null`, stdout+stderr into the per-job log)
+  and the parent reports `job-started` and exits **0** immediately; the
+  job survives the invoking process. No shell, no exec: the grandchild
+  continues the same process image.
+- Everything else plain `--update` reports — the running guard
+  (`skipped-running`), `up-to-date`, the download, digest verification,
+  the atomic replace, and the pending-notification-marker drop — happens
+  **inside the job** through the same shared update core, and is
+  published as the job document. A missing update source therefore
+  surfaces as a terminal `error` document, not a spawn-time failure.
+
+Real example output (job-started, exit 0):
+
+```json
+{"schema_version": 1, "result": "job-started", "desktop_id": "neovim.desktop", "job_path": "/home/user/.local/state/io.github.glasschan.appimage/jobs/neovim.json", "log_path": "/home/user/.local/state/io.github.glasschan.appimage/jobs/neovim.log", "pid": 12345}
+```
+
+#### Job documents
+
+One JSON document per app at
+`$XDG_STATE_HOME/io.github.glasschan.appimage/jobs/<desktop id stem>.json`
+(`$XDG_STATE_HOME` is honoured like `XDG_DATA_HOME`/`XDG_CONFIG_HOME`,
+default `~/.local/state`). Every rewrite is atomic (temp file +
+`os.replace`) — on every phase change and progress tick, plus a heartbeat
+refresh at least every 2 s (`JOB_HEARTBEAT_INTERVAL_SECONDS`).
+`schema_version` stays **1**.
+
+| Key | Type | Notes |
+|---|---|---|
+| `desktop_id` | string | The app's desktop id (e.g. `neovim.desktop`) |
+| `phase` | string | Writer-set: `starting` / `downloading` / `verifying` / `replacing` / `done` / `error`. Terminal: `done`, `error`. `verifying` is best-effort: sources without a `Content-Length` go straight from `downloading` to `replacing` |
+| `progress` | float | Download fraction 0.0–1.0 (1.0 from `replacing` on) |
+| `total_bytes` | int or null | Download size declared at the availability check; `null` when unknown. For `.zsync` sources that is the control file's size, so mid-download `downloaded_bytes` are approximate — the terminal value is exact |
+| `downloaded_bytes` | int | Derived from the fraction while downloading; exact once terminal |
+| `pid` | int | The detached job's process id |
+| `started`, `heartbeat` | float | Epoch seconds; `heartbeat` refreshes on every rewrite |
+| `message` | string | Human-readable phase/status text |
+| `status` | string or null | Terminal result: `updated` / `up-to-date` / `skipped-running` / `error`; `null` while running |
+| `new_version` | string or null | Installed release (`updated` jobs) |
+| `error` | string or null | Error text (`error` jobs); the traceback tail goes to the log, never into the document |
+
+**Liveness rule:** a job is **ACTIVE** if and only if its phase is
+non-terminal **and** its `pid` is alive **and** its `heartbeat` is
+fresher than `JOB_STALE_AFTER_SECONDS` = **120 s** (comfortably above the
+downloader's 30 s per-read stall guard). `interrupted` is **never
+written**: it is the reader-side classification for a non-terminal
+document that fails the rule (dead pid or stale heartbeat); unparsable
+documents classify the same way.
+
+The per-job log lives next to the document (`<stem>.log`, append mode)
+and is size-capped: a log over 256 KiB (`JOB_LOG_MAX_BYTES`) is truncated
+when the next job opens it.
+
 ### `--set-update-source <target> --manager <name> [key=value ...] [--unset] [--json]`
 
 Sets or removes a per-app custom update source (stored in `apps.ini` under
@@ -313,6 +378,7 @@ Real example output:
 | `--replace` | Replace the conflicting app instead of keeping both (integrate) |
 | `--keep-both` | Keep the old version when updating |
 | `--force` | Update even while the app is running |
+| `--async` | With `--update`: run the whole update as a detached background job and report `job-started` immediately (see the `--update --async` section) |
 | `--delete` | Bypass the trash (irreversible) |
 | `--help` / `-h` | Usage text, exit 0 |
 
@@ -469,6 +535,7 @@ Real example output:
 | `$XDG_CONFIG_HOME/io.github.glasschan.appimage/settings.json` | User settings |
 | `$XDG_CONFIG_HOME/io.github.glasschan.appimage/apps.ini` | Per-app metadata (`[app.<md5>]`) and update sources (`[app.<md5>.update_manager]`, `manager` + config keys, booleans stored as `true`/`false`), INI format compatible with GearLever |
 | `$XDG_CONFIG_HOME/io.github.glasschan.appimage/updates-state.json` | Last background-check signatures, `{desktop_id: "available_version|download_size"}` (desktop id falls back to the AppImage basename) |
+| `$XDG_STATE_HOME/io.github.glasschan.appimage/jobs/` | Background job documents (`<desktop id stem>.json`) and their size-capped logs (`<stem>.log`) written by `--update --async` |
 
 ### XDG override behaviour (required for tests/sandboxes)
 
