@@ -34,7 +34,9 @@ python3 <plugin_dir>/backend/main.py [OPTION]...
 
 ### `--list-installed [--json]`
 
-Lists integrated apps. Plain text (name, version, path) or JSON.
+Lists integrated apps. Plain text (name, version, path) or JSON. Runs the
+janitor sweep first (see *Document lifecycle* under `--update --async`)
+— best-effort, it can never fail the listing.
 
 For every app an update source is resolved **locally** (the per-app config
 in `apps.ini`, else the AppImage's embedded `.upd_info` ELF section — no
@@ -248,6 +250,38 @@ documents classify the same way.
 The per-job log lives next to the document (`<stem>.log`, append mode)
 and is size-capped: a log over 256 KiB (`JOB_LOG_MAX_BYTES`) is truncated
 when the next job opens it.
+
+#### Document lifecycle (janitor sweep, additive)
+
+Every `--list-installed` and every async job start (in the spawning
+**parent**, before the fork — never inside the grandchild) runs a
+best-effort sweep (`janitor.sweep()`) that **never fails the command**
+and removes, silently (debug log only — there is no expiry notification):
+
+- a **terminal** (`done`/`error`) or **`interrupted`** document — together
+  with its `<stem>.log` — once `JOB_ACK_WINDOW_SECONDS` = **24 h** have
+  passed since its last activity. The window clock is the document's
+  `heartbeat` (refreshed on every rewrite, so a terminal document's
+  heartbeat is its finished-at time and a dead job's is its last sign of
+  life); a document without a usable `heartbeat` (corrupt JSON, malformed
+  field) ages out from its **file mtime** under the same window.
+- an **`appimage-update-*` directory** in the temp area whose *effective
+  mtime* — its own mtime vs. the newest of its immediate entries (a live
+  download keeps writing its one file, so the file's mtime is the live
+  signal while the directory's own mtime goes stale at entry creation) —
+  is older than `UPDATE_TEMP_GRACE_SECONDS` = **600 s** (5× the 120 s
+  liveness threshold, 20× the downloader's 30 s per-read stall guard).
+  This disk-only rule reclaims legacy orphans from hard-killed pre-async
+  downloads, which carry neither a registry entry nor a job document. No
+  other prefix (`gearlever_appimage_*` above all) is ever touched, and
+  symlinks are never followed.
+
+**ACTIVE documents are never removed.** Readers may therefore rely on:
+a document they can read survives at least until 24 h after its last
+heartbeat; `read_job() == None` means "no job known" (never expired, and
+an expired one disappears rather than reading as `interrupted`).
+Removals are capped per sweep (`janitor.MAX_REMOVALS_PER_SWEEP` = 200)
+so a pathological state dir cannot grow unbounded removal work (the scan itself reads each document once).
 
 ### `--set-update-source <target> --manager <name> [key=value ...] [--unset] [--json]`
 

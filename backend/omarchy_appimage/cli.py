@@ -24,7 +24,7 @@ import tempfile
 import time
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from . import constants, extractor, jobs, net, settings
+from . import constants, extractor, janitor, jobs, net, settings
 from .ini_config import Config
 from .provider import AppImageProvider, AppImageUpdateLogic, InternalError
 from .updaters import UpdateError, UpdateManagerChecker
@@ -719,6 +719,11 @@ def cmd_integrate(args: list) -> int:
 
 def cmd_list_installed(args: list) -> int:
     json_output = '--json' in args
+    # janitor sweep (ticket 03): fossils — terminal/interrupted job
+    # documents past the acknowledgement window and orphan update temp
+    # dirs past the grace window — go away on every listing. Best-effort
+    # by contract: sweep() never raises.
+    janitor.sweep()
     apps = appimage_provider.list_installed()
 
     if json_output:
@@ -1077,6 +1082,11 @@ def _cmd_update_async(target: str, keep_both: bool, force: bool,
     that is run_update's first step inside the grandchild, so a missing
     or broken source surfaces as a terminal `error` job document instead
     of a second, drifting manager resolution here."""
+    # janitor sweep (ticket 03), parent-side only — never in the
+    # grandchild: stale terminal/interrupted documents age out and orphan
+    # update temp dirs are reclaimed before a new job is spawned.
+    # Best-effort by contract: sweep() never raises.
+    janitor.sweep()
     el = _resolve_target(target)
     desktop_id = _updates_state_key(el)
 
