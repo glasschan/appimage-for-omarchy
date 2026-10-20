@@ -1207,6 +1207,48 @@ const adopt = (f, pidAlive, offsetSec) =>
     JobDocs.classifyJob(null, now, true) === "interrupted")
 }
 
+// -- #27: force-quit done banner (the panel side of ticket 26) ---------------
+{
+  const nowMs = 1792494500000
+  const done = (over) => JobDocs.adoptDocumentForPanel(
+    JSON.stringify(Object.assign({
+      schema_version: 1, desktop_id: "fakeapp.desktop", phase: "done",
+      status: "updated", new_version: "v2.0", message: "updated successfully",
+      heartbeat: 1792494400
+    }, over)), null, nowMs).decision
+  const updatedLine = Model.formatCount("v2.0", Model.strings.updated)
+
+  check("#27: forceQuit rides the panel decision (null vs real record)",
+    done({}).forceQuit === null
+    && done({ force_quit: { count: 2, sigkill: true } }).forceQuit.count === 2
+    && done({ force_quit: { count: 2, sigkill: true } }).forceQuit.sigkill === true)
+  check("#27: done banner without force_quit is exactly the pre-#27 line",
+    Model.jobDoneBanner(done({}), "") === updatedLine
+    && Model.jobDoneBanner(done({ force_quit: null }), "") === updatedLine)
+  check("#27: done banner appends the closed-app clause once a close was recorded",
+    Model.jobDoneBanner(done({ force_quit: { count: 2, sigkill: true } }), "")
+      === updatedLine + Model.strings.forceQuitApplied
+    && Model.jobDoneBanner(done({ force_quit: { count: 1 } }), "")
+      === updatedLine + Model.strings.forceQuitApplied)
+  check("#27: a malformed force_quit never makes the banner claim a close",
+    ["closed 3", [3, true], 7, true].every((v) =>
+      Model.jobDoneBanner(done({ force_quit: v }), "") === updatedLine)
+    && Model.jobDoneBanner(done({ force_quit: { count: "junk" } }), "") === updatedLine
+    && Model.jobDoneBanner(done({ force_quit: { count: -2 } }), "") === updatedLine)
+  check("#27: up-to-date banner keeps message/fallback and gains the clause",
+    Model.jobDoneBanner(done({ status: "up-to-date", new_version: "",
+      message: "" }), Model.strings.upToDate) === Model.strings.upToDate
+    && Model.jobDoneBanner(done({ status: "up-to-date", new_version: "",
+      message: "already current" }), Model.strings.upToDate) === "already current"
+    && Model.jobDoneBanner(done({ status: "up-to-date", new_version: "",
+      message: "already current", force_quit: { count: 1, sigkill: false } }),
+      Model.strings.upToDate) === "already current" + Model.strings.forceQuitApplied)
+  check("#27: a version-less updated doc falls back to the backend message",
+    Model.jobDoneBanner(done({ new_version: "" }), "") === "updated successfully")
+  check("#27: banner helper tolerates a missing decision",
+    Model.jobDoneBanner(null, "") === "" && Model.jobDoneBanner(undefined, "") === "")
+}
+
 // -- #11 panel-reader additions: path rules + adoption plumbing ---------------
 {
   // jobDocumentStem/jobDocumentPath: the writer's own character class is
