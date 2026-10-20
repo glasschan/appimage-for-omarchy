@@ -239,22 +239,24 @@ def is_fuse_mounted(file_path: str, mounts_path: str = None) -> bool:
     """True when `file_path` is the source of an active FUSE mount.
 
     While a type-2 AppImage runs, its runtime FUSE-mounts the image at
-    /tmp/.mount_XXXXXX with the AppImage path as the mount source and
-    `fuse.AppImage` as the filesystem type, e.g.
+    /tmp/.mount_XXXXXX, e.g.
 
-        /home/user/AppImages/foo.appimage /tmp/.mount_fooXXXX fuse.AppImage rw,... 0 0
+        escrcpy.appimage /tmp/.mount_escrcpPC9VbJ fuse.escrcpy.appimage rw,... 0 0
 
-    The fuse.* fstype filter keeps unrelated mounts whose source happens
-    to be a regular file (loop devices, bind mounts) from matching.
-    `mounts_path` overrides the /proc/mounts location (tests)."""
+    Note the source: /proc/mounts only ever holds the AppImage's BASENAME
+    there, never the absolute path, so the attribution lives in
+    procs.mount_points_for (which also keeps the fuse.* filter that stops
+    an unrelated regular-file source — a loop device, a bind mount — from
+    matching). `mounts_path` overrides the /proc/mounts location (tests)."""
     if not file_path:
         return False
 
-    for source, _target, fstype in parse_proc_mounts(mounts_path):
-        if source == file_path and fstype.startswith('fuse.'):
-            return True
+    # Imported here, not at module scope: procs imports run_command and
+    # parse_proc_mounts from this module, so a top-level import either way
+    # would be a cycle.
+    from . import procs
 
-    return False
+    return bool(procs.mount_points_for(file_path, mounts_path))
 
 
 def gnu_naturalsize(value: int, precision: int = 1) -> str:

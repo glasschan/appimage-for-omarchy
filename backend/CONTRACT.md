@@ -224,8 +224,10 @@ Downloads the new release through the app's update source and installs it.
 - `--json` requires `--yes` (exit 2 otherwise).
 - No update source configured: exit 1, error
   `No update method was found for this AppImage (set one with --set-update-source)`.
-- App currently running (detected via `ps -eo exe` or a `fuse.*` mount in
-  `/proc/mounts`) and no `--force`: exit 0, result `skipped-running`.
+- App currently running (the process-identity rule under Security model:
+  a live process whose `exe` is the AppImage path, or one running out of
+  a `fuse.*` mount attributed to it in `/proc/mounts`) and no `--force`:
+  exit 0, result `skipped-running`.
 - Availability check says "definitely up to date": exit 0, result
   `up-to-date`. An indeterminate state (network error, no matching asset —
   tri-state `None`) still attempts the download, like a `True` result.
@@ -655,6 +657,19 @@ Real example output:
   refuse to extract past 20 000 entries / 512 MiB (fail closed); the
   extracted tree is sanitized afterwards (symlinks escaping the temp root
   are unlinked, quotas re-checked).
+- **Process identity** — a process belongs to an AppImage only when its
+  `/proc/<pid>/exe` proves it: the AppImage path itself (the type-2 runtime
+  parent) or a path under a `fuse.*` mount that `/proc/mounts` attributes
+  to this AppImage (`procs.pids_for`). `/proc/mounts` only ever holds the
+  AppImage's **basename** as the mount source, never the absolute path, so
+  `mount_points_for` matches on basenames; a stale entry whose mount is
+  gone attributes nothing. Process names, desktop `Exec` lines and
+  `/proc/<pid>/environ` are never used (the runtime parent exports no
+  `APPIMAGE`/`APPDIR` to itself and a mount child's environ reads as
+  zeroed) — a wrong kill is worse than a missed one, so nothing else is
+  ever signalled. Quitting (`procs.quit_app`) sends one SIGTERM round to
+  the parent and its mount children, then SIGKILLs only the survivors
+  after the grace; a process it may not signal is reported and left alone.
 - **Bounded subprocess output** — helper commands' stdout/stderr are
   capped at 10 MiB per stream; past the cap the reader stops and the
   timeout reaps a still-writing child.
@@ -683,7 +698,7 @@ No arguments prints usage and exits **2**.
 | `download_size` | int or null | Byte size of the available update (`null` unless filled by a check) |
 | `manager` | string or null | Update manager name (`StaticFileUpdater`, `GithubUpdater`, `GitlabUpdater`, `CodebergUpdater`, `ForgejoUpdater`) or `null` when no source exists |
 | `embedded_source` | boolean | True when the source comes from the AppImage's embedded `.upd_info` string (false for custom configs and for no source) |
-| `running` | boolean | True when the AppImage is currently running (via `ps -eo exe` **or** as the mount source of a `fuse.*` mount in `/proc/mounts`) |
+| `running` | boolean | True when the AppImage is currently running (a process whose `exe` is the AppImage path, or one running out of a `fuse.*` mount attributed to it in `/proc/mounts` — see Process identity under Security model) |
 | `exec_arguments` | string | The desktop entry's `Exec=` arguments, e.g. `"--no-sandbox %U"` or `"%U"`; `""` when the app has none. The desktop field codes (`%f %F %u %U %i %c %k`) stay **verbatim** — stripping them is the UI's job. The current desktop entry wins; when it carries no arguments, the install-time `default_exec_arguments` from `apps.ini` is used instead |
 
 > `exec_arguments` is an **additive** key: every other key keeps its
