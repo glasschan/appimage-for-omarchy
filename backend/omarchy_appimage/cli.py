@@ -22,7 +22,7 @@ import sys
 import tempfile
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from . import constants, net, settings
+from . import constants, net, settings, utils
 from .ini_config import Config
 from .provider import AppImageProvider, AppImageUpdateLogic, InternalError
 from .updaters import UpdateError, UpdateManagerChecker
@@ -227,6 +227,19 @@ def _updates_state_key(el) -> str:
     if el.desktop_file_path:
         return os.path.basename(el.desktop_file_path)
     return os.path.basename(el.file_path or '')
+
+
+def _runtime_block() -> dict:
+    """The additive `runtime` envelope block (ticket #17): best-effort
+    runtime capability states, probed ONCE per listing — never per app.
+    probe_fuse2 never raises by contract; the guard keeps even a probe
+    crash from failing the listing ('unknown', block still present)."""
+    try:
+        fuse2 = utils.probe_fuse2()
+    except Exception:
+        logging.exception('fuse2 probe failed')
+        fuse2 = utils.FUSE2_UNKNOWN
+    return {'fuse2': fuse2}
 
 
 def _update_signature(manager) -> str:
@@ -727,6 +740,10 @@ def cmd_list_installed(args: list) -> int:
         _print_json({
             'schema_version': constants.JSON_SCHEMA_VERSION,
             'installed': table,
+            # additive envelope key (schema_version stays 1): best-effort
+            # runtime capability states for the panel's launch-failure
+            # banner — probing never errors the call
+            'runtime': _runtime_block(),
         })
         return EXIT_OK
 

@@ -1,5 +1,6 @@
 # test_utils.py — unit tests for the shared helpers (utils.py), focusing
-# on the running detection (ps exe + /proc/mounts FUSE mounts).
+# on the running detection (ps exe + /proc/mounts FUSE mounts) and the
+# fuse2 runtime probe.
 #
 # Derived from GearLever (c) mijorus, GPL-3.0. Test suite written for
 # this plugin; integration behaviour verified against GearLever upstream.
@@ -27,6 +28,27 @@ tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
 
 FUSE_APP = '/home/user/AppImages/foo.appimage'
 SPACED_APP = '/home/user/AppImages/my spaced app.appimage'
+
+# Synthetic `ldconfig -p` listings (the dynamic-linker cache probe's
+# primary signal). Real shape: a summary line, then one line per cache
+# entry as "<soname> (<abi>) => <path>".
+FAKE_LDCONFIG_WITH_FUSE2 = '''\
+1612 libs found in cache '/etc/ld.so.cache'
+\tlibz.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libz.so.1
+\tlibfuse.so.2 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libfuse.so.2
+\tlibc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6
+'''
+FAKE_LDCONFIG_CLEAN = '''\
+1611 libs found in cache '/etc/ld.so.cache'
+\tlibz.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libz.so.1
+\tlibc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6
+'''
+# near-miss sonames that must never count as libfuse.so.2
+FAKE_LDCONFIG_DECOYS_ONLY = '''\
+2 libs found in cache '/etc/ld.so.cache'
+\tlibfuse3.so.3 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libfuse3.so.3
+\tlibfuse.so.20 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libfuse.so.20
+'''
 
 
 class MountsTestCase(unittest.TestCase):
@@ -98,6 +120,127 @@ class IsAppRunningTests(MountsTestCase):
 
     def test_empty_path_is_false(self):
         self.assertFalse(utils.is_app_running('', self.mounts))
+
+
+class Fuse2ProbeTests(unittest.TestCase):
+    """The fuse2 runtime probe (utils.probe_fuse2): dynamic-linker cache
+    first (faked via cache_output / a failing cache_command), then
+    standard library directory globs (faked filesystem roots). Every
+    outcome is one of present / missing / unknown — the probe NEVER
+    raises and NEVER depends on the host actually having (or lacking)
+    fuse2."""
+
+    def setUp(self):
+        # two faked library roots (one empty, one unused) plus a missing
+        # directory, which the scan must skip like any absent system dir
+        self.empty_dir = tempfile.mkdtemp(prefix='fuse2-empty-')
+        self.fuse_dir = tempfile.mkdtemp(prefix='fuse2-libs-')
+        self.lib_dirs = [self.fuse_dir, self.empty_dir, '/no/such/dir']
+        self.addCleanup(os.rmdir, self.empty_dir)
+        self.addCleanup(os.rmdir, self.fuse_dir)
+
+    def _put_lib(self, name: str) -> str:
+        path = os.path.join(self.fuse_dir, name)
+        with open(path, 'w') as f:
+            f.write('\x7fELF-fake-soname-body')
+        self.addCleanup(os.unlink, path)
+        return path
+
+    # ------------------------------------------------- linker-cache phase
+
+    def test_cache_listing_fuse2_is_present(self):
+        self.assertEqual(
+            utils.probe_fuse2(cache_output=FAKE_LDCONFIG_WITH_FUSE2,
+                              lib_dirs=self.lib_dirs),
+            'present')
+
+    def test_cache_short_circuits_the_glob_scan(self):
+        # the cache says present: no library directory is even scanned
+        # (here every lib dir is missing entirely and it still reports
+        # present)
+        self.assertEqual(
+            utils.probe_fuse2(cache_output=FAKE_LDCONFIG_WITH_FUSE2,
+                              lib_dirs=['/no/such/dir']),
+            'present')
+
+    def test_decoy_sonames_do_not_match(self):
+        # token equality: libfuse3.so.3 and libfuse.so.20 are NOT
+        # libfuse.so.2; a clean verdict with no glob hit is 'missing'
+        self.assertEqual(
+            utils.probe_fuse2(cache_output=FAKE_LDCONFIG_DECOYS_ONLY,
+                              lib_dirs=self.lib_dirs),
+            'missing')
+
+    # ---------------------------------------------- directory-glob phase
+
+    def test_stale_cache_real_file_in_lib_dir_is_present(self):
+        # cache ran clean but the glob finds the real file
+        # (libfuse.so.2.9.9, the usual real-file name behind the
+        # libfuse.so.2 symlink)
+        self._put_lib('libfuse.so.2.9.9')
+        self.assertEqual(
+            utils.probe_fuse2(cache_output=FAKE_LDCONFIG_CLEAN,
+                              lib_dirs=self.lib_dirs),
+            'present')
+
+    def test_unrelated_files_do_not_match_the_glob(self):
+        self._put_lib('libfuse3.so.3')
+        self.assertEqual(
+            utils.probe_fuse2(cache_output=FAKE_LDCONFIG_CLEAN,
+                              lib_dirs=self.lib_dirs),
+            'missing')
+
+    # ------------------------------------------------- failure -> unknown
+
+    def test_missing_cache_binary_unknown_without_glob_hit(self):
+        # the linker-cache phase fails (ldconfig not installed) and the
+        # globs find nothing: the probe cannot decide -> unknown
+        self.assertEqual(
+            utils.probe_fuse2(
+                cache_command=['omarchy-appimage-no-such-ldconfig', '-p'],
+                lib_dirs=self.lib_dirs),
+            'unknown')
+
+    def test_failing_cache_command_unknown_without_glob_hit(self):
+        # ldconfig runs but exits non-zero: same unknown verdict
+        self.assertEqual(
+            utils.probe_fuse2(
+                cache_command=[sys.executable, '-c', 'import sys; sys.exit(1)'],
+                lib_dirs=self.lib_dirs),
+            'unknown')
+
+    def test_failed_cache_still_reports_present_on_glob_hit(self):
+        # a glob hit is decisive evidence on its own, even when the
+        # cache phase failed entirely
+        self._put_lib('libfuse.so.2')
+        self.assertEqual(
+            utils.probe_fuse2(
+                cache_command=['omarchy-appimage-no-such-ldconfig', '-p'],
+                lib_dirs=self.lib_dirs),
+            'present')
+
+    def test_missing_lib_dirs_are_skipped_not_unknown(self):
+        # absent directories are the normal case (not every arch dir
+        # exists): a clean cache over all-missing dirs is 'missing'
+        self.assertEqual(
+            utils.probe_fuse2(cache_output=FAKE_LDCONFIG_CLEAN,
+                              lib_dirs=['/no/such/dir', '/no/either']),
+            'missing')
+
+    # ------------------------------------------------------- never raises
+
+    def test_real_defaults_return_a_contract_state(self):
+        # against the real host the probe must still answer with exactly
+        # one of the three contract states (whatever the host has)
+        self.assertIn(utils.probe_fuse2(),
+                      ('present', 'missing', 'unknown'))
+
+    def test_standard_dirs_cover_the_usual_roots(self):
+        # spec: standard library directory globs — the multiarch dir,
+        # lib64 and lib under the usual roots
+        for expected in ('/usr/lib/x86_64-linux-gnu', '/lib64', '/lib',
+                         '/usr/lib64', '/usr/lib'):
+            self.assertIn(expected, utils.FUSE2_LIB_DIRS, expected)
 
 
 class RunCommandOutputBoundTests(unittest.TestCase):
