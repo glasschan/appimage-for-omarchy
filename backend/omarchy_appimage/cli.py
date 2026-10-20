@@ -22,7 +22,7 @@ import sys
 import tempfile
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from . import constants, net, settings
+from . import constants, net, pick_file, settings
 from .ini_config import Config
 from .provider import AppImageProvider, AppImageUpdateLogic, InternalError
 from .updaters import UpdateError, UpdateManagerChecker
@@ -74,6 +74,13 @@ Commands:
   --fetch-updates          One-shot background update check; sends a
                            desktop notification when something is new
                            (used by the panel's timer service)
+  --pick-file              Open a native single-file, AppImage-filtered
+                           file dialog in a child process (desktop portal
+                           first, zenity fallback) and print the picked
+                           path. A crashed or stuck dialog yields a typed
+                           error, never a hang; with no dialog backend
+                           available the result is "unavailable" and the
+                           panel keeps the path field
   --settings               Show the current settings
   --set-setting <k>=<v>    Change one setting (e.g.
                            --set-setting update_check_enabled=false)
@@ -1159,6 +1166,39 @@ def cmd_fetch_updates(args: list) -> int:
 
 # ------------------------------------------------------- settings commands
 
+def cmd_pick_file(args: list) -> int:
+    """Open a native single-file AppImage dialog in a child process
+    (crash-isolated): the desktop portal first, zenity as fallback. The
+    heavy lifting (probe order, deadline, URI validation, typed results)
+    lives in pick_file.py; this wrapper only maps the payload to the
+    output contract."""
+    json_output = '--json' in args
+    payload = pick_file.run_pick()
+    result = payload.get('result')
+
+    if result == 'picked':
+        if json_output:
+            _print_json(payload)
+        else:
+            print(payload['path'])
+        return EXIT_OK
+
+    if result in ('cancelled', 'unavailable'):
+        # not errors: cancelled is the user's choice, unavailable means
+        # the panel keeps today's path-field UX
+        if json_output:
+            _print_json(payload)
+        else:
+            print(payload.get('message') or 'File selection cancelled')
+        return EXIT_OK
+
+    message = payload.get('error') or 'file selection failed'
+    print(f'Error: {message}', file=sys.stderr)
+    if json_output:
+        _print_json(payload)
+    return EXIT_ERROR
+
+
 def cmd_settings(args: list) -> int:
     json_output = '--json' in args
     data = settings.load_settings()
@@ -1253,6 +1293,7 @@ COMMANDS = {
     'get-update-source': cmd_get_update_source,
     'list-update-managers': cmd_list_update_managers,
     'fetch-updates': cmd_fetch_updates,
+    'pick-file': cmd_pick_file,
     'settings': cmd_settings,
     'set-setting': cmd_set_setting,
 }

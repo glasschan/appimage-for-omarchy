@@ -18,6 +18,8 @@ python3 <plugin_dir>/backend/main.py [OPTION]...
   `update-desktop-database` and `ps` are called best-effort and failures are
   ignored. `notify-send` is used best-effort by `--fetch-updates` only
   (a missing binary just means no notification, never a failure).
+  `gdbus` and `zenity` are probed and used by `--pick-file` only
+  (a missing binary is a typed `unavailable` result, never a failure).
 - The AppImage is **never executed** (metadata is read with a built-in
   squashfs reader; updates download and re-integrate the new file).
 - `OMARCHY_APPIMAGE_DEBUG=1` enables debug logging (stderr), including
@@ -277,6 +279,75 @@ Real example output (update available, first run, notification delivered):
 
 Second run with no change: same shape, `"notified": false`.
 
+### `--pick-file [--json]`
+
+Opens a native **single-file, AppImage-filtered** file dialog and prints
+the picked file. The backend **orchestrates, it does not dialog**: the
+dialog lives in child processes, so a crashed or hung dialog can never
+take down the caller (the panel's backend process). This verb never
+mutates anything, so it works with or without `--yes`.
+
+Probe order (first available wins):
+
+1. **Desktop portal** — `org.freedesktop.portal.FileChooser.OpenFile`
+   through the glib DBus CLI, when `gdbus` exists and introspection of
+   `/org/freedesktop/portal/desktop` exposes the FileChooser interface
+   (the probe is side-effect free: probing never opens a dialog). The
+   call is **monitor-then-call**: a `gdbus monitor --session --dest
+   org.freedesktop.portal.Desktop` child is started first, then the
+   `gdbus call` runs — the method reply only carries the request handle
+   (an object path, pinned by a constant `handle_token`), the actual
+   answer arrives as the `Request.Response` signal on the monitored
+   stream, matched by that handle. Portal response code 1 (user cancel)
+   → `cancelled`; any other non-zero code is a typed error.
+2. **zenity** — `zenity --file-selection` (single file: no `--multiple`)
+   with an `AppImage | *.AppImage *.appimage` file filter. Exit 1 =
+   `cancelled`.
+
+A portal **error** falls through to zenity (a broken portal must not cost
+the user the feature); an explicit user **cancel** never does (reopening
+a second dialog after a cancel is never wanted). Neither backend
+available → typed `unavailable` result (exit 0) so the panel keeps
+today's path-field UX.
+
+**Discipline** (same as every other child process, see the security
+model): one absolute whole-operation deadline of **600 s**
+(`DEFAULT_DEADLINE_SECONDS` in `omarchy_appimage/pick_file.py`) covers
+probe, call, signal wait and zenity together — a stuck dialog yields a
+typed timeout error, never a hang. One-shot children run through the
+bounded-output `run_command` (10 MiB/stream cap, own process group,
+killpg reap); the monitor child also runs in its own process group, is
+always reaped (killpg) and its stream is read line-by-line with a
+per-line cap of 1 MiB. Subprocess argv is fully constant — the dialog
+title is a constant, nothing user-controlled is ever interpolated, no
+shell is involved; the picked path is returned as JSON data only.
+
+The picked portal URI is validated: `file://` scheme only, empty or
+`localhost` host, percent-decoded to an absolute plain path. Anything
+else (https, remote share) is a typed `not-local` error.
+
+Result payloads (all exit 0 except `error`):
+
+```json
+{"schema_version": 1, "result": "picked", "path": "/home/user/Downloads/nvim-linux-x86_64.appimage", "backend": "portal"}
+{"schema_version": 1, "result": "cancelled", "backend": "zenity"}
+{"schema_version": 1, "result": "unavailable", "message": "no file chooser is available (neither the desktop portal nor zenity); type or paste the path instead"}
+```
+
+`backend` is `"portal"` or `"zenity"` (on `picked` / `cancelled`).
+
+Typed error documents (exit 1) add a `reason` key — `timeout`
+(whole-operation deadline exceeded), `backend-failed` (the dialog
+crashed, ended without answering, returned nothing, or its binary is
+gone) or `not-local` (non-`file://` or remote selection):
+
+```json
+{"schema_version": 1, "result": "error", "reason": "timeout", "error": "the file dialog did not answer in time"}
+```
+
+Plain text (no `--json`): `picked` prints the path, `cancelled` /
+`unavailable` print their message, errors go to stderr.
+
 ### `--settings [--json]`
 
 Current settings (defaults merged with `settings.json`).
@@ -385,8 +456,8 @@ Real example output:
 
 | Code | Meaning |
 |---|---|
-| 0 | Success (including `--help`, "already integrated", `up-to-date`, `skipped-running`, and any `--fetch-updates` outcome) |
-| 1 | Operation error (invalid file, not installed, extraction failed, download failed, ...) |
+| 0 | Success (including `--help`, "already integrated", `up-to-date`, `skipped-running`, any `--fetch-updates` outcome, and `--pick-file` `cancelled` / `unavailable` results) |
+| 1 | Operation error (invalid file, not installed, extraction failed, download failed, file-dialog timeout/crash, ...) |
 | 2 | Usage error (unknown option, missing argument, `--json` without `--yes`, invalid setting/manager config) |
 
 No arguments prints usage and exits **2**.
@@ -457,6 +528,11 @@ Real example output:
 ```json
 {"schema_version": 1, "result": "error", "error": "AppImage not integrated: 'ghost' (see --list-installed for valid names/ids)"}
 ```
+
+`--pick-file` error documents additionally carry a typed `reason` key
+(`timeout` / `backend-failed` / `not-local`); every other key keeps its
+meaning, so readers that ignore unknown keys are unaffected
+(`schema_version` stays 1).
 
 ## Filesystem layout
 
