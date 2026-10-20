@@ -149,6 +149,7 @@ The QML layer talks to `backend/main.py` over a stable JSON contract
 python3 backend/main.py --list-installed --json
 python3 backend/main.py --integrate /path/to/App.AppImage --yes --json
 python3 backend/main.py --integrate https://github.com/<owner>/<repo>/releases/download/<tag>/<file> --yes --json
+python3 backend/main.py --preview-integrate /path/to/App.AppImage --json
 python3 backend/main.py --pick-file --json
 python3 backend/main.py --remove <desktop-id> --yes --json
 python3 backend/main.py --list-updates --json
@@ -175,13 +176,39 @@ backend opens a native single-file, AppImage-filtered dialog — the
 desktop portal first, `zenity` as the fallback — orchestrating it as an
 isolated child process under one absolute 600 s whole-operation
 deadline, so a crashed or hung dialog can never take the panel down.
-A picked file fills the panel's path field ready to integrate; a cancel
-is a quiet notice; a missing file chooser reports itself and the
-paste-a-path flow keeps working exactly as before. Timeout and dialog
-failures surface as dismissible banners. The result documents
+A picked file fills the panel's path field ready to integrate; the fill
+itself integrates nothing (and dismisses any preview of a different
+path) — the next Enter or **Integrate** press runs the preview flow
+below. A cancel is a quiet notice; a missing file chooser reports itself
+and the paste-a-path flow keeps working exactly as before. Timeout and
+dialog failures surface as dismissible banners. The result documents
 (`picked` / `cancelled` / `unavailable`, typed `timeout` /
 `backend-failed` / `not-local` errors) are mapped defensively and
 pinned by `tests-js/parse-harness.mjs`.
+
+### Integrate: preview before install
+
+The panel's Integrate picker is not a one-press commit. Every route into
+it — a typed or pasted path/URL (Enter), the picker's **Integrate**
+button, or a Downloads quick-pick — first shows a **preview card** built
+by the offline `--preview-integrate` verb: the app name and version read
+from the file itself (URL sources show "unknown until download" — the
+preview fetches nothing), the destination path, and how the artifact
+will be verified at integrate time. A source that publishes no digest
+says so up front with a prominent **will install with reduced
+assurance** line — before anything is downloaded; an already-integrated
+file shows a notice that confirming changes nothing, and a same-app
+version conflict says integrate keeps both.
+
+**Confirm** (Enter or the button) then runs the real integrate command —
+which re-classifies and re-verifies from scratch, so a file that changed
+between preview and confirm is still caught. **Esc** (or Cancel) goes
+back to the picker with zero side effects. When the preview itself
+fails (bad path, non-AppImage file), the panel shows the error banner
+and the picker stays usable.
+
+The preview is advisory: it makes no network requests, never executes
+the AppImage, and installs nothing on its own.
 
 ### Install from a URL
 
