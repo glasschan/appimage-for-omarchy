@@ -23,8 +23,11 @@ import tempfile
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from . import constants, net, settings
+from .extractor import read_desktop_entry_in_place
 from .ini_config import Config
-from .provider import AppImageProvider, AppImageUpdateLogic, InternalError
+from .provider import (AppImageListElement, AppImageProvider,
+                       AppImageUpdateLogic, InternalError, InstalledStatus,
+                       _resolve_install_names)
 from .updaters import UpdateError, UpdateManagerChecker
 from .utils import get_file_hash, run_command
 
@@ -53,6 +56,11 @@ Commands:
                            installed with reduced assurance (AppImage
                            magic + advertised size) and wired to the
                            matching update source
+  --preview-integrate <p> Show what --integrate would install (source
+                           kind, app name/version, destination, how the
+                           artifact will be verified) without installing,
+                           downloading or executing anything — an
+                           offline, advisory preview document
   --list-installed         List integrated apps
   --remove <target>        Trash an AppImage, its .desktop file and its
                            icon; <target> may be the AppImage path, the
@@ -603,6 +611,24 @@ def _fetch_integrate_artifact(kind: str, info: dict, raw_url: str,
     return _download_static(raw_url, dest_dir), 'static', {'url': raw_url}
 
 
+def _find_name_conflict(list_element):
+    """The installed element that is another version of the same app,
+    detected either by display name or by the original (un-suffixed) name
+    recorded in X-AppImage-Name — GearLever's CLI only compares names,
+    which never matches apps that were integrated with the
+    "Name (version)" keep-both suffix. Shared by --integrate and
+    --preview-integrate."""
+    already_installed = None
+    for a in appimage_provider.list_installed():
+        original_name = ''
+        if a.desktop_entry:
+            original_name = a.desktop_entry.get('X-AppImage-Name', '') or ''
+        if a.name == list_element.name or original_name == list_element.name:
+            already_installed = a
+            break
+    return already_installed
+
+
 def cmd_integrate(args: list) -> int:
     json_output = '--json' in args
     assume_yes = ('-y' in args) or ('--yes' in args)
@@ -650,18 +676,7 @@ def cmd_integrate(args: list) -> int:
         list_element.update_logic = AppImageUpdateLogic.KEEP
         appimage_provider.refresh_data(list_element)
 
-        # Another version of the same app is detected either by display name
-        # or by the original (un-suffixed) name recorded in X-AppImage-Name —
-        # GearLever's CLI only compares names, which never matches apps that
-        # were integrated with the "Name (version)" keep-both suffix.
-        already_installed = None
-        for a in appimage_provider.list_installed():
-            original_name = ''
-            if a.desktop_entry:
-                original_name = a.desktop_entry.get('X-AppImage-Name', '') or ''
-            if a.name == list_element.name or original_name == list_element.name:
-                already_installed = a
-                break
+        already_installed = _find_name_conflict(list_element)
 
         if replace:
             list_element.update_logic = AppImageUpdateLogic.REPLACE
@@ -709,6 +724,208 @@ def cmd_integrate(args: list) -> int:
     finally:
         if tmp_cleanup:
             shutil.rmtree(tmp_cleanup, ignore_errors=True)
+
+
+# ------------------------------------------------------- preview command
+
+def _verification_preview(kind: str) -> dict:
+    """The verification block of the preview document: what --integrate
+    will verify at its own runtime, derived from the same offline URL
+    classification. The digest itself is only fetched at integrate
+    time; a .zsync control file's SHA-1 line is likewise only read then
+    (the preview stays offline), so the zsync note spells out the
+    conditional."""
+    if kind == 'github':
+        return {
+            'method': 'github-sha256',
+            'reduced_assurance': False,
+            'note': "the release asset's sha256 digest is fetched from "
+                    'the GitHub API and verified at integrate time; a '
+                    'missing digest refuses the install',
+        }
+    if kind == 'zsync':
+        return {
+            'method': 'zsync-sha1',
+            'reduced_assurance': False,
+            'note': "the .zsync control file's SHA-1 line is verified at "
+                    'integrate time when the publisher publishes one; '
+                    'without it the install runs with reduced assurance '
+                    '(AppImage magic bytes and the advertised size)',
+        }
+    if kind == 'local':
+        return {
+            'method': 'none',
+            'reduced_assurance': False,
+            'note': 'no download: the local file itself is integrated '
+                    '(AppImage magic-byte check only)',
+        }
+    # gitlab / codeberg / forgejo / static: no publisher digest exists
+    return {
+        'method': 'none',
+        'reduced_assurance': True,
+        'note': 'no publisher digest exists for this source; the '
+                'artifact installs with reduced assurance (AppImage '
+                'magic bytes and the advertised size)',
+    }
+
+
+def _preview_destination(source_basename: str, desktop_name,
+                         version: str) -> dict:
+    """The destination block of the preview document: the exact file
+    name --integrate would pick, derived with the install-time naming
+    helper (GearLever conflict suffixing included)."""
+    folder = settings.appimages_folder()
+    try:
+        existing_names = os.listdir(folder)
+    except OSError:
+        existing_names = []
+    filename, _prefix = _resolve_install_names(
+        source_basename=source_basename,
+        desktop_name=desktop_name,
+        version=version or '',
+        existing_names=existing_names)
+    return {'folder': folder, 'filename': filename,
+            'path': os.path.join(folder, filename)}
+
+
+def _as_url(value: str):
+    """urlsplit(value) when the argument looks like a URL ('scheme://'),
+    else None (a plain path, possibly one that does not exist)."""
+    if '://' not in value:
+        return None
+    try:
+        return urlsplit(value)
+    except ValueError:
+        return None
+
+
+def cmd_preview_integrate(args: list) -> int:
+    """--preview-integrate <path-or-url>: the offline pre-install preview
+    document. Purely advisory and read-only — no network access (the
+    classification is by URL shape, the same classifier --integrate
+    uses), no AppImage execution (the embedded desktop entry is read in
+    place with the stdlib squashfs reader), nothing is installed,
+    downloaded or written. The integrate command remains the single
+    authority and re-classifies/re-verifies at its own runtime."""
+    json_output = '--json' in args
+
+    positional = _remove_flag_value(args, ['--json'])
+    positional = [a for a in positional if not a.startswith('--')]
+    if not positional:
+        raise UsageError(
+            'missing argument: --preview-integrate <path-or-url>')
+    if len(positional) > 1:
+        raise UsageError(f'unexpected argument: {positional[1]!r}')
+    target = positional[0]
+
+    parts = _as_url(target)
+    if parts is not None:
+        # the URL branch mirrors --integrate's egress policy: net
+        # refuses anything but https, so the preview refuses it too
+        if parts.scheme != 'https':
+            raise OperationError(
+                f'{target}: only https:// URLs are allowed')
+        kind, _info = _classify_integrate_url(target)
+        document = {
+            'schema_version': constants.JSON_SCHEMA_VERSION,
+            'result': 'preview',
+            'source': {'kind': kind, 'input': target},
+            'verification': _verification_preview(kind),
+            'destination': {
+                'folder': settings.appimages_folder(),
+                'filename': None,
+                'path': None,
+            },
+            'app': None,
+            'already_integrated': False,
+            'name_conflict': False,
+            'advisory': True,
+        }
+    else:
+        if not os.path.exists(target):
+            raise OperationError(f'no such file: {target}')
+        if not os.path.isfile(target):
+            raise OperationError(f'not a regular file: {target}')
+        if not appimage_provider.can_install_file(target):
+            raise OperationError(f'{target} is not an AppImage')
+
+        list_element = appimage_provider.create_list_element_from_file(
+            target)
+        already_integrated = appimage_provider.is_installed(list_element)
+
+        if already_integrated:
+            # report the installation the file already is: integrate
+            # would exit 0 with 'already-integrated', changing nothing
+            name = list_element.name
+            version = list_element.version
+            destination = {
+                'folder': os.path.dirname(list_element.file_path),
+                'filename': os.path.basename(list_element.file_path),
+                'path': list_element.file_path,
+            }
+            name_conflict = False
+        else:
+            entry_name, entry_version = read_desktop_entry_in_place(target)
+            destination = _preview_destination(
+                os.path.basename(target), entry_name or None,
+                entry_version or '')
+            if entry_name:
+                conflict_probe = AppImageListElement(
+                    name=entry_name, description='', provider='',
+                    installed_status=InstalledStatus.NOT_INSTALLED,
+                    file_path=target)
+                name_conflict = _find_name_conflict(conflict_probe) \
+                    is not None
+                name = entry_name
+            else:
+                logging.info('preview: no embedded desktop entry could '
+                             'be read in place from %s', target)
+                name = None
+                name_conflict = False
+            version = entry_version or None
+
+        document = {
+            'schema_version': constants.JSON_SCHEMA_VERSION,
+            'result': 'preview',
+            'source': {'kind': 'local', 'input': target},
+            'verification': _verification_preview('local'),
+            'destination': destination,
+            'app': ({'name': name, 'version': version}
+                    if name else None),
+            'already_integrated': already_integrated,
+            'name_conflict': name_conflict,
+            'advisory': True,
+        }
+
+    if json_output:
+        _print_json(document)
+    else:
+        print(f'Source:       {document["source"]["input"]}')
+        print(f'Kind:         {document["source"]["kind"]}')
+        if document['app']:
+            line = f'App:          {document["app"]["name"]}'
+            if document['app']['version']:
+                line += f' (version {document["app"]["version"]})'
+            print(line)
+        dest = document['destination']
+        if dest['path']:
+            print(f'Destination:  {dest["path"]}')
+        else:
+            print(f'Destination:  {dest["folder"]} '
+                  '(final name decided at integrate time)')
+        verification = document['verification']
+        suffix = ' (reduced assurance)' \
+            if verification['reduced_assurance'] else ''
+        print(f'Verification: {verification["method"]}{suffix}')
+        print(f'              {verification["note"]}')
+        if document['already_integrated']:
+            print('Already integrated: yes (integrate would report '
+                  'already-integrated)')
+        elif document['name_conflict']:
+            print('Name conflict: another version of this app is '
+                  'installed (integrate keeps both, or replaces with '
+                  '--replace)')
+    return EXIT_OK
 
 
 def cmd_list_installed(args: list) -> int:
@@ -1245,6 +1462,7 @@ def _print_table(table: list):
 
 COMMANDS = {
     'integrate': cmd_integrate,
+    'preview-integrate': cmd_preview_integrate,
     'list-installed': cmd_list_installed,
     'remove': cmd_remove,
     'list-updates': cmd_list_updates,

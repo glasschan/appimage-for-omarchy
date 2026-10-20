@@ -101,6 +101,50 @@ static source instead of erroring. **`--update` and the update managers are
 unaffected**: they keep the strict mandatory-digest policy below, and the
 auto-populated cases 3–5 sources therefore still refuse to install updates.
 
+### `--preview-integrate <path-or-url> [--json]`
+
+The offline pre-install preview document: what `--integrate` would do,
+without installing, downloading or executing anything. Read-only and
+**advisory** — the integrate command remains the single authority and
+re-classifies/re-verifies at its own runtime (a file can change between
+preview and confirm; nothing is cached or trusted across the two).
+
+- **Zero network**: classification is by URL shape (the exact classifier
+  of `--integrate <url>`, first match wins, same source `kind` values)
+  and no request is ever made — release metadata, digests and `.zsync`
+  control files are only fetched at integrate time. Fully usable offline.
+- **The AppImage is never executed.** For local files the embedded
+  desktop entry is read in place (stdlib squashfs reader, bounded by the
+  same superblock quotas extraction uses, nothing written to disk).
+- A missing path, a non-regular file, a non-AppImage file and a
+  non-https `scheme://` URL (integrate's egress policy) produce the
+  typed error document (exit 1).
+- Read-only, so `--json` does **not** require `--yes` here.
+
+Verification matrix — what integrate WILL verify, so a source that
+installs without a publisher-attested digest says so before the
+download starts:
+
+| source `kind` | `verification.method` | `reduced_assurance` |
+|---|---|---|
+| `local` | `none` | `false` — no download; the AppImage magic-byte check only |
+| `github` | `github-sha256` | `false` — API digest mandatory at integrate time |
+| `zsync` | `zsync-sha1` | `false` — SHA-1 when the control file publishes one, else the reduced checks; the control file is only readable at integrate time |
+| `gitlab` / `codeberg` / `forgejo` / `static` | `none` | `true` — reduced assurance |
+
+Flags: `already_integrated` is true when the file's content already
+matches an installed AppImage (integrate would print
+`already-integrated` and change nothing; `destination.path` is then the
+installed file itself). `name_conflict` is true when another version of
+the same app is installed (integrate keeps both — the derived
+`destination` already carries the version-suffixed, non-clobbering file
+name — or replaces it with `--replace`).
+
+Plain text (no `--json`): a short human-readable preview block.
+
+The document schema is under "JSON schemas" below; keys are additive
+within `schema_version` 1 (same policy as `exec_arguments`).
+
 ### `--remove <target> [--yes] [--delete] [--json]`
 
 Removes an integrated app. `<target>` is resolved in this order:
@@ -439,6 +483,28 @@ Empty list:
 ```
 
 Other `result` values: `already-integrated` (exit 0, app unchanged).
+
+### `--preview-integrate <path-or-url> --json`
+
+```json
+{"schema_version": 1, "result": "preview", "source": {"kind": "local", "input": "<path-or-url as given>"}, "verification": {"method": "github-sha256|zsync-sha1|none", "reduced_assurance": true|false, "note": "<human-readable sentence for the panel>"}, "destination": {"folder": "<managed folder, absolute>", "filename": "<file name integrate would pick>" | null, "path": "<folder>/<filename>" | null}, "app": {"name": "...", "version": "..."} | null, "already_integrated": false, "name_conflict": false, "advisory": true}
+```
+
+| Key | Meaning |
+|---|---|
+| `source.kind` | `local`, `github`, `zsync`, `gitlab`, `codeberg`, `forgejo` or `static` — the same classification `--integrate <url>` uses |
+| `verification` | The matrix above; `note` is the exact sentence the panel may render verbatim |
+| `destination` | For a local file: folder + exact file name + full path, derived with the install-time naming helper (conflict suffixing included; `path` is the installed file itself when `already_integrated`). For a URL: only `folder` is known — `filename`/`path` are `null`, the final name comes from the artifact's embedded desktop entry at integrate time |
+| `app` | Local files only: `name`/`version` read in place from the embedded desktop entry; `null` when the entry cannot be read in place (the preview stays valid) or for URLs (nothing was downloaded) |
+| `already_integrated` | Content already matches an installed AppImage |
+| `name_conflict` | Another version of the same app is installed |
+| `advisory` | Always `true`; the integrate command re-classifies/re-verifies at its own runtime |
+
+Real example output (local file):
+
+```json
+{"schema_version": 1, "result": "preview", "source": {"kind": "local", "input": "/home/user/Downloads/nvim.appimage"}, "verification": {"method": "none", "reduced_assurance": false, "note": "no download: the local file itself is integrated (AppImage magic-byte check only)"}, "destination": {"folder": "/home/user/AppImages", "filename": "neovim.appimage", "path": "/home/user/AppImages/neovim.appimage"}, "app": {"name": "Neovim", "version": "v0.11.3"}, "already_integrated": false, "name_conflict": false, "advisory": true}
+```
 
 ### `--remove <target> --yes --json` (success)
 
