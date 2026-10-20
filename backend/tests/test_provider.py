@@ -300,6 +300,129 @@ Type=Application
             self.assertIn('/tmp/.mount_zzzz', f.read())
 
 
+class ExecArgumentsTests(FakeXDGTestCase):
+    """The desktop entry's Exec arguments reach the list element: the
+    current entry wins, the install-time record is the fallback."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider = AppImageProvider()
+
+    def _rewrite_exec(self, desktop: str, appimage: str, args: str):
+        with open(desktop, 'w') as f:
+            f.write(f'''[Desktop Entry]
+Name=Fake App
+Exec=env DESKTOPINTEGRATION=1 {appimage} {args}
+TryExec={appimage}
+Type=Application
+Terminal=false
+X-AppImage-Version=1.0
+''')
+
+    def test_arguments_come_from_the_current_desktop_entry(self):
+        appimage, desktop, _icon = self.install_fake_app()
+        self._rewrite_exec(desktop, appimage, '--no-sandbox %U')
+
+        listed = self.provider.list_installed()
+
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0].exec_arguments, '--no-sandbox %U')
+
+    def test_field_codes_stay_verbatim(self):
+        appimage, desktop, _icon = self.install_fake_app()
+        self._rewrite_exec(desktop, appimage, '%U')
+
+        listed = self.provider.list_installed()
+
+        self.assertEqual(listed[0].exec_arguments, '%U')
+
+    def test_no_arguments_means_empty_string(self):
+        self.install_fake_app()
+
+        listed = self.provider.list_installed()
+
+        self.assertEqual(listed[0].exec_arguments, '')
+
+    def test_recorded_arguments_are_the_fallback(self):
+        appimage, desktop, icon = self.install_fake_app()
+        el = _make_el(appimage, desktop_path=desktop)
+        Config.set_app_config(el, {
+            'appimage_path': appimage,
+            'desktop_file_path': desktop,
+            'icon_path': icon,
+            'default_exec_arguments': '--no-sandbox %U',
+        })
+
+        listed = self.provider.list_installed()
+
+        self.assertEqual(listed[0].exec_arguments, '--no-sandbox %U')
+
+
+class StaleRecordTests(FakeXDGTestCase):
+    """A record whose .desktop file is gone is invisible to the
+    desktop-driven listing — it must be logged, never dropped silently,
+    and never removed without an explicit request."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider = AppImageProvider()
+
+    def _record_without_desktop_file(self) -> tuple:
+        appimage, desktop, icon = self.install_fake_app()
+        os.unlink(desktop)          # the desktop file is gone
+        el = _make_el(appimage)    # no desktop entry to read any more
+        el.desktop_file_path = desktop
+        Config.set_app_config(el, {
+            'appimage_path': appimage,
+            'desktop_file_path': desktop,
+            'icon_path': icon,
+            'default_exec_arguments': '--no-sandbox %U',
+        })
+        return appimage, desktop, icon
+
+    def test_stale_record_is_logged_not_listed(self):
+        appimage, desktop, _icon = self._record_without_desktop_file()
+
+        with self.assertLogs(level='WARNING') as logs:
+            listed = self.provider.list_installed()
+
+        # not listed as an installed app…
+        self.assertEqual(listed, [])
+        # …but reported, with the missing desktop file and the orphaned
+        # AppImage, so the user can reclaim the file
+        message = '\n'.join(logs.output)
+        self.assertIn(desktop, message)
+        self.assertIn(appimage, message)
+
+    def test_list_stale_records_finds_the_orphan(self):
+        appimage, desktop, _icon = self._record_without_desktop_file()
+
+        stale = self.provider.list_stale_records()
+
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0].file_path, appimage)
+        self.assertEqual(stale[0].desktop_file_path, desktop)
+        self.assertEqual(stale[0].exec_arguments, '--no-sandbox %U')
+
+    def test_live_record_is_not_stale(self):
+        appimage, desktop, icon = self.install_fake_app()
+        el = _make_el(appimage, desktop_path=desktop)
+        Config.set_app_config(el, {
+            'appimage_path': appimage,
+            'desktop_file_path': desktop,
+            'icon_path': icon,
+        })
+
+        self.assertEqual(self.provider.list_stale_records(), [])
+
+    def test_listing_never_removes_the_orphan(self):
+        appimage, _desktop, _icon = self._record_without_desktop_file()
+
+        self.provider.list_installed()
+
+        self.assertTrue(os.path.isfile(appimage))
+
+
 class ResolveInstallNamesTests(unittest.TestCase):
     """Round-4 review: collision candidates are rebuilt from embedded,
     attacker-controlled desktop fields (Name, X-AppImage-Version). Every

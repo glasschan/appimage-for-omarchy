@@ -495,11 +495,26 @@ Panel {
   // shell ever sees it. DESKTOPINTEGRATION=1 matches the generated desktop
   // entry's Exec line so AppImages that bundle their own integration
   // prompt stay quiet.
+  //
+  // The app's own Exec arguments (the backend's exec_arguments, e.g.
+  // "--no-sandbox %U") ride along as extra argv tokens: real flags are
+  // kept, desktop field codes (%f %F %u %U %i %c %k) are dropped because
+  // the panel has no file or URL to hand over. No arguments at all (the
+  // common case) produce exactly the argv of before.
   function launchItem(item) {
     if (!item || item.path === "") return
-    Quickshell.execDetached(["env", "DESKTOPINTEGRATION=1", item.path])
+    var args = (item.execArguments || "").trim().split(/\s+/)
+      .filter(function(a) { return a && !/^%[fFuUicdk]$/.test(a) })
+    Quickshell.execDetached(["env", "DESKTOPINTEGRATION=1", item.path].concat(args))
     Model.markRunning(item.id, true)
     launchSettleTimer.restart()
+    // The panel is a full-screen overlay with exclusive keyboard focus, so
+    // a freshly launched app would sit behind it and the user would have
+    // to press Escape first. Close through the existing close path
+    // (requestClose) so the shell's openPanelIds bookkeeping stays
+    // consistent. A pinned panel is a compact floating window that is
+    // meant to stay open.
+    if (!root.pinned) root.requestClose()
   }
 
   // F3: first click arms the inline confirmation, second click runs

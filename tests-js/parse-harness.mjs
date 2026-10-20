@@ -2,7 +2,11 @@
 // during an e2e run) through the exact QML-side JS parse logic
 // (lib/Model.js + lib/Backend.js).
 // Run: node tests-js/parse-harness.mjs
-import { readFileSync } from "node:fs"
+import { spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import vm from "node:vm"
 
 const load = (path) => {
@@ -521,6 +525,122 @@ check("probe 3 while idle → missing", Model.pythonProbeOutcome(3, "", false) =
 check("probe 3 while installing → waiting", Model.pythonProbeOutcome(3, "", true) === "waiting")
 check("probe 2 with status 130 → canceled", Model.pythonProbeOutcome(2, "130\n", true) === "canceled")
 check("probe 2 with other status → failed", Model.pythonProbeOutcome(2, "1\n", true) === "failed")
+
+// ---- Live backend: exec_arguments + the stale-record path --------------------
+// The captures above are frozen e2e output. The two behaviours pinned here
+// have no capture (a stale record cannot be produced by a normal run), so
+// the REAL backend runs in a throwaway XDG sandbox and its output goes
+// through the same JS parse logic as every other document.
+const MAIN_PY = new URL("../backend/main.py", import.meta.url).pathname
+// ELF magic + the AppImage type-2 magic: enough for the listing to accept
+// the file (nothing is ever executed).
+const FAKE_APPIMAGE = Buffer.concat([
+  Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x41, 0x49, 0x02]),
+  Buffer.from("padding")
+])
+
+const sandbox = mkdtempSync(join(tmpdir(), "appimage-harness-"))
+const home = join(sandbox, "home")
+const dataHome = join(sandbox, "data")
+const configHome = join(sandbox, "config")
+const managed = join(home, "AppImages")
+const applications = join(dataHome, "applications")
+mkdirSync(join(managed, ".icons"), { recursive: true })
+mkdirSync(applications, { recursive: true })
+
+const writeApp = (name, execArgs) => {
+  const appimage = join(managed, name + ".appimage")
+  writeFileSync(appimage, FAKE_APPIMAGE)
+  const icon = join(managed, ".icons", name + ".png")
+  writeFileSync(icon, Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+  const args = execArgs ? " " + execArgs : ""
+  writeFileSync(join(applications, name + ".desktop"),
+    `[Desktop Entry]\nName=${name}\n`
+    + `Exec=env DESKTOPINTEGRATION=1 ${appimage}${args}\n`
+    + `TryExec=${appimage}\nIcon=${icon}\nType=Application\nTerminal=false\n`
+    + `X-AppImage-Version=1.0\n`)
+  return { appimage, icon }
+}
+
+writeApp("biscuit", "--no-sandbox %U")
+writeApp("plain", "")
+// a stale record: the .desktop file is gone, the AppImage is not
+const stale = writeApp("stale", "--no-sandbox %U")
+const staleDesktop = join(applications, "stale.desktop")
+rmSync(staleDesktop)
+
+const configDir = join(configHome, "io.github.glasschan.appimage")
+mkdirSync(configDir, { recursive: true })
+const appsIni = join(configDir, "apps.ini")
+writeFileSync(appsIni,
+  `[app.${createHash("md5").update(stale.appimage).digest("hex")}]\n`
+  + `default_exec_arguments = --no-sandbox %U\n`
+  + `appimage_path = ${stale.appimage}\n`
+  + `desktop_file_path = ${staleDesktop}\n`
+  + `icon_path = ${stale.icon}\n`
+  + `name = Stale App\n`
+  + `file_path = ${stale.appimage}\n`)
+
+const sandboxEnv = Object.assign({}, process.env, {
+  HOME: home, XDG_DATA_HOME: dataHome, XDG_CONFIG_HOME: configHome
+})
+const runBackend = (args) => spawnSync("python3", [MAIN_PY].concat(args),
+  { env: sandboxEnv, encoding: "utf8" })
+
+const listRun = runBackend(["--list-installed", "--json"])
+const liveOk = !listRun.error
+check("live backend runs (python3 present)", liveOk,
+  liveOk ? "" : String(listRun.error))
+if (liveOk) {
+  check("live backend --list-installed exits 0", listRun.status === 0,
+    listRun.stderr)
+  const liveDoc = Backend.parseJson(listRun.stdout)
+  const liveApps = liveDoc && Array.isArray(liveDoc.installed)
+    ? liveDoc.installed : []
+  const argsApp = liveApps.find((a) => a.desktop_id === "biscuit.desktop")
+  const noArgsApp = liveApps.find((a) => a.desktop_id === "plain.desktop")
+
+  // the new key: the desktop entry's Exec arguments reach the UI
+  check("exec_arguments present for an app with arguments",
+    !!argsApp && argsApp.exec_arguments === "--no-sandbox %U",
+    JSON.stringify(argsApp))
+  check("exec_arguments empty for an app without arguments",
+    !!noArgsApp && noArgsApp.exec_arguments === "", JSON.stringify(noArgsApp))
+  check("exec_arguments is a string on every app object",
+    liveApps.length === 2 && liveApps.every((a) => typeof a.exec_arguments === "string"),
+    JSON.stringify(liveApps))
+  // the field codes stay verbatim — the UI strips them
+  check("exec_arguments keeps the field codes verbatim",
+    !!argsApp && argsApp.exec_arguments.indexOf("%U") !== -1)
+
+  // the JS parse logic still handles the live document
+  const liveList = Model.parseListJson(listRun.stdout)
+  check("live backend document parses in Model", liveList.ok === true
+    && liveList.items.length === 2, JSON.stringify(liveList.items))
+
+  // the stale record: no crash, and it is REPORTED, not silently dropped
+  check("stale record does not crash the listing", listRun.status === 0)
+  check("stale record is not listed as installed",
+    !liveApps.some((a) => a.desktop_id === "stale.desktop"))
+  check("stale record is reported with both paths",
+    listRun.stderr.includes(staleDesktop)
+    && listRun.stderr.includes(stale.appimage), listRun.stderr)
+  check("listing never removes the stale record", existsSync(stale.appimage))
+
+  // ...and it can be cleaned up explicitly, by its desktop id
+  const removeRun = runBackend(["--remove", "stale.desktop", "--yes", "--json"])
+  check("stale record can be removed by its desktop id",
+    removeRun.status === 0, removeRun.stderr)
+  const removedDoc = Model.parseActionJson(removeRun.stdout)
+  check("stale removal reports removed",
+    removedDoc.ok === true && removedDoc.result === "removed")
+  check("stale removal trashes the orphaned AppImage",
+    existsSync(join(dataHome, "Trash", "files", "stale.appimage")))
+  check("stale removal deletes the record",
+    readFileSync(appsIni, "utf8").indexOf("stale") === -1,
+    readFileSync(appsIni, "utf8"))
+}
+rmSync(sandbox, { recursive: true, force: true })
 
 console.log(failures === 0 ? "\nALL PASS" : "\n" + failures + " FAILURES")
 process.exit(failures === 0 ? 0 : 1)

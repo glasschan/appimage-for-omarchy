@@ -44,6 +44,13 @@ the routed manager name (e.g. `GithubUpdater` for a `gh-releases-zsync|...`
 string). `available_version` / `download_size` stay `null` here; only
 `--list-updates` populates them.
 
+The listing is desktop-driven: a record in `apps.ini` whose `.desktop` file
+is gone is **not** listed as installed. It is logged on stderr instead
+(`stale integration record: the desktop file <path> is gone; orphaned
+AppImage: <path> (remove it with --remove <desktop id>)`), so the user can
+reclaim the file — the record itself is removed only on an explicit
+`--remove <desktop id> --yes`.
+
 ### `--integrate <path> [--yes] [--replace] [--json]`
 
 Integrates an AppImage: extracts the `.desktop` entry + icon from the
@@ -101,11 +108,16 @@ Removes an integrated app. `<target>` is resolved in this order:
 1. exact AppImage file path (e.g. `~/AppImages/neovim.appimage`)
 2. desktop id, with or without `.desktop` (e.g. `neovim` or `neovim.desktop`)
 3. desktop `Name`, case-insensitive (e.g. `Neovim (v0.11.3)`)
+4. the desktop id of a **stale record** — an `apps.ini` record whose
+   `.desktop` file is gone (see `--list-installed`)
 
 The AppImage, its `.desktop` file and its icon are moved to the FreeDesktop
 trash (`$XDG_DATA_HOME/Trash`); `--delete` removes them permanently instead.
 Per-app config entries (including the update source) are deleted either way.
 **All commands taking a `<target>` use this same resolution order.**
+
+Nothing is ever removed automatically: a stale record is only cleaned up
+when the user asks for it explicitly (`--remove <desktop id> --yes`).
 
 ### `--list-updates [--json]`
 
@@ -127,7 +139,7 @@ per-app errors are logged (stderr) and skipped.
 - JSON (real example output):
 
 ```json
-{"schema_version": 1, "updates": [{"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false}]}
+{"schema_version": 1, "updates": [{"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "exec_arguments": "%F"}]}
 ```
 
 ### `--update <target> [--yes] [--keep-both] [--force] [--json]`
@@ -157,13 +169,13 @@ Downloads the new release through the app's update source and installs it.
 Real example output (success):
 
 ```json
-{"schema_version": 1, "result": "updated", "message": "/home/user/AppImages/neovim.appimage was updated successfully", "app": {"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": null, "embedded_source": false, "running": false}, "downloaded_bytes": 10996237}
+{"schema_version": 1, "result": "updated", "message": "/home/user/AppImages/neovim.appimage was updated successfully", "app": {"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": null, "embedded_source": false, "running": false, "exec_arguments": "%F"}, "downloaded_bytes": 10996237}
 ```
 
 Real example output (up-to-date):
 
 ```json
-{"schema_version": 1, "result": "up-to-date", "app": {"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false}}
+{"schema_version": 1, "result": "up-to-date", "app": {"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "exec_arguments": "%F"}}
 ```
 
 Real example output (skipped-running, exit 0):
@@ -189,7 +201,7 @@ update string**).
 Real example output (set):
 
 ```json
-{"schema_version": 1, "result": "set", "app": {"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "StaticFileUpdater", "embedded_source": false, "running": false}, "manager": "StaticFileUpdater", "config": {"url": "https://example.com/nvim.appimage"}}
+{"schema_version": 1, "result": "set", "app": {"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "exec_arguments": "%F"}, "manager": "StaticFileUpdater", "config": {"url": "https://example.com/nvim.appimage"}}
 ```
 
 ### `--get-update-source <target> [--json]`
@@ -260,7 +272,7 @@ Behaviour:
 Real example output (update available, first run, notification delivered):
 
 ```json
-{"schema_version": 1, "updates": [{"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false}], "notified": true, "offline": false}
+{"schema_version": 1, "updates": [{"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "exec_arguments": "%F"}], "notified": true, "offline": false}
 ```
 
 Second run with no change: same shape, `"notified": false`.
@@ -394,6 +406,12 @@ No arguments prints usage and exits **2**.
 | `manager` | string or null | Update manager name (`StaticFileUpdater`, `GithubUpdater`, `GitlabUpdater`, `CodebergUpdater`, `ForgejoUpdater`) or `null` when no source exists |
 | `embedded_source` | boolean | True when the source comes from the AppImage's embedded `.upd_info` string (false for custom configs and for no source) |
 | `running` | boolean | True when the AppImage is currently running (via `ps -eo exe` **or** as the mount source of a `fuse.*` mount in `/proc/mounts`) |
+| `exec_arguments` | string | The desktop entry's `Exec=` arguments, e.g. `"--no-sandbox %U"` or `"%U"`; `""` when the app has none. The desktop field codes (`%f %F %u %U %i %c %k`) stay **verbatim** — stripping them is the UI's job. The current desktop entry wins; when it carries no arguments, the install-time `default_exec_arguments` from `apps.ini` is used instead |
+
+> `exec_arguments` is an **additive** key: every other key keeps its
+> meaning, and a reader that ignores unknown keys (the QML layer does)
+> is unaffected — the same way `manager` / `embedded_source` /
+> `download_size` were added. `schema_version` therefore stays **1**.
 
 ### `--list-installed --json`
 
@@ -405,7 +423,7 @@ Real example output (app with an embedded `gh-releases-zsync` string; the
 custom-config case looks the same with `embedded_source: false`):
 
 ```json
-{"schema_version": 1, "installed": [{"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "GithubUpdater", "embedded_source": true, "running": false}]}
+{"schema_version": 1, "installed": [{"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "GithubUpdater", "embedded_source": true, "running": false, "exec_arguments": "%F"}]}
 ```
 
 Empty list:

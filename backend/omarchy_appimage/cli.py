@@ -57,6 +57,8 @@ Commands:
   --remove <target>        Trash an AppImage, its .desktop file and its
                            icon; <target> may be the AppImage path, the
                            desktop id (e.g. neovim.desktop) or the app name
+                           (a stale record whose .desktop file is gone is
+                           removed by its desktop id too)
   --list-updates           Check every installed app that has an update
                            source for a new release
   --update <target>        Download and install an update (--keep-both
@@ -160,6 +162,9 @@ def _make_app_json(el, manager=None, running=None) -> dict:
         'manager': manager.name if manager else None,
         'embedded_source': bool(manager and manager.embedded),
         'running': running,
+        # the desktop entry's Exec arguments (field codes stay VERBATIM —
+        # the UI strips them), "" when the app has none
+        'exec_arguments': getattr(el, 'exec_arguments', '') or '',
     }
 
 
@@ -186,6 +191,18 @@ def _resolve_target(target: str):
 
     # 3. desktop-file name, case-insensitive
     for el in installed:
+        if el.name.lower() == target.lower():
+            return el
+
+    # 4. a stale record: its .desktop file is gone, so list_installed()
+    #    cannot know it — but the record in apps.ini still names the
+    #    AppImage, and the user must be able to reclaim it explicitly.
+    for el in appimage_provider.list_stale_records():
+        if el.file_path == target:
+            return el
+        if el.desktop_file_path and \
+                os.path.basename(el.desktop_file_path) == wanted + '.desktop':
+            return el
         if el.name.lower() == target.lower():
             return el
 
