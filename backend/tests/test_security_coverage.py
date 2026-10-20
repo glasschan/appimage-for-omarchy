@@ -60,6 +60,12 @@ REQUIRED_SCENARIOS = [
      [{'oversize'}, {'over_cap'}, {'max_size'}], False),
     ('process-group cleanup: killpg reaps grandchildren, no orphans',
      [{'killpg'}, {'process_group'}], False),
+    ('ticket 26: the running-app guard signals nothing without the '
+     '--kill-running grant (no silent process kills)',
+     [{'signalled', 'without', 'kill_running'}], False),
+    ('ticket 26: the grant is re-checked before the atomic replace, so a '
+     'process relaunched during the download is closed too',
+     [{'rechecks', 'before', 'replace'}], False),
     ('env kill switch stays dead (no ALLOW_LOCAL re-entry)',
      [{'allow_local'}, {'environ'}, {'env_var'}], False),
     ('shell source stays constant under hostile runtime dir (round 3: '

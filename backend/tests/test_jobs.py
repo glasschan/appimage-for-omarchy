@@ -434,7 +434,7 @@ class AsyncJobCliTests(InProcessCliMixin, FakeXDGTestCase):
         # alive for the job's whole life)
         spawn.assert_called_once_with('fakeapp.desktop', 'fakeapp',
                                       keep_both=False, force=False,
-                                      log_fd=mock.ANY)
+                                      log_fd=mock.ANY, kill_running=False)
 
     def test_job_started_plain_text(self):
         with mock.patch.object(cli, '_spawn_update_job',

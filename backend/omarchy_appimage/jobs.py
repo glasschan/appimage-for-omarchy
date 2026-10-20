@@ -292,9 +292,17 @@ class JobWriter:
         self._write()
 
     def finish(self, status: str, message: str, new_version: str = None,
-               downloaded_bytes: int = None, error: str = None):
+               downloaded_bytes: int = None, error: str = None,
+               force_quit: dict = None):
         """Terminal rewrite: phase `done` (status updated / up-to-date /
-        skipped-running) or `error` (status error, text in `error`)."""
+        skipped-running) or `error` (status error, text in `error`).
+
+        `force_quit` is the additive ticket-26 record of the processes
+        that had to be closed for the update ({"count": int,
+        "sigkill": bool}); it is written ONLY when something was actually
+        closed, so a document that never touched a process keeps its
+        original key set. `schema_version` stays 1 and no phase or status
+        value is added."""
         phase = 'error' if status == 'error' else 'done'
         with self._lock:
             self._doc['phase'] = phase
@@ -306,6 +314,10 @@ class JobWriter:
                 self._doc['downloaded_bytes'] = int(downloaded_bytes)
             if error is not None:
                 self._doc['error'] = error
+            if force_quit:
+                self._doc['force_quit'] = {'count': int(force_quit['count']),
+                                           'sigkill': bool(
+                                               force_quit['sigkill'])}
             if phase == 'done':
                 self._doc['progress'] = 1.0
         self._write()

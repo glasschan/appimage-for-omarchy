@@ -101,7 +101,7 @@ def _resolve_install_names(source_basename: str, desktop_name, version: str,
 resolve_install_names = _resolve_install_names
 
 
-def _atomic_install(src: str, dest: str, mode: int):
+def _atomic_install(src: str, dest: str, mode: int, before_replace=None):
     """Descriptor-safe install of `src` at `dest` (marketplace review).
 
     The bytes land in a fresh temp file next to `dest` (created
@@ -112,7 +112,14 @@ def _atomic_install(src: str, dest: str, mode: int):
     replaced instead of written through, and a crash can never leave a
     truncated AppImage behind. The source is the user's own chosen file:
     its final component is resolved with realpath first (following a
-    symlink there is correct), then opened O_NOFOLLOW."""
+    symlink there is correct), then opened O_NOFOLLOW.
+
+    `before_replace` is the narrow seam for the running-app grant (ticket
+    26): it is called once, right before os.replace(), with the complete
+    but not yet visible temp file on disk. It defaults to None, so every
+    caller that does not pass one behaves exactly as before; an exception
+    from it aborts the install and the temp file is removed like any other
+    failure."""
     try:
         if stat.S_ISDIR(os.lstat(dest).st_mode):
             raise InternalError(f'refusing to install over a directory: '
@@ -139,6 +146,8 @@ def _atomic_install(src: str, dest: str, mode: int):
             os.fchmod(out.fileno(), mode)
             out.flush()
             os.fsync(out.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(tmp_path, dest)
     except BaseException:
         for open_fd in (fd, src_fd):
@@ -482,9 +491,16 @@ class AppImageProvider():
             el.name = extracted.desktop_entry.getName()
             el.version = extracted.desktop_entry.get('X-AppImage-Version')
 
-    def install_file(self, el: AppImageListElement):
+    def install_file(self, el: AppImageListElement, before_replace=None):
         """Ported from AppImageProvider.install_file (naming, conflict
-        resolution and desktop entry rewriting follow upstream)."""
+        resolution and desktop entry rewriting follow upstream).
+
+        `before_replace` is forwarded to the AppImage's own
+        _atomic_install only (never to the icon write): it is the last
+        moment before the new file becomes visible at its final name, so
+        an update that was granted permission to close the running app
+        can close whatever was (re)started during the download. Default
+        None keeps every existing caller byte-identical."""
         logging.info('Installing appimage: %s', el.file_path)
         el.installed_status = InstalledStatus.INSTALLING
         appimages_destination_path = self._get_appimages_default_destination_path()
@@ -517,7 +533,8 @@ class AppImageProvider():
                                           appimage_filename)
         original_appimage_path = extracted_appimage.appimage_file
 
-        _atomic_install(original_appimage_path, dest_appimage_file, 0o755)
+        _atomic_install(original_appimage_path, dest_appimage_file, 0o755,
+                        before_replace=before_replace)
         logging.debug('file copied to %s', appimages_destination_path)
 
         el.file_path = dest_appimage_file
@@ -638,7 +655,8 @@ class AppImageProvider():
         el.updating_from = None
 
     def update_from_url(self, manager, el: AppImageListElement,
-                        keep_both=False, progress_cb=None) -> AppImageListElement:
+                        keep_both=False, progress_cb=None,
+                        before_replace=None) -> AppImageListElement:
         """Download an update through `manager` and install it over `el`.
 
         Ported from AppImageProvider.update_from_url with the Gio.File
@@ -654,7 +672,10 @@ class AppImageProvider():
           * `keep_both` lets the caller pick AppImageUpdateLogic.KEEP —
             upstream's CLI path always installs with REPLACE;
           * on success we only clear updating_from here, update_logic is
-            left set so callers can tell KEEP from REPLACE installs.
+            left set so callers can tell KEEP from REPLACE installs;
+          * `before_replace` is handed to install_file (see there): the
+            running-app grant of ticket 26 needs one hook immediately
+            before the atomic replace.
         Raises InternalError when the download is not an AppImage."""
         dest_dir = extractor.new_temp_dir(prefix='appimage-update-')
         update_file_path = manager.download(dest_dir, progress_cb)
@@ -669,7 +690,7 @@ class AppImageProvider():
         list_element.update_logic = (AppImageUpdateLogic.KEEP if keep_both
                                      else AppImageUpdateLogic.REPLACE)
         list_element.updating_from = el
-        self.install_file(list_element)
+        self.install_file(list_element, before_replace=before_replace)
 
         list_element.updating_from = None
 
