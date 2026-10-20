@@ -62,6 +62,11 @@ Panel {
   // F7 downloads can be a full AppImage; the backend replaces the file in
   // place, so the watchdog must outlast the transfer, not the UI.
   readonly property int updateTimeoutMs: 600000
+  // --pick-file: the backend bounds probe + portal dialog + zenity under
+  // one 600 s whole-operation deadline (CONTRACT.md); the watchdog matches
+  // it instead of undercutting it, so a slow portal is never reaped while
+  // the backend still considers the dialog alive.
+  readonly property int pickTimeoutMs: 600000
   // How long the two-click remove confirmation stays armed.
   readonly property int confirmResetMs: 4000
   // Grace before the post-launch refresh so `ps` can see the new process.
@@ -113,6 +118,7 @@ Panel {
   property var items: []
   property bool busyList: false
   property bool busyIntegrate: false
+  property bool busyPick: false
   property bool busyRemove: false
   property bool busyUpdates: false
   // desktop_id of the in-flight --update ("" when idle) — rows compare it
@@ -124,8 +130,9 @@ Panel {
 
   // Integrate picker (F2): Quickshell has no FileDialog type (checked
   // against /usr/lib/qt6/qml/Quickshell — no dialog types ship with it),
-  // so the picker is a path field plus AppImages found in ~/Downloads and
-  // ~/downloads.
+  // so the picker is a path field, a Browse button backed by the backend's
+  // crash-isolated --pick-file dialog (portal first, zenity fallback), and
+  // AppImages found in ~/Downloads and ~/downloads.
   property bool pickerOpen: false
   property string pickerPath: ""
   property var pickerFiles: []
@@ -220,6 +227,7 @@ Panel {
     items = Model.state.items.slice()
     busyList = Model.state.busy.list === true
     busyIntegrate = Model.state.busy.integrate === true
+    busyPick = Model.state.busy.pick === true
     busyRemove = Model.state.busy.remove === true
     busyUpdates = Model.state.busy.updates === true
     updatingId = String(Model.state.busy.update || "")
@@ -694,7 +702,11 @@ Panel {
       closeSourceEditor()
       return
     }
-    pickerOpen = false
+    // A browse in flight keeps the picker card (closePicker guards it);
+    // opening settings under it would recreate the width/focus fight the
+    // cards' mutual exclusion exists to prevent.
+    if (Model.state.busy.pick) return
+    closePicker()
     settingsOpen = true
     mirrorEditFields()
     loadSettingsCard()
@@ -941,6 +953,11 @@ Panel {
   }
 
   function closePicker() {
+    // A browse in flight owns the card: its answer lands in pickerPath, so
+    // the card must not be dismissed out from under the pending dialog.
+    // Idempotent-open paths (openPicker, settings toggling back) are
+    // unaffected; the dialog itself is bounded by the pick watchdog.
+    if (Model.state.busy.pick) return
     pickerOpen = false
   }
 
@@ -969,6 +986,66 @@ Panel {
       }
     }
     pickerFiles = picks
+  }
+
+  // F2 browse: run --pick-file through the shared watchdog plumbing. The
+  // backend orchestrates a crash-isolated native dialog (portal first,
+  // zenity fallback) under its own 600 s whole-operation deadline; result
+  // mapping per CONTRACT.md — picked (exit 0 + path) fills the field,
+  // cancelled/unavailable are exit-0 statuses, typed errors (reason key)
+  // and a watchdog overrun surface through reportFailure like every other
+  // backend failure. A busy browse is a no-op (and the Go/Downloads paths
+  // are disabled meanwhile), so the dialog can never stack.
+  function browseForFile() {
+    if (Model.state.busy.pick) return
+    if (Model.state.busy.integrate) return
+    if (backendCommand.length === 0) {
+      Model.setError(strings.backendMissing)
+      syncFromModel()
+      return
+    }
+    Model.clearError()
+    Model.setBusy("pick", true)
+    Model.setStatus(strings.pickerBrowsing)
+    syncFromModel()
+    callBackend(["--pick-file", "--json"], { timeoutMs: pickTimeoutMs },
+        function(result) {
+      Model.setBusy("pick", false)
+      if (result.ok) {
+        var pick = Model.parsePickJson(result.stdout)
+        if (pick.result === "picked" && pick.path !== "") {
+          Model.clearStatus()
+          pickerPath = pick.path
+          syncFromModel()
+          focusPickerField()
+          return
+        }
+        if (pick.result === "cancelled") {
+          Model.setStatus(strings.pickCanceled)
+        } else if (pick.result === "unavailable") {
+          // The backend's own copy wins; the local string is the fallback.
+          // Status, not error: the path field keeps working exactly as
+          // before (this is today's UX, not a failure).
+          Model.setStatus(pick.message !== "" ? pick.message
+            : strings.pickerUnavailable)
+        } else {
+          Model.setError(pick.result === "error" && pick.error !== ""
+            ? pick.error : strings.pickerPickFailed)
+        }
+      } else {
+        reportFailure(result, "pick-file")
+      }
+      syncFromModel()
+    })
+  }
+
+  // Put focus into the picker's path field (Loader-created — it exists
+  // only while the card is open) so a picked path can be integrated with
+  // Enter right away. Defensive: a browse that outlived the card is a
+  // quiet store update.
+  function focusPickerField() {
+    var field = pickerFieldLoader.item
+    if (field) field.forceActiveFocus()
   }
 
   Component.onCompleted: {
@@ -1206,7 +1283,8 @@ Panel {
     interval: 10000
     repeat: true
     running: root.opened && !root.busyList && !root.busyIntegrate && !root.busyRemove
-      && !root.busyUpdates && root.updatingId === "" && !root.settingsBusy && !root.sourceBusy
+      && !root.busyPick && !root.busyUpdates && root.updatingId === ""
+      && !root.settingsBusy && !root.sourceBusy
     onTriggered: root.refresh()
   }
 
@@ -1670,14 +1748,30 @@ Panel {
                 Loader {
                   id: pickerFieldLoader
                   active: root.pickerOpen
-                  width: parent.width - pickerGoButton.width - Style.spacing.xs
+                  width: parent.width - pickerGoButton.width
+                    - pickerBrowseButton.width - Style.spacing.xs * 2
                   sourceComponent: pickerFieldComp
+                }
+
+                Button {
+                  id: pickerBrowseButton
+                  text: root.busyPick ? root.strings.pickerBrowsing
+                    : root.strings.pickerBrowse
+                  enabled: !root.busyPick && !root.busyIntegrate
+                  anchors.verticalCenter: parent.verticalCenter
+                  foreground: root.foreground
+                  accent: Color.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  implicitHeight: root.controlHeight
+                  onClicked: root.browseForFile()
                 }
 
                 Button {
                   id: pickerGoButton
                   text: root.busyIntegrate ? root.strings.integrateWorking : root.strings.pickerGo
-                  enabled: !root.busyIntegrate && root.pickerPath.trim() !== ""
+                  enabled: !root.busyIntegrate && !root.busyPick
+                    && root.pickerPath.trim() !== ""
                   anchors.verticalCenter: parent.verticalCenter
                   foreground: root.foreground
                   accent: Color.accent
@@ -1722,7 +1816,7 @@ Panel {
                       accent: Color.accent
                       fontFamily: root.fontFamily
                       fontSize: Style.font.caption
-                      enabled: !root.busyIntegrate
+                      enabled: !root.busyIntegrate && !root.busyPick
                       onClicked: root.integratePath(modelData.path)
                     }
                   }

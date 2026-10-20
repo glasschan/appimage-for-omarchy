@@ -5,7 +5,8 @@
 [![CI](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml/badge.svg)](https://github.com/glasschan/appimage-for-omarchy/actions/workflows/ci.yml)
 
 Manage AppImages from the Omarchy bar: integrate new ones into your app
-menu — from a local file or straight from a release URL — see what is
+menu — from a local file (through a Browse dialog or a pasted path) or
+straight from a release URL — see what is
 installed (and running), launch, update, and remove them — all in a
 native Quickshell panel. No daemon, no extra runtime: the
 panel is plain QML and the backend is a Python-stdlib CLI that runs only
@@ -134,6 +135,7 @@ The QML layer talks to `backend/main.py` over a stable JSON contract
 python3 backend/main.py --list-installed --json
 python3 backend/main.py --integrate /path/to/App.AppImage --yes --json
 python3 backend/main.py --integrate https://github.com/<owner>/<repo>/releases/download/<tag>/<file> --yes --json
+python3 backend/main.py --pick-file --json
 python3 backend/main.py --remove <desktop-id> --yes --json
 python3 backend/main.py --list-updates --json
 python3 backend/main.py --update <desktop-id> --yes --json
@@ -150,6 +152,22 @@ stderr); `--json` requires `--yes` for integrate/remove/update.
 `--get-update-source` reads a configured source back — the configured
 manager + config, or `no-source` — which is what the panel's source
 editor pre-fills from when it opens.
+
+### Integrate picker
+
+The Integrate card takes a pasted path or release URL, quick-picks from
+`~/Downloads`, or a **Browse…** button. Browse runs `--pick-file`: the
+backend opens a native single-file, AppImage-filtered dialog — the
+desktop portal first, `zenity` as the fallback — orchestrating it as an
+isolated child process under one absolute 600 s whole-operation
+deadline, so a crashed or hung dialog can never take the panel down.
+A picked file fills the panel's path field ready to integrate; a cancel
+is a quiet notice; a missing file chooser reports itself and the
+paste-a-path flow keeps working exactly as before. Timeout and dialog
+failures surface as dismissible banners. The result documents
+(`picked` / `cancelled` / `unavailable`, typed `timeout` /
+`backend-failed` / `not-local` errors) are mapped defensively and
+pinned by `tests-js/parse-harness.mjs`.
 
 ### Install from a URL
 
