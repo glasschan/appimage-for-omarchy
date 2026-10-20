@@ -1,6 +1,7 @@
 # pick_file.py — crash-isolated native file dialog for --pick-file.
 #
-# Test suite written for this plugin (spec #14 / ticket #16).
+# Original code written for this plugin (spec #14 / ticket #16),
+# GPL-3.0 (same license as the plugin; see LICENSE).
 #
 # The backend never dialogs in-process: it ORCHESTRATES a dialog that
 # lives in child processes, so a crashed or hung dialog can never take
