@@ -242,14 +242,19 @@ Downloads the new release through the app's update source and installs it.
   script) gets the result straight away with a message that names the fix:
   `... was skipped because the application is running; pass
   --kill-running to close it and update, or --force to replace it in
-  place`.
+  place`. `--keep-both` is exempt: it installs beside the running file,
+  so the guard neither asks nor skips (see its bullet below).
 - **The availability check comes first.** The target is asked whether
   there is anything to install *before* any process is touched: a
   `up-to-date` target returns exit 0 with result `up-to-date`, never
   closes the app (not even with `--kill-running`), never asks the
   question and never records `force_quit`. When there *is* an update, the
   close still happens **before the download starts**, so nothing is
-  ever downloaded for an app that cannot be replaced.
+  ever downloaded for an app that cannot be replaced. When the check
+  itself cannot run (no reachable source) the refusal needs no knowledge
+  of the update, so a non-interactive, no-grant run still answers
+  `skipped-running`; a granted run, or one that would ask the question,
+  propagates the error instead of silently skipping.
 - **`--kill-running` vs `--force`** — the two ways past that guard, and
   they differ in exactly one respect: whether the running app is closed.
   - `--kill-running` closes the app, then updates, and **never asks**:
@@ -293,8 +298,10 @@ Downloads the new release through the app's update source and installs it.
   together with `--kill-running` accepts the flag but **closes nothing**:
   the new file lands beside the running one and `os.replace` never touches
   the running app's path, so both the job-start quit and the pre-replace
-  hook are skipped and the document carries no `force_quit`. The running
-  guard still applies when neither flag is given.
+  hook are skipped and the document carries no `force_quit`. The guard
+  itself is skipped too — no question, no `skipped-running` — because
+  nothing is replaced under the running app; without `--keep-both` the
+  guard applies exactly as documented above.
 - On success the app's entry in `updates-state.json` is cleared so the next
   `--fetch-updates` does not re-notify for the now-installed release.
 

@@ -1325,11 +1325,15 @@ def run_update(target: str, keep_both: bool = False,
         download_size is available), 'replacing' after the download and
         its digest verification returned (via _ManagerStageProxy).
 
-    Running-app guard (ticket 26). The availability check runs FIRST, so
-    an update that does not exist never costs the user their running app
-    (status `up-to-date`, no process touched, no force_quit). When an
-    update DOES exist, three modes decide what happens, and only two of
-    them signal anything:
+    Running-app guard (ticket 26). The availability check runs before
+    anything can touch a process, so an update that does not exist never
+    costs the user their running app (status `up-to-date`, no process
+    touched, no question asked, no force_quit). The one answer that needs
+    no knowledge of the update — "it is running and nobody agreed to
+    close it" — is decided even earlier, so the documented
+    skipped-running refusal still arrives on a machine that cannot reach
+    the update source. When an update DOES exist, three modes decide what
+    happens, and only two of them signal anything:
       * neither a grant nor consent → the `skipped-running` result,
         untouched, and no process is signalled;
       * `kill_running=True` (--kill-running) → an unconditional grant for
@@ -1366,23 +1370,45 @@ def run_update(target: str, keep_both: bool = False,
         raise OperationError('No update method was found for this AppImage '
                              '(set one with --set-update-source)')
 
-    # A: the availability decision comes FIRST. Closing (or refusing for)
-    # the running app for an update that turns out not to exist is the
-    # worst possible trade — the user loses the app and gains nothing.
-    # tri-state: None (state not determinable) still attempts the download
-    if manager.is_update_available() is False:
-        return UpdateResult(status='up-to-date', el=el, manager=manager)
-
     sink = force_quit_sink if force_quit_sink is not None else {}
     force_quit = None
-    # C: --keep-both writes beside the running app, never over it
+    # C: --keep-both writes beside the running app, never over it, so that
+    # combination asks nothing, closes nothing and never skips.
     replaces_in_place = not keep_both
     granted = kill_running and replaces_in_place
-    if kill_running and replaces_in_place:
-        force_quit = _close_running_app(el.file_path, 'the update start',
-                                        probe, sink)
-    elif not kill_running and not force \
-            and appimage_provider.is_app_running(el):
+
+    # The running-app answer, asked once (one process scan, not two):
+    # only a replace-in-place without a grant needs it.
+    needs_consent = replaces_in_place and not kill_running and not force
+    running = (needs_consent and appimage_provider.is_app_running(el)) or False
+    # A: the availability decision comes before anything can touch the
+    # process. Closing (or asking to close) the running app for an update
+    # that turns out not to exist is the worst possible trade — the user
+    # loses the app, or answers a pointless question, and gains nothing.
+    # tri-state: None (state not determinable) still attempts the download
+    try:
+        available = manager.is_update_available()
+    except Exception:
+        # The check needs the source; a refusal that does not need it must
+        # still be answerable when the source cannot be reached. Only the
+        # non-interactive no-grant case (the answer is the same with or
+        # without an update) degrades to skipped-running; everything else
+        # keeps raising exactly as before.
+        if running and confirm_close is None:
+            return UpdateResult(
+                status='skipped-running', el=el, manager=manager,
+                message=(f'{el.file_path} was skipped because the '
+                         'application is running; pass --kill-running to '
+                         'close it and update, or --force to replace it in '
+                         'place'))
+        raise
+    if available is False:
+        return UpdateResult(status='up-to-date', el=el, manager=manager)
+
+    if running:
+        # the user said yes: same grant as --kill-running, and only now,
+        # with an update actually available; a caller that cannot ask
+        # (non-TTY, --json, --yes) refuses here, after the check
         if confirm_close is None or not confirm_close(el):
             return UpdateResult(
                 status='skipped-running', el=el, manager=manager,
@@ -1390,8 +1416,9 @@ def run_update(target: str, keep_both: bool = False,
                          'application is running; pass --kill-running to '
                          'close it and update, or --force to replace it in '
                          'place'))
-        # the user said yes: same grant as --kill-running
         granted = True
+
+    if granted:
         force_quit = _close_running_app(el.file_path, 'the update start',
                                         probe, sink)
 

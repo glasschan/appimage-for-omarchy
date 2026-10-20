@@ -206,6 +206,26 @@ class RunUpdateKillTests(_RunningAppTestCase):
         self.assertEqual(asked.call_count, 0)
         self.assertEqual(self.probe.sent, [])
 
+    def test_an_unreachable_source_still_answers_skipped_running(self):
+        # the refusal needs no knowledge of the update, so a failing
+        # availability check must not turn it into a network error
+        self.manager.is_update_available.side_effect = \
+            cli.OperationError('could not reach the release feed')
+        result = self._run()
+        self.assertEqual(result.status, 'skipped-running')
+        self.assertEqual(self.probe.sent, [])
+        self.assertEqual(self.installs, [])
+
+    def test_an_unreachable_source_still_raises_when_it_matters(self):
+        # with a grant (or a question to ask) the check is load-bearing:
+        # the error must not be swallowed into a silent skip
+        self.manager.is_update_available.side_effect = \
+            cli.OperationError('could not reach the release feed')
+        with self.assertRaises(cli.OperationError):
+            self._run(kill_running=True)
+        self.assertEqual(self.probe.sent, [])
+        self.assertEqual(self.installs, [])
+
     # -------------------------------------------------- finding C / G5
 
     def test_keep_both_with_kill_running_never_signals(self):

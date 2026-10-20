@@ -318,7 +318,8 @@ non-interactive. If a target process cannot be closed (its signal is
 refused, or it ignores `SIGTERM` and `SIGKILL`), the job stops with an
 error naming the surviving pid(s) instead of replacing the file behind
 a live app. `--keep-both` never closes anything: it installs a second
-file beside the running one, so `--kill-running` adds nothing there.
+file beside the running one, so `--kill-running` adds nothing there and
+the running guard neither asks nor skips.
 `--force` is the opposite and unchanged: replace the AppImage under the
 running app, closing nothing.
 
