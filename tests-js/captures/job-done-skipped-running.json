@@ -1,0 +1,15 @@
+{
+  "desktop_id": "fakeapp.desktop",
+  "downloaded_bytes": 0,
+  "error": null,
+  "heartbeat": 1792494753.6947136,
+  "message": "/tmp/omarchy-appimage-test-hkh3gd54/home/AppImages/fakeapp.appimage was skipped because the application is running; use --force to override",
+  "new_version": null,
+  "phase": "done",
+  "pid": 3102379,
+  "progress": 1.0,
+  "schema_version": 1,
+  "started": 1792494753.6617417,
+  "status": "skipped-running",
+  "total_bytes": null
+}

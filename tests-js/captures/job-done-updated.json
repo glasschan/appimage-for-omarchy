@@ -1,0 +1,15 @@
+{
+  "desktop_id": "fakeapp.desktop",
+  "downloaded_bytes": 10996216,
+  "error": null,
+  "heartbeat": 1792494753.7783785,
+  "message": "/tmp/omarchy-appimage-test-r1981u7t/home/AppImages/fakeapp.appimage was updated successfully",
+  "new_version": "v0.11.3",
+  "phase": "done",
+  "pid": 3102379,
+  "progress": 1.0,
+  "schema_version": 1,
+  "started": 1792494753.705237,
+  "status": "updated",
+  "total_bytes": 106
+}
