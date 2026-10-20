@@ -4,6 +4,8 @@
 # Test suite written for this plugin. Every process in here is a fake: the
 # CLI-level tests swap procs._PROBE for test_procs.FakeProbe, so not one
 # real pid is ever signalled.
+#
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 
 import io
 import json

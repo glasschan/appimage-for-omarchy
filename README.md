@@ -299,6 +299,18 @@ running its Remove button stays disabled — the job installs over that
 AppImage, so removing it mid-flight would leave the new release with no
 target (the armed "Remove?" confirm honours the same block).
 
+A running app is the one exception to that one-click flow: **Update**
+asks first, naming the app and how many processes the confirm will
+close, and spawns nothing until you confirm (`Enter`; `Esc` cancels).
+The panel then starts the job with the `--kill-running` grant — the
+backend closes the app when the job starts and again immediately before
+it replaces the file, records the close as `force_quit` in the job
+document, and the done banner says the app was closed. From a terminal
+`--update` asks the same question, while a script gets `skipped-running`
+(its message names `--kill-running`) unless it passes the flag itself.
+`--force` is the opposite and unchanged: replace the AppImage under the
+running app, closing nothing.
+
 ## Plugin layout
 
 ```
@@ -327,6 +339,22 @@ named after the plugin id), and publishes a GitHub Release with
 auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
+
+### 0.9.0
+
+- Updating a **running** app now asks first: the row's Update button
+  names the app and how many processes will be closed, and starts
+  nothing until you confirm (Enter confirms, Esc cancels). The app is
+  closed when the job starts and again right before the new release
+  replaces the old file, so a process relaunched during the download is
+  closed too.
+- `--kill-running` is the CLI half of that consent: on a terminal
+  `--update` asks the same question, and a script gets `skipped-running`
+  whose message names the flag. `--force` keeps its meaning — replace
+  the file while the app keeps running, close nothing.
+- The `running` column is right on real hosts again: the FUSE-mount
+  lookup compared an absolute AppImage path against a `/proc/mounts`
+  source field that only ever holds the basename, so it never matched.
 
 ### 0.8.0
 
