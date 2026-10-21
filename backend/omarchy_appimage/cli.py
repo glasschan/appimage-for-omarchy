@@ -723,6 +723,16 @@ def cmd_integrate(args: list) -> int:
 
         list_element = appimage_provider.create_list_element_from_file(file_path)
         if appimage_provider.is_installed(list_element):
+            # already integrated: nothing is installed. When the URL names a
+            # release tag and the installed entry states no version of its
+            # own, record it there (metadata repair only, v0.9.4) —
+            # re-integrating the same URL is otherwise a dead end for an
+            # install made before the plugin knew how to fill it in.
+            if url_kind and appimage_provider.apply_version_to_installed(
+                    list_element, (url_info or {}).get('version', '')):
+                logging.info('recorded release version %s on the installed '
+                             '%s', list_element.version,
+                             list_element.file_path)
             message = 'This AppImage is already integrated'
             if json_output:
                 _print_json({

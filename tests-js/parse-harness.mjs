@@ -1550,8 +1550,12 @@ check("title keeps a parenthetical that is not the version",
   rowName("Foo (Fork)", "2.0") === "Foo (Fork)", rowName("Foo (Fork)", "2.0"))
 check("title keeps a version-shaped suffix when no version is reported",
   rowName("Orca (1.4.237)", null) === "Orca (1.4.237)")
-check("title drops a hash suffix only when nothing matches",
-  rowName("App (abcdef)", "1.0") === "App (abcdef)")
+check("title drops a hash suffix even once a real version is known",
+  rowName("App (abcdef)", "1.0") === "App", rowName("App (abcdef)", "1.0"))
+check("title keeps a parenthetical that is not hash-shaped",
+  rowName("App (Fork)", "1.0") === "App (Fork)")
+check("title keeps a long hex parenthetical that is not the hash shape",
+  rowName("App (abcdefa)", "1.0") === "App (abcdefa)")
 
 rmSync(sandbox, { recursive: true, force: true })
 

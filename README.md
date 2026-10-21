@@ -352,6 +352,16 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.9.5
+
+- An app integrated before 0.9.4 gets its version without waiting for a
+  newer release: re-integrating the same URL is still a no-op install, but
+  it now records the release tag the URL names on the already-installed app
+  (`already-integrated` reports the new name/version). A leftover md5
+  artifact in an old display name (`Terax (77efdf)`) is cleaned off at the
+  same time — and the panel strips a hash-shaped suffix from a row's title
+  even when a real version is now known, so a legacy install reads plainly.
+
 ### 0.9.4
 
 - An AppImage that ships no `X-AppImage-Version` now gets the version it

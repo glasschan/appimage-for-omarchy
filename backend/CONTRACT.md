@@ -136,6 +136,17 @@ wins. `--update` does the same with the tag of the release its manager just
 downloaded (`provider.update_from_url`), which also repairs an install made
 by an older version of the plugin.
 
+**Re-integrating an already-installed URL (v0.9.5).** `already-integrated`
+still installs nothing, but when the URL names a tag and the installed
+desktop entry states no `X-AppImage-Version`, that tag is written into the
+installed entry (`provider.apply_version_to_installed`) — metadata only, the
+AppImage is untouched — together with a repair of a leftover GearLever md5
+suffix in the display name (`Terax (77efdf)` → `Terax`). This is the only
+way an install made before v0.9.4 gains its version without a newer release
+to update to, and the `app` object in the `already-integrated` document
+reports the resulting name/version. An entry that already has a version is
+never touched, so the call stays idempotent.
+
 **Relaxed digest rule (deliberate deviation, `--integrate <url>` only).**
 For the verbs in this section a cryptographic digest is verified whenever
 the source publishes one — GitHub `sha256:` (required) and a `.zsync`

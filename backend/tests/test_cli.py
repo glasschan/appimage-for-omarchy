@@ -1312,6 +1312,45 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
         self.assertEqual(payload['installed'][0]['current_version'],
                          'v0.11.3')
 
+    def test_reintegrating_the_same_url_repairs_a_missing_version(self):
+        # An install made by an older plugin states no version, and an even
+        # older one baked GearLever's md5 artifact into the display Name.
+        # Re-integrating the same URL installs nothing, but it must repair
+        # that metadata: otherwise the app stays versionless until some
+        # later release happens to overwrite it.
+        self._patch_download_and_api()
+        out, err, code = self._integrate()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)['result'], 'integrated')
+
+        # degrade the install to what an older plugin would have left: no
+        # X-AppImage-Version at all, and the md5 hash in the display Name
+        installed = cli.appimage_provider.list_installed()[0]
+        desktop = Path(installed.desktop_file_path)
+        kept = [line for line in desktop.read_text().splitlines()
+                if not line.startswith('X-AppImage-Version=')]
+        desktop.write_text('\n'.join(
+            'Name=Neovim (77efdf)' if line.startswith('Name=') else line
+            for line in kept) + '\n')
+        self.assertIsNone(
+            cli.appimage_provider.list_installed()[0].version)
+
+        out, err, code = self._integrate()
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload['result'], 'already-integrated')
+        self.assertEqual(payload['app']['current_version'], 'v4.5.6')
+        self.assertEqual(payload['app']['name'], 'Neovim')
+
+        installed = cli.appimage_provider.list_installed()[0]
+        self.assertEqual(installed.version, 'v4.5.6')
+        self.assertEqual(installed.name, 'Neovim')
+
+        # idempotent: a second repair run changes nothing and still exits 0
+        out, err, code = self._integrate()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)['result'], 'already-integrated')
+
     def test_integrate_from_url_writes_the_release_tag_as_the_version(self):
         # End to end: an AppImage that states no version of its own gets
         # the tag the URL names, written into the installed desktop entry

@@ -16,6 +16,7 @@ import dataclasses
 import filecmp
 import logging
 import os
+import re
 import shlex
 import stat
 import tempfile
@@ -44,6 +45,12 @@ class InternalError(Exception):
     def __init__(self, message: str):
         super().__init__(message)
         self.message = message
+
+
+# A display Name ending in GearLever's md5-prefix "version" artifact, e.g.
+# "Terax (77efdf)": six lowercase hex chars, the same shape the plugin's
+# lib/Model.js displayName() strips for the panel.
+_HASH_SUFFIX_RE = re.compile(r'^(.*?) \(([0-9a-f]{6})\)$')
 
 
 def _resolve_install_names(source_basename: str, desktop_name, version: str,
@@ -522,6 +529,51 @@ class AppImageProvider():
         if el.desktop_entry is not None and el.desktop_entry is not entry:
             el.desktop_entry.set_custom('X-AppImage-Version', version)
         el.version = version
+        return True
+
+    def apply_version_to_installed(self, el: AppImageListElement,
+                                    version: str) -> bool:
+        """Record a release tag on an ALREADY integrated app that states no
+        version of its own (v0.9.4 follow-up).
+
+        Re-integrating the very same URL is a no-op (`already-integrated`,
+        nothing installed), so an app integrated by an older plugin — one
+        that predates apply_release_version, or simply carries no
+        X-AppImage-Version — would keep its blank version until a newer
+        release happened to arrive. When the pasted URL names a tag, write
+        it into the installed desktop entry instead: metadata only, the
+        AppImage itself is untouched. A leftover GearLever md5 suffix in
+        the display Name (`Terax (77efdf)`) is cleaned off at the same
+        time so the launcher and the panel agree. Returns whether anything
+        was written."""
+        version = (version or '').strip()
+        if not version:
+            return False
+        # `el` is the temp download whose file_path is_installed() just
+        # pointed at the managed copy; the installed element is the one that
+        # carries the desktop entry / desktop file path.
+        installed = next((a for a in self.list_installed()
+                          if a.file_path == el.file_path), None)
+        if installed is None or not installed.desktop_entry \
+                or not installed.desktop_file_path:
+            return False
+        if installed.desktop_entry.get('X-AppImage-Version'):
+            return False
+        entry = DesktopEntry(path=installed.desktop_file_path)
+        entry.set_custom('X-AppImage-Version', version)
+        name = entry.getName()
+        match = _HASH_SUFFIX_RE.match(name)
+        if match:
+            entry.Name.default_text = match.group(1).rstrip()
+        entry.write_file(installed.desktop_file_path)
+        installed.desktop_entry = DesktopEntry(path=installed.desktop_file_path)
+        installed.name = installed.desktop_entry.getName()
+        installed.version = installed.desktop_entry.get('X-AppImage-Version')
+        # the caller reports THIS element
+        el.desktop_entry = installed.desktop_entry
+        el.desktop_file_path = installed.desktop_file_path
+        el.name = installed.name
+        el.version = installed.version
         return True
 
     def install_file(self, el: AppImageListElement, before_replace=None):
