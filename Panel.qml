@@ -2990,46 +2990,37 @@ Panel {
                               width: parent.width
                             }
 
-                            Row {
-                              spacing: Style.spacing.xxs
-
-                              Text {
-                                visible: rowOuter.modelData.version !== ""
-                                text: rowOuter.modelData.version
-                                color: root.dim
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.caption
-                              }
-
-                              Text {
-                                visible: rowOuter.modelData.running
-                                text: "● " + root.strings.runningLabel
-                                color: Color.accent
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.caption
-                              }
-
-                              // F6: pending release, accent like the running dot.
-                              Text {
-                                visible: rowOuter.modelData.updateVersion !== ""
-                                text: Model.formatCount(rowOuter.modelData.updateVersion, root.strings.updateAvailable)
-                                color: Color.accent
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.caption
-                              }
-
-                              // F7 background job (ticket #11): live
-                              // progress for this row's running update —
-                              // percent plus a byte pair when the source
-                              // declared a payload-sized total. The
-                              // label exists only while the adopted
-                              // document says active.
-                              Text {
-                                visible: root.jobActive(rowOuter.modelData.id)
-                                text: root.jobProgressLabel(rowOuter.modelData.id)
-                                color: Color.accent
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.caption
+                            // Row meta as ONE bounded line: version ·
+                            // running · pending release · live progress.
+                            // Separate Texts in a Row painted over the
+                            // action buttons as soon as the fragments got
+                            // long (a version plus a pending release plus
+                            // a byte-pair progress label), so the segments
+                            // are colour-spanned into a single elided
+                            // StyledText instead.
+                            Text {
+                              width: parent.width
+                              visible: text !== ""
+                              textFormat: Text.StyledText
+                              elide: Text.ElideRight
+                              color: root.dim
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                              text: {
+                                var segs = Model.rowMeta(
+                                  rowOuter.modelData,
+                                  root.jobActive(rowOuter.modelData.id)
+                                    ? root.jobProgressLabel(rowOuter.modelData.id)
+                                    : "")
+                                var parts = []
+                                for (var i = 0; i < segs.length; i++) {
+                                  parts.push('<span style="color:'
+                                    + (segs[i].accent ? Color.accent : root.dim)
+                                    + '">'
+                                    + Model.escapeHtml(segs[i].text)
+                                    + "</span>")
+                                }
+                                return parts.join(" ")
                               }
                             }
 

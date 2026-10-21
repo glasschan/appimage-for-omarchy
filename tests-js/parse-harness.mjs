@@ -1308,6 +1308,47 @@ const adopt = (f, pidAlive, offsetSec) =>
     Model.forceQuitBody("a%1b", 2)
     === "a%1b is running — 2 processes will be closed to apply the update.")
 
+  // -- row meta line: one bounded, elided StyledText ----------------------
+  // The meta line used to be a Row of separate Texts, which painted over the
+  // row's action buttons as soon as the fragments got long (a version, a
+  // pending release and a byte-pair progress label). Model.rowMeta now owns
+  // the segment list, so the panel renders one spanned Text and this asserts
+  // the order, the accent flags and the escaping.
+  {
+    const item = Model.parseListJson(JSON.stringify({
+      schema_version: 1,
+      installed: [{ desktop_id: "o.desktop", name: "Orca",
+        path: "/x/orca.appimage", current_version: "1.4.235",
+        available_version: "v1.4.237", running: true }]
+    })).items[0]
+    const segs = Model.rowMeta(item, "0% · 0 B / 232.1 MB")
+    check("#row-meta: segments arrive in display order",
+      segs.map((s) => s.text).join("|") === "1.4.235|● running|⬆ v1.4.237 available|0% · 0 B / 232.1 MB",
+      segs.map((s) => s.text).join("|"))
+    check("#row-meta: only the version is quiet text",
+      segs.map((s) => s.accent).join(",") === "false,true,true,true",
+      segs.map((s) => s.accent).join(","))
+    check("#row-meta: no progress label means no progress segment",
+      Model.rowMeta(item, "").length === 3)
+    const quiet = Model.parseListJson(JSON.stringify({
+      schema_version: 1,
+      installed: [{ desktop_id: "q.desktop", name: "Quiet",
+        path: "/x/quiet.appimage", current_version: "2.1.2" }]
+    })).items[0]
+    check("#row-meta: a plain row is the version alone",
+      Model.rowMeta(quiet, "").length === 1
+      && Model.rowMeta(quiet, "").length === 1
+      && Model.rowMeta(quiet, "")[0].text === "2.1.2")
+    check("#row-meta: missing item yields no segments",
+      Model.rowMeta(null, "50%").length === 0
+      && Model.rowMeta(undefined, "").length === 0)
+    check("#row-meta: markup in user data is escaped, not interpreted",
+      Model.escapeHtml('<b>a & b</b>') === "&lt;b&gt;a &amp; b&lt;/b&gt;")
+    check("#row-meta: escapeHtml tolerates null/undefined/number",
+      Model.escapeHtml(null) === "" && Model.escapeHtml(undefined) === ""
+      && Model.escapeHtml(7) === "7")
+  }
+
   // running_pids rides the app normalization as a clamped int; the key is
   // additive, so an older capture (or backend) has none at all.
   const itemWith = (entry) => Model.parseListJson(JSON.stringify({
