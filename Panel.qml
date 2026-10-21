@@ -372,6 +372,14 @@ Panel {
     // Parked, not run: the cache-first refresh below may occupy the shared
     // backend process, and tryConsumePendingDrop waits that out.
     readDropPayload(payloadJson)
+    // Release flags a DESTROYED panel instance left behind before mirroring
+    // the store: closing the panel unloads this whole QML object, which
+    // SIGTERMs its backend child (the shell's kill is `running: false`) and
+    // so never runs the onDone callback that would have cleared the flag.
+    // `lib/Model.js` is engine-wide, so without this the "Integrating…" of a
+    // run that died with the last panel instance is permanent — and the
+    // busy guard then refuses every retry (see releaseOrphanedRuns).
+    Model.releaseOrphanedRuns()
     syncFromModel()
     // Settle the python3 state first: with it missing, refresh() below is
     // a no-op and the install card takes over the body instead.
@@ -785,7 +793,7 @@ Panel {
     }
     // Single flight with the background service — a sweep that started in
     // Service.qml wins and this click is a no-op.
-    if (!Model.claimUpdateCheck()) return
+    if (!Model.claimUpdateCheck("panel")) return
     Model.clearError()
     Model.setStatus(strings.checkingUpdates)
     syncFromModel()
@@ -1629,6 +1637,15 @@ Panel {
   }
 
   Component.onDestruction: {
+    // This instance is being destroyed and takes its backend child with it
+    // (panel close unloads the object → Process destroyed → python gets
+    // SIGTERM). A killed integrate can never write its own outcome, so say
+    // so: the next open explains the vanished download instead of showing
+    // a stuck spinner. The flags themselves are released by open()'s
+    // releaseOrphanedRuns().
+    if (Model.state.busy.integrate) {
+      Model.setError(strings.integrateInterrupted)
+    }
     if (unsubscribe) unsubscribe()
   }
 

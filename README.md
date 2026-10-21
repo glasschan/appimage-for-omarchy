@@ -352,6 +352,18 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.9.2
+
+- An integrate that was still running when the panel closed no longer
+  sticks: closing the panel unloads its QML object, which kills the
+  backend child mid-call, and the busy flag it left behind (the store
+  outlives the panel) made every later integrate refuse with
+  "Integrating…" on screen until the shell restarted. The flag is
+  released whenever the panel opens, and the interrupted run now says so
+  instead of vanishing. A killed `--integrate <url>` also skipped its
+  temp-dir cleanup, so the janitor sweeps those partial downloads
+  (`omarchy-integrate-*`) like it already swept update downloads.
+
 ### 0.9.1
 
 - A row's meta line (version, the running dot, a pending release, a

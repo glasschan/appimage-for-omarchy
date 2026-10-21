@@ -1494,6 +1494,45 @@ const adopt = (f, pidAlive, offsetSec) =>
   unsubJobs()
 }
 
+// ---- Model.releaseOrphanedRuns: a torn-down panel's run flags ---------------
+{
+  let announcements = 0
+  const unsubscribe = Model.subscribe(() => { announcements++ })
+  // The panel set the flag, then the panel QML object was destroyed (panel
+  // close) and its Process took the backend child with it — so the clear
+  // site inside onDone never ran and the flag survived the reload.
+  Model.setBusy("integrate", true)
+  Model.setStatus(Model.strings.integrateWorking)
+  check("orphaned integrate flag and status are in the store",
+    Model.state.busy.integrate === true
+      && Model.state.status === Model.strings.integrateWorking)
+  Model.releaseOrphanedRuns()
+  check("releaseOrphanedRuns clears the orphaned integrate flag",
+    Model.state.busy.integrate === false)
+  check("releaseOrphanedRuns drops the in-flight status line",
+    Model.state.status === "")
+  check("releaseOrphanedRuns announces to listeners", announcements > 0)
+  // The same orphan class on the update-check claim: without the release
+  // Service.qml's claimUpdateCheck() would fail for the shell's lifetime.
+  check("a claim is refused to a second caller",
+    Model.claimUpdateCheck("panel") === true
+      && Model.claimUpdateCheck("service") === false)
+  check("releaseOrphanedRuns releases a claim the PANEL took",
+    (Model.releaseOrphanedRuns(), Model.claimUpdateCheck("service") === true))
+  check("releaseOrphanedRuns keeps a claim the SERVICE took",
+    (Model.releaseOrphanedRuns(), Model.state.busy.updates === true
+      && Model.state.updatesChecking === true))
+  Model.setError("boom")
+  check("releaseOrphanedRuns keeps a real outcome",
+    (Model.releaseOrphanedRuns(), Model.state.lastError === "boom"))
+  check("the service claim still blocks, owner untouched",
+    Model.state.updateCheckOwner === "service")
+  Model.releaseUpdateCheck()
+  check("releaseUpdateCheck clears claim and owner",
+    Model.state.busy.updates === false && Model.state.updateCheckOwner === "")
+  unsubscribe()
+}
+
 rmSync(sandbox, { recursive: true, force: true })
 
 console.log(failures === 0 ? "\nALL PASS" : "\n" + failures + " FAILURES")

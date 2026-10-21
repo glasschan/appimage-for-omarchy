@@ -708,7 +708,7 @@ def cmd_integrate(args: list) -> int:
     tmp_cleanup = None
     if _is_url(target_arg or ''):
         url_kind, url_info = _classify_integrate_url(target_arg)
-        tmp_cleanup = tempfile.mkdtemp(prefix='omarchy-integrate-')
+        tmp_cleanup = tempfile.mkdtemp(prefix=janitor.INTEGRATE_TEMP_PREFIX)
 
     try:
         if url_kind:

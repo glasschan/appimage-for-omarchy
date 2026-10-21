@@ -52,10 +52,21 @@ JOB_ACK_WINDOW_SECONDS = 24 * 60 * 60
 # has a download dir well inside the grace window.
 UPDATE_TEMP_GRACE_SECONDS = 600
 
-# Only this prefix is ever swept from the temp area. Extraction dirs
-# (`gearlever_appimage_`, `unsquashfs-`, `bsdtar-`, anything else) are
+# Prefixes of temp dirs that may be swept from the temp area. Extraction
+# dirs (`gearlever_appimage_`, `unsquashfs-`, `bsdtar-`, anything else) are
 # never touched — they belong to a live process's registry.
-UPDATE_TEMP_PREFIX = 'appimage-update-'
+#
+# `appimage-update-` is provider.update_from_url's download dir (and the
+# legacy pre-async orphans). `omarchy-integrate-` is cmd_integrate's
+# per-run dir (cli.py mkdtemp — kept in lockstep through this constant):
+# a clean exit removes it in its `finally`, but a SIGNALLED child skips
+# that, and that is the normal case for the panel — closing the panel
+# unloads the panel QML object, which destroys the Quickshell Process and
+# SIGTERMs python mid-download, leaving a truncated multi-MiB AppImage in
+# the temp area with no process behind it.
+INTEGRATE_TEMP_PREFIX = 'omarchy-integrate-'
+
+UPDATE_TEMP_PREFIXES = ('appimage-update-', INTEGRATE_TEMP_PREFIX)
 
 # Hard bounds per sweep: the scans stop after this many removals, so a
 # pathological state/temp dir cannot make --list-installed slow.
@@ -118,14 +129,15 @@ def sweep_update_temp_dirs(now: float = None,
     """Remove partial-download temp dirs with no live owner.
 
     Disk-only rule (the janitor runs in a different process than any live
-    job, so the in-process registry is invisible): an
-    `appimage-update-*` directory in the temp area whose EFFECTIVE mtime
-    (the dir's own mtime vs. the max of its immediate entries' mtimes —
-    a live download keeps writing its file, so the file's mtime is the
-    live signal) is older than UPDATE_TEMP_GRACE_SECONDS is a fossil and
-    is removed. Symlinked entries are skipped (never followed), and
-    nothing with any other prefix — `gearlever_appimage_*` above all —
-    is ever touched.
+    job, so the in-process registry is invisible): a temp dir whose name
+    starts with one of UPDATE_TEMP_PREFIXES — `appimage-update-*` (async
+    update downloads) or `omarchy-integrate-*` (a `--integrate` URL run's
+    download) — and whose EFFECTIVE mtime (the dir's own mtime vs. the max
+    of its immediate entries' mtimes — a live download keeps writing its
+    file, so the file's mtime is the live signal) is older than
+    UPDATE_TEMP_GRACE_SECONDS is a fossil and is removed. Symlinked
+    entries are skipped (never followed), and nothing with any other
+    prefix — `gearlever_appimage_*` above all — is ever touched.
 
     `temp_area` overrides the scan root (default tempfile.gettempdir(),
     the same area provider.update_from_url downloads into). Returns the
@@ -145,7 +157,7 @@ def sweep_update_temp_dirs(now: float = None,
     for name in entries:
         if removed >= MAX_REMOVALS_PER_SWEEP:
             break
-        if not name.startswith(UPDATE_TEMP_PREFIX):
+        if not name.startswith(UPDATE_TEMP_PREFIXES):
             continue
         path = os.path.join(temp_area, name)
         try:
@@ -164,8 +176,8 @@ def sweep_update_temp_dirs(now: float = None,
 
 def sweep(now: float = None, temp_area: str = None) -> dict:
     """Both sweeps, best-effort: job documents past the acknowledgement
-    window, then orphan update temp dirs past the grace window. Returns
-    per-surface removal counts; never raises."""
+    window, then orphan download temp dirs (UPDATE_TEMP_PREFIXES) past the
+    grace window. Returns per-surface removal counts; never raises."""
     counts = {'documents_removed': 0, 'temp_dirs_removed': 0}
     try:
         counts['documents_removed'] = sweep_job_documents(now=now)

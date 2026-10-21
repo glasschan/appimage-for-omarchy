@@ -460,9 +460,16 @@ silently (debug log only — there is no expiry notification):
   is older than `UPDATE_TEMP_GRACE_SECONDS` = **600 s** (5× the 120 s
   liveness threshold, 20× the downloader's 30 s per-read stall guard).
   This disk-only rule reclaims legacy orphans from hard-killed pre-async
-  downloads, which carry neither a registry entry nor a job document. No
-  other prefix (`gearlever_appimage_*` above all) is ever touched, and
-  symlinks are never followed.
+  downloads, which carry neither a registry entry nor a job document.
+- the same rule for an **`omarchy-integrate-*` directory**
+  (`janitor.INTEGRATE_TEMP_PREFIX`, the `--integrate <url>` per-run
+  `mkdtemp`). A clean exit removes it in `cmd_integrate`'s `finally`, but
+  a **signalled** child skips that: the panel's Quickshell `Process` is
+  killed with the panel QML object when the panel closes, mid-download.
+  The sweep is what reclaims the truncated multi-MiB AppImage it leaves.
+  Both prefixes live in `janitor.UPDATE_TEMP_PREFIXES`; no other prefix
+  (`gearlever_appimage_*` above all) is ever touched, and symlinks are
+  never followed.
 
 **ACTIVE documents are never removed.** Readers may therefore rely on:
 a document they can read survives at least until 24 h after its last

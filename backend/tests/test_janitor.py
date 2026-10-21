@@ -214,6 +214,35 @@ class JanitorTempDirTests(_DocSeedMixin, FakeXDGTestCase):
         janitor.sweep_update_temp_dirs(temp_area=self.area)
         self.assertTrue(os.path.isdir(path))
 
+    def test_orphan_integrate_dir_past_grace_is_removed(self):
+        # the panel kills its own --integrate URL child when it closes
+        # (panel QML unload → Process destroyed → SIGTERM), which skips
+        # cmd_integrate's `finally` rmtree and leaves the truncated
+        # download in the temp area with no process behind it
+        path = self._orphan(janitor.INTEGRATE_TEMP_PREFIX + 'an9_lb0a',
+                            age_seconds=GRACE + 300,
+                            child_content=b'\x7fELFpartial',
+                            child_age_seconds=GRACE + 300)
+        self.assertEqual(janitor.sweep_update_temp_dirs(temp_area=self.area),
+                         1)
+        self.assertFalse(os.path.exists(path))
+
+    def test_live_integrate_dir_is_kept(self):
+        # a running --integrate keeps writing download.appimage, so the
+        # child's mtime is fresh even after a long transfer
+        path = self._orphan(janitor.INTEGRATE_TEMP_PREFIX + 'live_run',
+                            age_seconds=GRACE + 300,
+                            child_content=b'\x7fELFpartial',
+                            child_age_seconds=2.0)
+        janitor.sweep_update_temp_dirs(temp_area=self.area)
+        self.assertTrue(os.path.isdir(path))
+
+    def test_integrate_prefix_is_swept(self):
+        # cli.py takes the prefix from this constant, so the sweep and
+        # the mkdtemp call cannot drift apart
+        self.assertIn(janitor.INTEGRATE_TEMP_PREFIX,
+                      janitor.UPDATE_TEMP_PREFIXES)
+
     def test_dir_mtime_stale_but_child_fresh_is_kept(self):
         # pins the EFFECTIVE-mtime rule: net.download_to_file keeps
         # writing one file, so a live download refreshes the file's

@@ -184,7 +184,7 @@ Item {
   // else arms checkTimer — a settings-save reschedule only re-times the
   // pending shot.
   function fetch() {
-    if (fetchCtx || !Model.claimUpdateCheck()) {
+    if (fetchCtx || !Model.claimUpdateCheck("service")) {
       // Either our own sweep is still running (a settings save re-timed
       // checkTimer mid-flight) or a panel-initiated sweep owns the flight.
       scheduleRetry()
