@@ -194,10 +194,13 @@ class ProvenanceRecordingTests(FakeXDGTestCase):
         self.assertEqual(config['icon_path'], icon)
 
     def test_atomic_install_helper_exists_with_mode_contract(self):
-        # guard against accidental signature drift
+        # guard against accidental signature drift; `before_replace` is
+        # the ticket-26 seam (defaulted, so it changes no caller)
         import inspect
         sig = inspect.signature(provider_module._atomic_install)
-        self.assertEqual(list(sig.parameters), ['src', 'dest', 'mode'])
+        self.assertEqual(list(sig.parameters),
+                         ['src', 'dest', 'mode', 'before_replace'])
+        self.assertIsNone(sig.parameters['before_replace'].default)
 
 
 class ClobberedDesktopRecoveryTests(FakeXDGTestCase):

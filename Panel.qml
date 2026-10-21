@@ -127,6 +127,18 @@ Panel {
   readonly property int jobStartGraceMs: 10000
   property var jobStartGraces: ({})
 
+  // Force-quit confirm card (ticket #27): Update on a row whose last
+  // --list-installed poll said the app runs opens this card first. The id,
+  // name and process count are pinned at click time (the row's model data
+  // may be replaced by the refresh that follows); nothing is spawned until
+  // confirmForceQuit, and cancel clears the trio with zero side effects.
+  // The count comes from the backend's additive `running_pids`; 0 means
+  // "not known" (a stale flag, or an older backend) and the card falls
+  // back to its count-free sentence.
+  property string forceQuitId: ""
+  property string forceQuitName: ""
+  property int forceQuitPids: 0
+
   // Current Backend.run context (null while idle); the Process and Timer
   // signal handlers feed it back into lib/Backend.js.
   property var runCtx: null
@@ -248,9 +260,15 @@ Panel {
   property string sourceEditManager: ""
   property var sourceEditValues: ({})
   property bool sourceBusy: false
-  // Focus count over the editor's dynamic text fields; PanelKeyCatcher
-  // must hand raw keys to whichever field is typing (see formEditing).
-  property int sourceFieldFocusCount: 0
+  // Focus count over EVERY editable text field in the panel (the picker's
+  // path field, the source editor's dynamic fields). PanelKeyCatcher must
+  // hand raw keys to whichever field is typing (see formEditing), and it
+  // has to be blocked for as long as one holds focus: its Keys handler
+  // CONSUMES every key it is handed — a handler that only returns still
+  // accepts — so an unblocked catcher silently eats typed characters (the
+  // force-quit card exposed exactly that: it early-returns on single-letter
+  // text keys while it asks, and `blocked` was formEditing only).
+  property int textFieldFocusCount: 0
   // Mirrors the per-row manager Dropdown's popupOpen so formEditing can
   // keep blocking the key catcher while the popup (outside this item
   // tree) owns keys — see onPopupOpenChanged on the dropdown.
@@ -339,7 +357,7 @@ Panel {
   // at the bottom of this file), so guard on the loaded items.
   readonly property bool formEditing: (pickerFieldLoader.item
       ? pickerFieldLoader.item.activeFocus : false)
-    || sourceFieldFocusCount > 0
+    || textFieldFocusCount > 0
     || root.sourceDropdownOpen
     || (settingsNumbersLoader.item
         ? settingsNumbersLoader.item.anyFieldFocused : false)
@@ -793,6 +811,9 @@ Panel {
   // F7: one-click update as a DETACHED BACKGROUND JOB. The click only
   // spawns: `--update --async` answers job-started (exit 0) or an error
   // document (exit 1 — e.g. the active-job refusal) within milliseconds.
+  // A running app is the one exception: updateItem is reached through
+  // requestUpdate, which shows the #27 confirm card instead of spawning
+  // (a stale `running` flag is harmless in both directions — see there).
   // The spawn runs on its OWN Process/Timer pair (updateSpawnProc below)
   // with the default 15 s watchdog — never through callBackend, whose
   // single flight would synthetically fail the spawn whenever the shared
@@ -802,7 +823,44 @@ Panel {
   // backend replaces the AppImage where it sits; the running-app guard
   // and "up-to-date" now surface as terminal job documents, not
   // spawn-time results.
-  function updateItem(item) {
+  // The row's Update action (ticket #27): a running app asks first. The
+  // `running` flag comes from the last --list-installed poll, so it can be
+  // stale — deliberately not probed at click time. Stale-but-running (the
+  // flag says true, nothing runs any more) only grants a close the backend
+  // finds nothing to do with; stale-but-not-running (the flag says false,
+  // the app actually runs) is caught by the backend: without the grant a
+  // non-TTY caller gets `skipped-running`, whose banner asks for another
+  // Update press — by then the poll has caught up and the card appears.
+  function requestUpdate(item) {
+    if (!item || item.id === "") return
+    if (root.jobActive(item.id)) return
+    if (item.running === true) {
+      root.forceQuitId = item.id
+      root.forceQuitName = item.name !== "" ? item.name : item.id
+      root.forceQuitPids = item.runningPids > 0 ? item.runningPids : 0
+      return
+    }
+    root.updateItem(item, false)
+  }
+
+  function dismissForceQuit() {
+    root.forceQuitId = ""
+    root.forceQuitName = ""
+    root.forceQuitPids = 0
+  }
+
+  // Confirm: run exactly the async job, now with the --kill-running grant
+  // (the backend closes the app at job start and again right before the
+  // atomic replace; its force_quit record feeds the done banner).
+  function confirmForceQuit() {
+    var id = root.forceQuitId
+    var name = root.forceQuitName
+    if (id === "") return
+    root.dismissForceQuit()
+    root.updateItem({ id: id, name: name }, true)
+  }
+
+  function updateItem(item, killRunning) {
     if (!item || item.id === "") return
     // Per-app single flight: a row with an active job refuses here (the
     // button is disabled too; the backend refuses a second job for the
@@ -821,9 +879,11 @@ Panel {
     Model.clearError()
     Model.setStatus(Model.formatCount(item.name, strings.updating))
     syncFromModel()
+    var args = ["--update", item.id, "--yes", "--json", "--async"]
+    if (killRunning === true) args.push("--kill-running")
     // Default watchdog on purpose: this call is over in milliseconds.
     var ctx = Backend.run(updateSpawnProc, updateSpawnTimer, backendCommand,
-        ["--update", item.id, "--yes", "--json", "--async"], {},
+        args, {},
         function(result) {
       root.updateSpawnCtx = null
       if (result.ok) {
@@ -951,21 +1011,19 @@ Panel {
       // "updated" changed the AppImage (and its desktop entry's version):
       // re-list so names, versions and manager columns stay truthful.
       if (d.status === "updated") {
-        Model.setStatus(d.newVersion !== ""
-          ? Model.formatCount(d.newVersion, strings.updated)
-          : d.message)
+        Model.setStatus(Model.jobDoneBanner(d, ""))
         refresh()
       } else if (d.status === "up-to-date") {
-        Model.setStatus(d.message !== "" ? d.message : strings.upToDate)
+        Model.setStatus(Model.jobDoneBanner(d, strings.upToDate))
       } else if (d.status === "skipped-running") {
         Model.setStatus(d.message !== "" ? d.message : strings.skippedRunning)
       } else if (d.message !== "") {
         Model.setStatus(d.message)
       }
     } else if (d.state === "error") {
-      Model.setError(d.errorText !== ""
-        ? d.errorText
-        : (d.message !== "" ? d.message : strings.backendFailed))
+      // G: the error line also carries the closed-app clause when the job
+      // closed the app and THEN failed (force_quit on an error document)
+      Model.setError(Model.jobErrorBanner(d, strings.backendFailed))
     } else { // interrupted: dead updater or a heartbeat stale past 120 s
       Model.setError(strings.jobInterrupted)
     }
@@ -1104,10 +1162,10 @@ Panel {
     sourceEditManager = item.manager
     rebuildSourceEditValues()
     sourceEditId = item.id
-    // Switching rows empties the previous row's Repeater model, which
+    // Switched rows empty the previous row's Repeater model, which
     // Loader-destroys its fields (see closeSourceEditor for why the count
     // must be zeroed by hand).
-    sourceFieldFocusCount = 0
+    textFieldFocusCount = 0
     // Coarse reveal: the editor may sit below the fold of a long list.
     Qt.callLater(function() {
       if (root.sourceEditId !== "" && listFlick) {
@@ -1151,7 +1209,7 @@ Panel {
     // Loader-destroyed fields may never deliver their final
     // activeFocusChanged(false); zero the count so the key catcher cannot
     // stay blocked forever.
-    sourceFieldFocusCount = 0
+    textFieldFocusCount = 0
   }
 
   function rebuildSourceEditValues() {
@@ -1164,7 +1222,7 @@ Panel {
     }
     // Reset before the model swap re-creates the Loader-held fields, for
     // the same skipped-leave reason as closeSourceEditor above.
-    sourceFieldFocusCount = 0
+    textFieldFocusCount = 0
     sourceEditValues = values
   }
 
@@ -1587,6 +1645,9 @@ Panel {
       // open must never surface a stale gesture as a fresh preview card.
       root.pendingDropPath = ""
       root.pendingDropIgnored = 0
+      // Same rule for the #27 confirm card: a force-quit decision belongs
+      // to the visit that asked for it, never to a later open.
+      root.dismissForceQuit()
     }
   }
 
@@ -1993,24 +2054,29 @@ Panel {
         blocked: root.formEditing
         // The confirm step owns Escape first: Esc dismisses the preview
         // back to the picker with zero side effects; a second Esc (no
-        // preview showing) closes the panel as before.
+        // preview showing) closes the panel as before. The force-quit
+        // card (ticket #27) outranks both: Esc cancels it, nothing runs.
         onCloseRequested: {
-          if (root.previewOpen) root.dismissPreview()
+          if (root.forceQuitId !== "") root.dismissForceQuit()
+          else if (root.previewOpen) root.dismissPreview()
           else root.requestClose()
         }
         // Enter on the catcher confirms the shown preview (while the path
         // field holds focus, its own Enter reaches requestPreview through
-        // SafeTextField.accepted instead).
+        // SafeTextField.accepted instead). Confirm on the force-quit card
+        // wins over a preview: that card is the later, blocking decision.
         onActivateRequested: {
-          if (root.previewOpen) root.confirmPreview()
+          if (root.forceQuitId !== "") root.confirmForceQuit()
+          else if (root.previewOpen) root.confirmPreview()
         }
         onTextKey: function(t) {
           // Behind the confirm card the single-letter shortcuts would fire
           // blind actions (refresh/integrate/checks); the preview owns the
           // keyboard from the moment its call starts until it is confirmed
           // or dismissed (a refresh racing the fetch would only earn the
-          // shared-process "busy" banner).
-          if (root.previewOpen || root.busyPreview) return
+          // shared-process "busy" banner). The force-quit card is modal in
+          // the same way while it asks.
+          if (root.forceQuitId !== "" || root.previewOpen || root.busyPreview) return
           if (t === "r" || t === "R") root.refresh()
           else if (t === "i" || t === "I") root.integrateRequested()
           else if (t === "u" || t === "U") root.checkUpdates()
@@ -2278,6 +2344,81 @@ Panel {
                   Model.clearError()
                   Model.clearStatus()
                 }
+              }
+            }
+          }
+
+          // ---- Force-quit confirm card (ticket #27) ---------------------
+          // Shown instead of spawning when Update lands on a row the last
+          // listing said runs. It names the app and how many processes the
+          // confirm will close (the listing's `running_pids`; a count of 0
+          // — unknown — keeps the count-free sentence). Enter confirms, Esc
+          // cancels (PanelKeyCatcher wiring above); Cancel spawns nothing
+          // and leaves the row as it was.
+          BorderSurface {
+            id: forceQuitCard
+            width: parent.width
+            visible: root.forceQuitId !== ""
+            implicitHeight: visible ? forceQuitCol.implicitHeight + Style.spacing.sm * 2 : 0
+            color: Util.alpha(root.urgent, 0.09)
+            borderSpec: Border.flat(Util.alpha(root.urgent, 0.45), Math.max(1, Style.normalBorderWidth))
+            radius: Style.cornerRadius
+
+            Column {
+              id: forceQuitCol
+              width: parent.width - Style.spacing.sm * 2
+              anchors.centerIn: parent
+              spacing: Style.spacing.xs
+
+              Text {
+                text: root.strings.forceQuitTitle
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+
+              Text {
+                text: Model.forceQuitBody(root.forceQuitName, root.forceQuitPids)
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+                width: parent.width
+              }
+
+              Row {
+                spacing: Style.spacing.xs
+
+                Button {
+                  text: root.strings.forceQuitConfirm
+                  // The confirm card can outlive its row's job-start reply
+                  // (a slow backend): never stack a second job by hand.
+                  enabled: !root.jobActive(root.forceQuitId)
+                  foreground: root.foreground
+                  accent: root.urgent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  implicitHeight: root.controlHeight
+                  onClicked: root.confirmForceQuit()
+                }
+
+                Button {
+                  text: root.strings.pickerCancel
+                  foreground: root.foreground
+                  accent: Color.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  implicitHeight: root.controlHeight
+                  onClicked: root.dismissForceQuit()
+                }
+              }
+
+              Text {
+                text: root.strings.forceQuitKeysHint
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
               }
             }
           }
@@ -3032,7 +3173,7 @@ Panel {
                                 }
                               }
 
-                              onClicked: root.updateItem(rowOuter.modelData)
+                              onClicked: root.requestUpdate(rowOuter.modelData)
                             }
 
                             // F9: open this row's inline source editor.
@@ -3297,7 +3438,7 @@ Panel {
       enabled: !root.sourceBusy
       value: root.sourceEditValues[fieldKey] || ""
       onEdited: function(v) { root.setSourceValue(fieldKey, v) }
-      onActiveFocusChanged: root.sourceFieldFocusCount = activeFocus ? root.sourceFieldFocusCount + 1 : Math.max(0, root.sourceFieldFocusCount - 1)
+      onActiveFocusChanged: root.textFieldFocusCount = activeFocus ? root.textFieldFocusCount + 1 : Math.max(0, root.textFieldFocusCount - 1)
     }
   }
 
@@ -3360,6 +3501,10 @@ Panel {
         }
       }
       onAccepted: root.requestPreview(root.pickerPath)
+      // Same count as the editor fields: the key catcher stays blocked
+      // while this field types, whatever card is on screen (see
+      // textFieldFocusCount).
+      onActiveFocusChanged: root.textFieldFocusCount = activeFocus ? root.textFieldFocusCount + 1 : Math.max(0, root.textFieldFocusCount - 1)
     }
   }
 

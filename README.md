@@ -299,6 +299,30 @@ running its Remove button stays disabled — the job installs over that
 AppImage, so removing it mid-flight would leave the new release with no
 target (the armed "Remove?" confirm honours the same block).
 
+A running app is the one exception to that one-click flow: **Update**
+asks first, naming the app and how many processes the confirm will
+close, and spawns nothing until you confirm (`Enter`; `Esc` cancels).
+The panel then starts the job with the `--kill-running` grant: the
+backend closes the app when the job starts — but only when the source
+really has a newer release, never for an update that turns out to be
+`up-to-date` — and again immediately before it replaces the file,
+records the close as `force_quit` in the job document, and the done
+banner says the app was closed. A close that needed `SIGKILL` says
+force-quit instead, and an `error` document carries the same record
+with a banner clause saying the app was closed *before* the update
+failed. From a terminal `--update` asks the same question, while a
+script gets `skipped-running` (its message names `--kill-running`)
+unless it passes the flag itself; `--async` asks too when stdin is a
+terminal, so a background job started by hand is no longer implicitly
+non-interactive. If a target process cannot be closed (its signal is
+refused, or it ignores `SIGTERM` and `SIGKILL`), the job stops with an
+error naming the surviving pid(s) instead of replacing the file behind
+a live app. `--keep-both` never closes anything: it installs a second
+file beside the running one, so `--kill-running` adds nothing there and
+the running guard neither asks nor skips.
+`--force` is the opposite and unchanged: replace the AppImage under the
+running app, closing nothing.
+
 ## Plugin layout
 
 ```
@@ -327,6 +351,38 @@ named after the plugin id), and publishes a GitHub Release with
 auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
+
+### 0.9.0
+
+- Updating a **running** app now asks first: the row's Update button
+  names the app and how many processes will be closed, and starts
+  nothing until you confirm (Enter confirms, Esc cancels). The app is
+  closed when the job starts and again right before the new release
+  replaces the old file, so a process relaunched during the download is
+  closed too.
+- `--kill-running` is the CLI half of that consent: on a terminal
+  `--update` asks the same question, and a script gets `skipped-running`
+  whose message names the flag. `--async` asks on a terminal too, before
+  the job is spawned. `--force` keeps its meaning — replace the file
+  while the app keeps running, close nothing.
+- The app is only closed for an update that exists: the availability
+  check now runs first, so `--update <id> --kill-running` on a current
+  app answers `up-to-date` without touching a single process (and the
+  document carries no `force_quit`, so the banner cannot claim a close).
+- `--keep-both` + `--kill-running` closes nothing — the new file lands
+  beside the running AppImage, whose path is never replaced.
+- A target that survives the close (signal refused, or ignored past
+  `SIGKILL`) refuses the replace: the job fails with an error naming the
+  surviving pid(s) and the stage, instead of installing behind a live
+  app. The record rides the `error` document as `force_quit`, and the
+  banner distinguishes the `SIGKILL` case from a clean close.
+- `running` and `running_pids` are computed by one rule (the same process
+  scan, realpath-normalised on both sides, so a symlinked AppImages
+  directory matches), and one listing scans once however many rows are
+  running.
+- The `running` column is right on real hosts again: the FUSE-mount
+  lookup compared an absolute AppImage path against a `/proc/mounts`
+  source field that only ever holds the basename, so it never matched.
 
 ### 0.8.0
 

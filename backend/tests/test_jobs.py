@@ -434,7 +434,7 @@ class AsyncJobCliTests(InProcessCliMixin, FakeXDGTestCase):
         # alive for the job's whole life)
         spawn.assert_called_once_with('fakeapp.desktop', 'fakeapp',
                                       keep_both=False, force=False,
-                                      log_fd=mock.ANY)
+                                      log_fd=mock.ANY, kill_running=False)
 
     def test_job_started_plain_text(self):
         with mock.patch.object(cli, '_spawn_update_job',
@@ -564,9 +564,19 @@ class AsyncJobCliTests(InProcessCliMixin, FakeXDGTestCase):
             f'{self.managed_dir}/fakeapp.appimage /tmp/.mount_x '
             'fuse.AppImage rw 0 0\n')
 
-        with mock.patch.object(utils, 'PROC_MOUNTS_PATH', mounts):
+        with mock.patch.object(utils, 'PROC_MOUNTS_PATH', mounts), \
+                mock.patch.object(
+                    updaters.StaticFileUpdater, 'is_update_available',
+                    return_value=True), \
+                mock.patch.object(cli.appimage_provider,
+                                  'update_from_url') as install:
             code = cli._job_entrypoint('fakeapp.desktop', 'fakeapp',
                                        keep_both=False, force=False)
+        # availability says "there is an update", so the guard is the
+        # thing that stopped the job — and it stopped it before the
+        # download (finding A: the guard now runs after the availability
+        # check, never before it)
+        install.assert_not_called()
         self.assertEqual(code, 0)
         doc = jobs.read_job('fakeapp.desktop')
         self.assertEqual(doc['phase'], 'done')

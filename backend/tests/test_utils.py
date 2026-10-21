@@ -11,8 +11,9 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
-from omarchy_appimage import utils
+from omarchy_appimage import procs, utils
 
 # Synthetic /proc/mounts content: two FUSE AppImage mounts (as produced
 # by running type-2 AppImages, one with octal-escaped spaces in the
@@ -100,6 +101,43 @@ class IsFuseMountedTests(MountsTestCase):
         self.assertFalse(utils.is_fuse_mounted('', self.mounts))
 
 
+# The real /proc/mounts shape for an AppImage's FUSE mount: the source
+# field holds the AppImage's BASENAME, never the absolute path (measured
+# on a live host: `escrcpy.appimage /tmp/.mount_escrcpPC9VbJ
+# fuse.escrcpy.appimage`).
+BASENAME_MOUNTS = '''\
+/dev/sda2 / ext4 rw,relatime 0 0
+foo.appimage /tmp/.mount_fooXq8zW fuse.foo.appimage rw,nosuid,nodev 0 0
+plain.iso /mnt/iso iso9660 ro,relatime 0 0
+'''
+
+
+class IsFuseMountedBasenameTests(unittest.TestCase):
+    """Regression: the fuse branch compared the absolute AppImage path to
+    a field that only ever holds a basename, so it never matched on a real
+    host. A basename source now attributes its mount to the AppImage."""
+
+    def setUp(self):
+        fd, self.mounts = tempfile.mkstemp(prefix='mounts-basename-')
+        with os.fdopen(fd, 'w') as f:
+            f.write(BASENAME_MOUNTS)
+        self.addCleanup(os.unlink, self.mounts)
+
+    def test_absolute_appimage_path_matches_a_basename_source(self):
+        self.assertTrue(utils.is_fuse_mounted(FUSE_APP, self.mounts))
+
+    def test_mount_is_attributed_through_is_app_running_too(self):
+        # the `ps` signal cannot answer for this path; only the mount can
+        self.assertTrue(utils.is_app_running(FUSE_APP, self.mounts))
+
+    def test_other_appimage_is_not_mounted(self):
+        self.assertFalse(utils.is_fuse_mounted(
+            '/home/user/AppImages/bar.appimage', self.mounts))
+
+    def test_non_fuse_source_with_the_basename_still_does_not_match(self):
+        self.assertFalse(utils.is_fuse_mounted('/mnt/plain.iso', self.mounts))
+
+
 class IsAppRunningTests(MountsTestCase):
     """The two signals are OR-ed: ps exe match (original GearLever
     detection) + FUSE mount source match (new for type-2 AppImages)."""
@@ -120,6 +158,42 @@ class IsAppRunningTests(MountsTestCase):
 
     def test_empty_path_is_false(self):
         self.assertFalse(utils.is_app_running('', self.mounts))
+
+
+class RunningByPsRuleTests(unittest.TestCase):
+    """Finding 7: `running` and `running_pids` are computed by ONE rule.
+
+    `_running_by_ps` asks procs.pids_for — the same identity rule the pid
+    list uses, with the same bounded `ps` (10 s) — so one JSON object can
+    never report `running: false` with a non-zero `running_pids`. It used
+    to run its own `ps -eo exe` with run_command's 120 s default and
+    compare strings."""
+
+    def test_the_parent_rule_is_the_procs_one(self):
+        with mock.patch.object(procs, 'pids_for',
+                               return_value={'parent': [11],
+                                             'children': []}) as scan:
+            self.assertTrue(utils._running_by_ps(FUSE_APP))
+        scan.assert_called_once_with(FUSE_APP)
+
+    def test_children_alone_are_not_the_app_itself(self):
+        with mock.patch.object(procs, 'pids_for',
+                               return_value={'parent': [],
+                                             'children': [3]}):
+            self.assertFalse(utils._running_by_ps(FUSE_APP))
+
+    def test_a_failing_scan_is_one_warning_and_false(self):
+        with mock.patch.object(procs, 'pids_for',
+                               side_effect=OSError('ps wedged')):
+            with self.assertLogs(level='WARNING') as logs:
+                self.assertFalse(utils._running_by_ps(FUSE_APP))
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('ps lookup failed', logs.output[0])
+
+    def test_empty_path_never_spawns_ps(self):
+        with mock.patch.object(procs, 'pids_for') as scan:
+            self.assertFalse(utils._running_by_ps(''))
+        scan.assert_not_called()
 
 
 class Fuse2ProbeTests(unittest.TestCase):

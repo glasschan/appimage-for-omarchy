@@ -174,7 +174,11 @@ def is_app_running(file_path: str,
     Two signals are OR-ed, because a type-2 AppImage started through its
     FUSE runtime executes from /tmp/.mount_* so its `ps` exe never equals
     the AppImage path:
-      1. a `ps -eo exe` entry equals `file_path` (direct execution);
+      1. a process whose exe IS `file_path` (direct execution) — asked
+         through procs' identity rule, the SAME rule that answers
+         `running_pids`, so the two fields of one document cannot
+         disagree (a symlinked install directory, a pid scanned after the
+         file was replaced, a basename match on mounts);
       2. `file_path` is the mount source of an active FUSE mount
          (see is_fuse_mounted).
 
@@ -184,21 +188,26 @@ def is_app_running(file_path: str,
 
 
 def _running_by_ps(file_path: str) -> bool:
-    """The original GearLever detection: exact match in `ps -eo exe`."""
+    """True when a process's exe IS `file_path`.
+
+    One rule with procs.pids_for — one bounded `ps -eo pid=,exe=` scan
+    (10 s, not run_command's 120 s default) plus the same realpath
+    comparison, instead of a second, string-compared `ps -eo exe` view."""
     if not file_path:
         return False
 
+    # Imported here, not at module scope: procs imports run_command and
+    # parse_proc_mounts from this module, so a top-level import either way
+    # would be a cycle.
+    from . import procs
+
     try:
-        result = run_command(['ps', '-eo', 'exe'], check=True)
+        return bool(procs.pids_for(file_path)['parent'])
     except Exception as e:
+        # Best-effort, like the `ps` lookup it replaces: no answer means
+        # "nothing attributable", never a caller error.
         logging.warning('ps lookup failed: %s', e)
         return False
-
-    for line in result.stdout.decode(errors='replace').split('\n'):
-        if line.strip() == file_path:
-            return True
-
-    return False
 
 
 PROC_MOUNTS_PATH = '/proc/mounts'
@@ -239,22 +248,24 @@ def is_fuse_mounted(file_path: str, mounts_path: str = None) -> bool:
     """True when `file_path` is the source of an active FUSE mount.
 
     While a type-2 AppImage runs, its runtime FUSE-mounts the image at
-    /tmp/.mount_XXXXXX with the AppImage path as the mount source and
-    `fuse.AppImage` as the filesystem type, e.g.
+    /tmp/.mount_XXXXXX, e.g.
 
-        /home/user/AppImages/foo.appimage /tmp/.mount_fooXXXX fuse.AppImage rw,... 0 0
+        escrcpy.appimage /tmp/.mount_escrcpPC9VbJ fuse.escrcpy.appimage rw,... 0 0
 
-    The fuse.* fstype filter keeps unrelated mounts whose source happens
-    to be a regular file (loop devices, bind mounts) from matching.
-    `mounts_path` overrides the /proc/mounts location (tests)."""
+    Note the source: /proc/mounts only ever holds the AppImage's BASENAME
+    there, never the absolute path, so the attribution lives in
+    procs.mount_points_for (which also keeps the fuse.* filter that stops
+    an unrelated regular-file source — a loop device, a bind mount — from
+    matching). `mounts_path` overrides the /proc/mounts location (tests)."""
     if not file_path:
         return False
 
-    for source, _target, fstype in parse_proc_mounts(mounts_path):
-        if source == file_path and fstype.startswith('fuse.'):
-            return True
+    # Imported here, not at module scope: procs imports run_command and
+    # parse_proc_mounts from this module, so a top-level import either way
+    # would be a cycle.
+    from . import procs
 
-    return False
+    return bool(procs.mount_points_for(file_path, mounts_path))
 
 
 def gnu_naturalsize(value: int, precision: int = 1) -> str:
