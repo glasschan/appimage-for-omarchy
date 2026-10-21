@@ -1118,10 +1118,16 @@ class UpdateFlowTests(InProcessCliMixin, FakeXDGTestCase):
         Path(self._state_path()).write_text(
             json.dumps({'neovim.desktop': 'v0.11.3|10996216'}))
 
-        with release:
+        with release, mock.patch.object(
+                cli.appimage_provider, 'apply_release_version',
+                wraps=cli.appimage_provider.apply_release_version) as spy:
             out, err, code = self.run_cmd(cli.cmd_update,
                                           ['neovim', '--yes', '--json'])
         self.assertEqual(code, 0, err)
+        # the manager's release tag is offered as the version (the fixture
+        # states its own, so apply_release_version declines it)
+        self.assertEqual([c.args[1] for c in spy.call_args_list],
+                         ['v0.11.3'])
         payload = json.loads(out)
         self.assertEqual(payload['result'], 'updated')
         self.assertEqual(payload['message'],
@@ -1298,6 +1304,61 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
         self.assertEqual(cfg['manager'], 'GithubUpdater')
         self.assertEqual(cfg['repo'], 'neovim/neovim')
         self.assertEqual(cfg['repo_filename'], 'nvim-*-linux-x86_64.AppImage')
+
+        # the fixture states its own X-AppImage-Version, so the URL's tag
+        # (v4.5.6) must NOT replace it (apply_release_version)
+        payload = json.loads(
+            self.run_cli('--list-installed', '--json').stdout)
+        self.assertEqual(payload['installed'][0]['current_version'],
+                         'v0.11.3')
+
+    def test_integrate_from_url_writes_the_release_tag_as_the_version(self):
+        # End to end: an AppImage that states no version of its own gets
+        # the tag the URL names, written into the installed desktop entry
+        # (X-AppImage-Version + the 'Name (version)' suffix) instead of
+        # being listed with no version at all.
+        self._patch_download_and_api()
+        real_load = cli.appimage_provider._load_appimage_metadata
+        popped = []
+
+        def _load_versionless(el):
+            result = real_load(el)
+            if not popped:
+                popped.append(True)
+                result.desktop_entry.main.pop('X-AppImage-Version', None)
+            return result
+
+        with mock.patch.object(cli.appimage_provider,
+                               '_load_appimage_metadata',
+                               side_effect=_load_versionless):
+            out, err, code = self._integrate()
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload['app']['current_version'], 'v4.5.6')
+        self.assertEqual(payload['app']['name'], 'Neovim (v4.5.6)')
+
+        installed = cli.appimage_provider.list_installed()[0]
+        self.assertEqual(installed.version, 'v4.5.6')
+        self.assertEqual(installed.name, 'Neovim (v4.5.6)')
+
+    def test_integrate_from_url_offers_the_release_tag_as_the_version(self):
+        # An image with no X-AppImage-Version of its own (real ones exist:
+        # Terax, OpenTypeless) is integrated with the tag the URL names —
+        # otherwise the app is listed with no version at all.
+        self._patch_download_and_api()
+        seen = []
+        real = cli.appimage_provider.apply_release_version
+
+        def _spy(el, version):
+            seen.append(version)
+            return real(el, version)
+
+        with mock.patch.object(cli.appimage_provider,
+                               'apply_release_version', side_effect=_spy):
+            out, err, code = self._integrate()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)['result'], 'integrated')
+        self.assertEqual(seen, ['v4.5.6'])
 
     def test_integrate_from_url_refuses_missing_digest(self):
         # an asset with no sha256 digest is refused (same contract as

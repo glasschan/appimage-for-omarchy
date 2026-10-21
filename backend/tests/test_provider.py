@@ -12,6 +12,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from helpers import FakeXDGTestCase
 
@@ -531,6 +532,51 @@ class AppVersionTests(unittest.TestCase):
                 None, desktop_entry=self._Entry('1.4.237')), '1.4.237')
         self.assertEqual(
             self.provider._get_app_version(None, desktop_entry=self._Entry('')), '')
+
+
+class ReleaseVersionTests(unittest.TestCase):
+    """apply_release_version: the release tag is the version of last
+    resort, and only when the image itself states none.
+
+    `X-AppImage-Version` is the only version source, and real AppImages
+    ship without it (Terax, OpenTypeless): the tag the user integrated
+    from (or the release an update downloaded) is then the only version
+    information there is, so it must reach the desktop entry instead of
+    an app listed with no version at all."""
+
+    def setUp(self):
+        self.provider = AppImageProvider()
+
+    @staticmethod
+    def _element(version=''):
+        content = '[Desktop Entry]\nName=Xerces\nType=Application\n'
+        if version:
+            content += f'X-AppImage-Version={version}\n'
+        entry = DesktopEntry(content=content)
+        el = AppImageListElement(name='Xerces', description='', provider='P',
+                                 installed_status=InstalledStatus.NOT_INSTALLED,
+                                 file_path='/tmp/xerces.appimage')
+        el.extracted = SimpleNamespace(desktop_entry=entry)
+        el.desktop_entry = entry
+        return el
+
+    def test_tag_fills_a_missing_version(self):
+        el = self._element()
+        self.assertTrue(self.provider.apply_release_version(el, 'v0.9.0'))
+        self.assertEqual(el.desktop_entry.get('X-AppImage-Version'), 'v0.9.0')
+        self.assertEqual(el.version, 'v0.9.0')
+
+    def test_the_images_own_version_wins(self):
+        el = self._element(version='v0.11.3')
+        self.assertFalse(self.provider.apply_release_version(el, 'v4.5.6'))
+        self.assertEqual(el.desktop_entry.get('X-AppImage-Version'), 'v0.11.3')
+        self.assertIsNone(el.version)
+
+    def test_a_blank_tag_invents_nothing(self):
+        for tag in ('', None, '   '):
+            el = self._element()
+            self.assertFalse(self.provider.apply_release_version(el, tag))
+            self.assertEqual(el.desktop_entry.get('X-AppImage-Version'), None)
 
 
 if __name__ == '__main__':

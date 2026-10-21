@@ -352,6 +352,20 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.9.4
+
+- An AppImage that ships no `X-AppImage-Version` now gets the version it
+  really is, instead of no version at all. Terax and OpenTypeless are
+  examples of builds that embed no version anywhere, so integrating
+  `.../releases/download/v0.9.0/Terax_0.9.0_amd64.AppImage` produced a row
+  with the version missing even though the release tag was right there in
+  the URL. The tag is now used as the app's version when the image itself
+  states none (from the pasted URL, or from the release API for
+  GitLab/Codeberg/Forgejo), and `--update` does the same with the tag of
+  the release it just installed — which also repairs an app integrated by
+  an older version of the plugin on its next update. An image that states
+  its own version still wins, and nothing is invented when no tag is known.
+
 ### 0.9.3
 
 - A row no longer shows its version twice and no longer shows a hash as

@@ -355,7 +355,10 @@ def _classify_integrate_url(url: str):
     falls back to case 6 in _fetch_integrate_artifact."""
     github = _github_release_url_data(url)
     if github:
-        return 'github', github
+        # the tag parsed from the URL is a real version, and it travels
+        # with the classification: apply_release_version uses it when the
+        # download carries no X-AppImage-Version of its own (v0.9.4)
+        return 'github', dict(github, version=github['tag'])
 
     try:
         parts = urlsplit(url)
@@ -662,7 +665,8 @@ def _fetch_integrate_artifact(kind: str, info: dict, raw_url: str,
                     {'url': raw_url})
         dest = _download_static(asset['url'], dest_dir, asset['size'])
         info = dict(info,
-                    pattern=_glob_for_version(info['filename'], asset['tag']))
+                    pattern=_glob_for_version(info['filename'], asset['tag']),
+                    version=asset['tag'] or '')
         return dest, kind, info
     # case 6: a plain URL
     return _download_static(raw_url, dest_dir), 'static', {'url': raw_url}
@@ -732,6 +736,15 @@ def cmd_integrate(args: list) -> int:
 
         list_element.update_logic = AppImageUpdateLogic.KEEP
         appimage_provider.refresh_data(list_element)
+        # A release tag is a real version even when the image forgets to
+        # embed one (v0.9.4): integrating from
+        # .../releases/download/v0.9.0/Terax_0.9.0_amd64.AppImage used to
+        # produce an app with no version at all. The tag the user pasted
+        # describes the file better than nothing, and install_file then
+        # writes it as X-AppImage-Version and in the desktop Name suffix.
+        if url_kind:
+            appimage_provider.apply_release_version(
+                list_element, (url_info or {}).get('version', ''))
 
         already_installed = _find_name_conflict(list_element)
 

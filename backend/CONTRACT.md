@@ -123,6 +123,19 @@ a leading `v`) rewritten to a `*` glob, so a future release still matches;
 if the version isn't in the name the exact filename is kept (`GithubUpdater`
 case included).
 
+**Version of a URL integrate (v0.9.4).** `X-AppImage-Version` is the only
+version source, and real AppImages ship without it (Terax, OpenTypeless).
+When the downloaded image states no version of its own, the **release tag**
+the URL names (cases 1 and 3–5 — from the URL itself or the release API;
+never invented for cases 2 and 6) is recorded as the app's version: it is
+written to the installed desktop entry's `X-AppImage-Version` (and to the
+keep-both `Name (version)` suffix) by `provider.apply_release_version`, so
+the app is listed with the release it actually is instead of with no
+version at all. An image that states its own `X-AppImage-Version` always
+wins. `--update` does the same with the tag of the release its manager just
+downloaded (`provider.update_from_url`), which also repairs an install made
+by an older version of the plugin.
+
 **Relaxed digest rule (deliberate deviation, `--integrate <url>` only).**
 For the verbs in this section a cryptographic digest is verified whenever
 the source publishes one — GitHub `sha256:` (required) and a `.zsync`

@@ -491,6 +491,39 @@ class AppImageProvider():
             el.name = extracted.desktop_entry.getName()
             el.version = extracted.desktop_entry.get('X-AppImage-Version')
 
+    def apply_release_version(self, el: AppImageListElement,
+                              version: str) -> bool:
+        """Record a release tag as the app's version when the downloaded
+        AppImage does not embed one (v0.9.4).
+
+        `X-AppImage-Version` is the only version source (see
+        _get_app_version), and plenty of real AppImages ship without it —
+        Terax and OpenTypeless, for instance, carry no version anywhere in
+        the image. Their release tag is the only version information there
+        is, so `--integrate .../releases/download/v0.9.0/Terax_0.9.0_amd64.
+        AppImage` used to produce an app with no version at all and the
+        panel had nothing to show. Both `--integrate` (whose classifier
+        knows the tag from the URL or from the release API) and
+        `update_from_url` (whose manager reports the release it just
+        downloaded) call this before install_file, so the desktop entry's
+        `Name (version)` suffix and the reported current_version describe
+        the release actually installed.
+
+        Never overrides a version the image states itself and never invents
+        one: a blank tag is a no-op. Returns whether it applied."""
+        version = (version or '').strip()
+        if not version:
+            return False
+        extracted = el.extracted or self._load_appimage_metadata(el)
+        entry = extracted.desktop_entry if extracted else None
+        if entry is None or entry.get('X-AppImage-Version'):
+            return False
+        entry.set_custom('X-AppImage-Version', version)
+        if el.desktop_entry is not None and el.desktop_entry is not entry:
+            el.desktop_entry.set_custom('X-AppImage-Version', version)
+        el.version = version
+        return True
+
     def install_file(self, el: AppImageListElement, before_replace=None):
         """Ported from AppImageProvider.install_file (naming, conflict
         resolution and desktop entry rewriting follow upstream).
@@ -692,6 +725,10 @@ class AppImageProvider():
         list_element.update_logic = (AppImageUpdateLogic.KEEP if keep_both
                                      else AppImageUpdateLogic.REPLACE)
         list_element.updating_from = el
+        # The manager knows the release it downloaded: use its tag as the
+        # version when the image carries none of its own (v0.9.4).
+        self.apply_release_version(list_element,
+                                   getattr(manager, 'available_version', ''))
         self.install_file(list_element, before_replace=before_replace)
 
         list_element.updating_from = None
