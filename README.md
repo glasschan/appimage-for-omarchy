@@ -352,6 +352,13 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.9.1
+
+- A row's meta line (version, the running dot, a pending release, a
+  job's progress) stays inside its column: the fragments are one elided
+  line now, so a long update label can no longer paint over the row's
+  launch, settings and remove buttons.
+
 ### 0.9.0
 
 - Updating a **running** app now asks first: the row's Update button
