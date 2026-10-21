@@ -321,7 +321,7 @@ class AppImageProvider():
                 exec_in_folder = True if manage_from_outside \
                     else exec_in_default_folder
                 app_version = self._get_app_version(
-                    None, desktop_entry=entry, return_hash=False)
+                    None, desktop_entry=entry)
                 file_size = os.stat(exec_location).st_size
 
                 if exec_in_folder and self.can_install_file(exec_location):
@@ -507,7 +507,7 @@ class AppImageProvider():
         os.makedirs(appimages_destination_path, exist_ok=True)
 
         extracted_appimage = self._load_appimage_metadata(el)
-        version = self._get_app_version(extracted_appimage, return_hash=False)
+        version = self._get_app_version(extracted_appimage)
 
         # how the appimage will be called
         if el.update_logic == AppImageUpdateLogic.REPLACE \
@@ -588,10 +588,12 @@ class AppImageProvider():
                                             *exec_arguments])
 
         if el.update_logic is AppImageUpdateLogic.KEEP:
-            v_version = self._get_app_version(extracted_appimage,
-                                              return_hash=True)
-            final_app_name = (extracted_appimage.desktop_entry.getName()
-                              + f' ({v_version})')
+            # The display suffix carries the REAL version only — an image
+            # without an X-AppImage-Version keeps its plain name (no md5
+            # hash suffix; see _get_app_version).
+            final_app_name = extracted_appimage.desktop_entry.getName()
+            if version:
+                final_app_name += f' ({version})'
             jd_desktop_entry.Name.default_text = final_app_name
 
         desktop_icon = 'applications-other'
@@ -855,20 +857,22 @@ class AppImageProvider():
         return settings.appimages_folder()
 
     def _get_app_version(self, extracted_appimage=None,
-                         desktop_entry: DesktopEntry = None,
-                         return_hash=True):
+                         desktop_entry: DesktopEntry = None):
+        """The app's real version: X-AppImage-Version only.
+
+        GearLever's md5 fallback (first six hex chars of the file hash) is
+        deliberately gone: it is a hash, not a version, and it used to
+        leak into the installed desktop entry's Name as
+        "Terax (77efdf)" — where the launcher and the panel showed it as
+        the app's version. An image that ships no X-AppImage-Version has
+        no version, and every caller now renders nothing instead."""
         if not desktop_entry:
             desktop_entry = extracted_appimage.desktop_entry \
                 if extracted_appimage else None
 
-        version = ''
         if desktop_entry:
-            version = desktop_entry.get('X-AppImage-Version', '') or ''
-
-        if (not version) and extracted_appimage and return_hash:
-            version = extracted_appimage.md5[0:6]
-
-        return version
+            return desktop_entry.get('X-AppImage-Version', '') or ''
+        return ''
 
 
 def _user_applications_dir() -> str:

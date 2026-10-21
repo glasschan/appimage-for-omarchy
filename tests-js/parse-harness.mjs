@@ -35,7 +35,7 @@ check("list ok", list.ok === true)
 check("list count", list.items.length === 1, JSON.stringify(list.items))
 const nvim = list.items[0]
 check("list id=desktop_id", nvim.id === "neovim.desktop", nvim.id)
-check("list name", nvim.name === "Neovim (v0.11.3)", nvim.name)
+check("list name", nvim.name === "Neovim", nvim.name)
 check("list version", nvim.version === "v0.11.3", nvim.version)
 check("list path", nvim.path === "/tmp/appimage-e2e/home/AppImages/neovim.appimage", nvim.path)
 check("list running", nvim.running === false)
@@ -121,7 +121,7 @@ check("banner tolerates an empty name", Model.launchFailureBanner("", "missing")
 // ---- F2: --integrate outcomes ----------------------------------------------
 const integ = Model.parseActionJson(cap("integrated.json"))
 check("integrated result", integ.ok === true && integ.result === "integrated")
-check("integrated app mapped", integ.app && integ.app.id === "neovim.desktop" && integ.app.name === "Neovim (v0.11.3)")
+check("integrated app mapped", integ.app && integ.app.id === "neovim.desktop" && integ.app.name === "Neovim")
 check("integrated message", integ.message.includes("integrated successfully"))
 
 const already = Model.parseActionJson(cap("already.json"))
@@ -1532,6 +1532,26 @@ const adopt = (f, pidAlive, offsetSec) =>
     Model.state.busy.updates === false && Model.state.updateCheckOwner === "")
   unsubscribe()
 }
+
+// ---- display name: the version suffix and the md5 "version" trap ---------
+// A row's title is the backend's desktop Name; the meta line below it
+// already prints the version, so the suffix must not repeat it, and the
+// md5-hash fallback ("Terax (77efdf)") is garbage no one asked to see.
+const rowName = (name, currentVersion) => Model.parseListJson(JSON.stringify({
+  schema_version: 1,
+  installed: [{ name: name, current_version: currentVersion,
+    desktop_id: "x.desktop", path: "/home/u/AppImages/x.appimage" }]
+})).items[0].name
+check("title drops the version the meta line already shows",
+  rowName("Escrcpy (3.3.1)", "3.3.1") === "Escrcpy", rowName("Escrcpy (3.3.1)", "3.3.1"))
+check("title drops the md5 fallback when the image has no version",
+  rowName("Terax (77efdf)", null) === "Terax", rowName("Terax (77efdf)", null))
+check("title keeps a parenthetical that is not the version",
+  rowName("Foo (Fork)", "2.0") === "Foo (Fork)", rowName("Foo (Fork)", "2.0"))
+check("title keeps a version-shaped suffix when no version is reported",
+  rowName("Orca (1.4.237)", null) === "Orca (1.4.237)")
+check("title drops a hash suffix only when nothing matches",
+  rowName("App (abcdef)", "1.0") === "App (abcdef)")
 
 rmSync(sandbox, { recursive: true, force: true })
 

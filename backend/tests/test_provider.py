@@ -491,5 +491,47 @@ class ResolveInstallNamesTests(unittest.TestCase):
         self.assertNotIn('/', prefix)
 
 
+class AppVersionTests(unittest.TestCase):
+    """_get_app_version: X-AppImage-Version only.
+
+    GearLever fell back to the first six hex chars of the file's md5 when
+    an image shipped no X-AppImage-Version, and install_file's KEEP branch
+    wrote that "version" into the desktop entry's Name — so a freshly
+    integrated AppImage showed up in the launcher and the panel as
+    "Terax (77efdf)": a hash presented as the app's version."""
+
+    class _Entry:
+        def __init__(self, version):
+            self.version = version
+
+        def get(self, key, default=None):
+            if key == 'X-AppImage-Version':
+                return self.version
+            return default
+
+    class _Extracted:
+        def __init__(self, version):
+            self.desktop_entry = AppVersionTests._Entry(version)
+            self.md5 = '77efdf43468678a2e98edeff02ccc193'
+
+    def setUp(self):
+        self.provider = AppImageProvider()
+
+    def test_real_version_is_returned(self):
+        self.assertEqual(
+            self.provider._get_app_version(self._Extracted('3.3.1')), '3.3.1')
+
+    def test_no_version_means_no_version_not_the_md5_hash(self):
+        self.assertEqual(self.provider._get_app_version(self._Extracted('')), '')
+        self.assertEqual(self.provider._get_app_version(self._Extracted(None)), '')
+
+    def test_desktop_entry_only_call(self):
+        self.assertEqual(
+            self.provider._get_app_version(
+                None, desktop_entry=self._Entry('1.4.237')), '1.4.237')
+        self.assertEqual(
+            self.provider._get_app_version(None, desktop_entry=self._Entry('')), '')
+
+
 if __name__ == '__main__':
     unittest.main()

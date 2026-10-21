@@ -788,10 +788,10 @@ No arguments prints usage and exits **2**.
 
 | Key | Type | Notes |
 |---|---|---|
-| `name` | string | Display name from the desktop entry (may contain a version suffix) |
+| `name` | string | Display name from the desktop entry (keep-both entries carry a ` (<version>)` suffix, added only when the image really reports a version) |
 | `path` | string | Absolute path of the managed AppImage |
 | `desktop_id` | string or null | Basename of the `.desktop` file |
-| `current_version` | string or null | `X-AppImage-Version` from the desktop entry |
+| `current_version` | string or null | `X-AppImage-Version` from the desktop entry — **the only version source**: an image that ships none reports `null`. GearLever's md5-prefix fallback is gone, so a hash is never presented as a version (v0.9.3; it used to reach the desktop `Name` as `Terax (77efdf)`) |
 | `available_version` | string or null | Release tag of the available update (`null` unless filled by a check; static-file sources have no version) |
 | `download_size` | int or null | Byte size of the available update (`null` unless filled by a check) |
 | `manager` | string or null | Update manager name (`StaticFileUpdater`, `GithubUpdater`, `GitlabUpdater`, `CodebergUpdater`, `ForgejoUpdater`) or `null` when no source exists |
@@ -937,6 +937,12 @@ Icon=/home/user/AppImages/.icons/neovim.png
 X-AppImage-Version=v0.11.3
 X-AppImage-Name=Neovim
 ```
+
+- The `Name` suffix exists so the *launcher* shows the version next to the
+  app; it is written only when `X-AppImage-Version` is present. **No md5
+  hash is ever substituted for a missing version** (v0.9.3): the panel
+  strips a trailing ` (<version>)` from a row's title because the row's
+  meta line already prints the version.
 
 - `Exec` keeps the original arguments/field codes (`%F` etc.); the
   `DESKTOPINTEGRATION=1` env var is appended like GearLever does.

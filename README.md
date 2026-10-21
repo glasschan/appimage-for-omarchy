@@ -352,6 +352,19 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.9.3
+
+- A row no longer shows its version twice and no longer shows a hash as
+  its version. The installed desktop entry's name carries a ` (version)`
+  suffix for the launcher, and the row's meta line already prints the
+  version, so rows read `Escrcpy (3.3.1)` over `3.3.1 · running`; the
+  title now drops that suffix. And for an AppImage that ships no
+  `X-AppImage-Version`, GearLever's fallback used the first six hex
+  characters of the file's md5 as the "version" — which is how a freshly
+  integrated app ended up listed as `Terax (77efdf)`. That fallback is
+  gone: an image without a version is listed plainly, and the panel keeps
+  a parenthetical that belongs to the app's own name (e.g. `Foo (Fork)`).
+
 ### 0.9.2
 
 - An integrate that was still running when the panel closed no longer
