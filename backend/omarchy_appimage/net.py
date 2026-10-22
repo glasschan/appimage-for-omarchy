@@ -15,9 +15,10 @@
 #     validated addresses (TLS still verifies the original hostname via
 #     SNI/cert checks), so the resolve-then-connect TOCTOU window is gone;
 #   * manual redirects — max 5 hops, each hop re-validated, and the
-#     intermediate 3xx body is drained in bounded chunks (stdlib drains
-#     it with an unbounded fp.read() before the final-response byte
-#     caps could ever apply);
+#     intermediate 3xx body is drained in bounded chunks from
+#     redirect_request, the one hook every redirect status reaches
+#     (stdlib's shared 30x body drains it with an unbounded fp.read()
+#     before the final-response byte caps could ever apply);
 #   * byte caps — metadata responses are capped at MAX_METADATA_BYTES,
 #     downloads at MAX_DOWNLOAD_BYTES (a running cap aborts mid-stream
 #     even when the server lies about or omits Content-Length);
@@ -186,10 +187,14 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
     public addresses) — the pinned connection re-checks at dial time, the
     eager check just makes the failure message point at the right hop.
 
-    Intermediate 3xx bodies are drained by http_error_302 in bounded
-    chunks and capped at _MAX_REDIRECT_BODY_BYTES; stdlib drains them
-    with an unbounded fp.read(), which would let a hostile hop exhaust
-    helper memory before the final-response byte caps apply."""
+    Intermediate 3xx bodies are drained by redirect_request in bounded
+    chunks and capped at _MAX_REDIRECT_BODY_BYTES. The drain deliberately
+    lives there and not in an http_error_30x override: CPython defines
+    301/303/307/308 as class-level aliases of the base http_error_302
+    FUNCTION, so a subclass override of http_error_302 alone never runs
+    for those statuses, while redirect_request is dynamically dispatched
+    for all of them — and the base body's own fp.read() afterwards then
+    sees EOF."""
 
     max_hops = _MAX_REDIRECTS
 
@@ -199,18 +204,19 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
             raise NetworkError(f'{req.full_url}: more than '
                                f'{self.max_hops} redirects')
         _validate_url(newurl)
+        if fp is not None:
+            # Drain the intermediate body BEFORE the shared base 30x body
+            # follows the redirect: stdlib drains it with an unbounded
+            # fp.read(). redirect_request is the only hook every 30x
+            # status reaches (301/303/307/308 are class-level aliases of
+            # the base http_error_302 function — an http_error_30x
+            # override would miss them). fp is None in unit tests that
+            # exercise the guard without sockets.
+            self._drain_redirect_body(fp, req)
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None:
             new.redirect_hops = hops
         return new
-
-    def http_error_302(self, req, fp, code, msg, headers):
-        # Reached for 301/302/303/307/308 (the stdlib aliases all call
-        # http_error_302). Drain the intermediate body here, in bounded
-        # chunks, before the stdlib follows the redirect; its own
-        # fp.read() then sees EOF.
-        self._drain_redirect_body(fp, req)
-        return super().http_error_302(req, fp, code, msg, headers)
 
     @staticmethod
     def _drain_redirect_body(fp, req) -> None:

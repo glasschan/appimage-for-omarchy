@@ -206,10 +206,11 @@ class LocalServerTests(FakeXDGTestCase):
             self.assertEqual(f.read(), body)
 
     def test_redirect_small_body_follows(self):
-        # end-to-end through http_error_302: a normal small redirect body
-        # is drained and the hop is followed
+        # end-to-end through the base 30x body: a normal small redirect
+        # body is drained and the hop is followed
         url = self._serve(type('H', (_RedirectHandler,),
-                               {'body': b'next', 'final_hits': 0}))
+                               {'body': b'next', 'final_hits': 0,
+                                'status': 302}))
         self.assertEqual(net.fetch_text(url), 'final')
 
     def test_redirect_intermediate_body_over_cap_raises(self):
@@ -218,19 +219,39 @@ class LocalServerTests(FakeXDGTestCase):
         # hop is followed (final_hits stays 0)
         handler = type('H', (_RedirectHandler,),
                        {'body': b'x' * (net._MAX_REDIRECT_BODY_BYTES + 1),
-                        'final_hits': 0})
+                        'final_hits': 0, 'status': 302})
         url = self._serve(handler)
         with self.assertRaises(net.NetworkError) as ctx:
             net.fetch_text(url)
         self.assertIn('redirect body exceeds', str(ctx.exception))
         self.assertEqual(handler.final_hits, 0)
 
+    def test_every_redirect_status_drains_the_body(self):
+        # 301/303/307/308 are class-level aliases of the base
+        # http_error_302 FUNCTION in CPython, so an http_error_302
+        # override would never run for them; the drain lives in
+        # redirect_request (dynamically dispatched for all of them) and
+        # every status must therefore abort on an oversized body.
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                handler = type('H', (_RedirectHandler,),
+                               {'body': b'x'
+                                * (net._MAX_REDIRECT_BODY_BYTES + 1),
+                                'final_hits': 0, 'status': status})
+                url = self._serve(handler)
+                with self.assertRaises(net.NetworkError) as ctx:
+                    net.fetch_text(url)
+                self.assertIn('redirect body exceeds', str(ctx.exception))
+                self.assertEqual(handler.final_hits, 0)
+
 
 class _RedirectHandler(BaseHTTPRequestHandler):
-    """Serves a 302 to /final carrying a fixed intermediate body, then a
-    200 'final' — exercises the bounded redirect-body drain end to end."""
+    """Serves a redirect to /final carrying a fixed intermediate body,
+    then a 200 'final' — exercises the bounded redirect-body drain end to
+    end. `status` selects which 3xx the redirect uses."""
     body = b'next'
     final_hits = 0
+    status = 302
 
     def do_GET(self):
         if self.path == '/final':
@@ -241,7 +262,7 @@ class _RedirectHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
-        self.send_response(302)
+        self.send_response(type(self).status)
         self.send_header('Location', '/final')
         self.send_header('Content-Length', str(len(self.body)))
         self.end_headers()

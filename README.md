@@ -352,6 +352,16 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.9.7
+
+- Follow-up to 0.9.6: the bounded redirect-body drain now runs from
+  `redirect_request` instead of an `http_error_302` override. CPython
+  declares 301/303/307/308 as class-level aliases of the base
+  `http_error_302` function, so an override never ran for those statuses
+  and their intermediate bodies could still be drained unbounded.
+  `redirect_request` is the hook every redirect status reaches; a test now
+  covers all five statuses end to end.
+
 ### 0.9.6
 
 - Marketplace review hardening: urllib drains each redirect's intermediate
