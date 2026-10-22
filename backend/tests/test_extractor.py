@@ -15,7 +15,14 @@ from unittest import mock
 from omarchy_appimage import extractor
 from omarchy_appimage.squashfs import SquashfsError
 
-PNG = b'\x89PNG\r\n\x1a\n'
+# A real 1x1 8-bit RGB PNG (IHDR/IDAT/IEND only, no ancillary chunk), so
+# _find_icon's sanitiser accepts it and returns it byte-identically: the
+# rebuild keeps those chunks verbatim and re-compresses nothing.
+PNG = (b'\x89PNG\r\n\x1a\n'
+       b'\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02'
+       b'\x00\x00\x00\x90wS\xde'
+       b'\x00\x00\x00\x0cIDATx\xdac```\x00\x00\x00\x04\x00\x01\xc8\xea\xeb\xf9'
+       b'\x00\x00\x00\x00IEND\xaeB`\x82')
 
 
 class SafeIconBaseTests(unittest.TestCase):

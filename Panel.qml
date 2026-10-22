@@ -2955,8 +2955,8 @@ Panel {
                           anchors.rightMargin: Style.spacing.sm
                           spacing: Style.spacing.sm
 
-                          // Extracted icon when it exists (try png → svg →
-                          // xpm next to the AppImage under .icons/, CONTRACT.md
+                          // Extracted icon when it exists (png then svg
+                          // next to the AppImage under .icons/, CONTRACT.md
                           // filesystem layout), tabler cube-unfolded icon otherwise.
                           Image {
                             id: appIcon
@@ -2965,7 +2965,7 @@ Panel {
                               var list = []
                               var base = rowOuter.modelData.iconBase
                               if (base) {
-                                var exts = [".png", ".svg", ".xpm"]
+                                var exts = [".png", ".svg"]
                                 for (var i = 0; i < exts.length; i++) {
                                   list.push(Util.fileUrl(base + exts[i]))
                                 }

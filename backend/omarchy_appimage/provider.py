@@ -638,6 +638,24 @@ class AppImageProvider():
                 prefixed_filename + icon_file_ext)
             _atomic_install(icon_file, dest_appimage_icon_file, 0o644)
 
+        # A previous icon of the same stem must not survive: the panel
+        # renders .icons/<stem>.png|svg by file name (not through the
+        # desktop entry's Icon=), so a stale file would keep being decoded
+        # by the shared shell even after an update whose new icon is
+        # refused -- and a stale .png would win the panel's png-first probe
+        # over a freshly installed .svg.
+        icons_folder = os.path.join(appimages_destination_path, '.icons')
+        keep_ext = (os.path.splitext(dest_appimage_icon_file)[1]
+                    if dest_appimage_icon_file else None)
+        for stale_ext in ('.png', '.svg', '.xpm'):
+            if stale_ext == keep_ext:
+                continue
+            try:
+                os.remove(os.path.join(icons_folder,
+                                       prefixed_filename + stale_ext))
+            except OSError:
+                pass
+
         # Move .desktop file to its default location
         os.makedirs(self.user_desktop_files_path, exist_ok=True)
         dest_desktop_file_path = os.path.join(

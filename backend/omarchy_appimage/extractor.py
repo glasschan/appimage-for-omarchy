@@ -33,6 +33,7 @@ from typing import Optional
 
 from . import elf
 from .desktop_entry import DesktopEntry
+from .icon import sanitize_icon
 from .squashfs import SquashfsReader, SquashfsError
 from .utils import get_file_hash, run_command
 
@@ -504,8 +505,17 @@ def _find_icon(source, icon_name: str) -> Optional[bytes]:
                 continue
             read_path = target
         data = source.read(read_path)
-        if data and image_format(data) in ('image/png', 'image/svg+xml'):
-            return data
+        if data:
+            fmt = image_format(data)
+            if fmt in ('image/png', 'image/svg+xml'):
+                # MAX_ICON_BYTES bounds the STORED bytes only; what the
+                # decoder materialises is a different quantity (IHDR
+                # dimensions, inflated chunk payloads), so the bytes are
+                # sanitised before they can ever become a file the shell
+                # decodes. Refused icons fall through to the next candidate.
+                safe = sanitize_icon(data, fmt)
+                if safe:
+                    return safe
 
     return None
 
@@ -579,7 +589,12 @@ def load_appimage_metadata(appimage_path: str) -> ExtractedAppImage:
 
             icon_data = _find_icon(source, entry.getIcon())
             if icon_data:
-                ext = '.svg' if b'<svg' in icon_data[:512] else '.png'
+                # The extension must describe what the sanitised bytes
+                # actually are: the panel probes .png before .svg, so a
+                # mislabelled file would be decoded as the wrong format
+                # (Qt sniffs content, but the probe order is by name).
+                ext = ('.svg' if image_format(icon_data) == 'image/svg+xml'
+                       else '.png')
                 icon_path = os.path.join(tmp_folder, 'icon' + ext)
                 with os.fdopen(os.open(icon_path,
                                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,

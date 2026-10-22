@@ -142,11 +142,16 @@ def _dial_validated(host: str, port: int, timeout) -> socket.socket:
         raise NetworkError(f'{host}: resolves to no addresses')
 
     last_error = None
-    for family, socktype, proto, _canonname, sockaddr in infos:
+    # Validate EVERY answer before dialling any of them: the loop below
+    # returns on the first successful connect, so validating per-iteration
+    # would leave the addresses after it unchecked and make this function's
+    # "checks at dial time" promise true only for the ones it reached.
+    for _family, _socktype, _proto, _canonname, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
         if not _addr_allowed(ip):
             raise NetworkError(f'{host}: {ip} is not a public address '
                                '(SSRF guard)')
+    for family, socktype, proto, _canonname, sockaddr in infos:
         sock = socket.socket(family, socktype, proto)
         try:
             sock.settimeout(timeout)
@@ -164,9 +169,19 @@ def _dial_validated(host: str, port: int, timeout) -> socket.socket:
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """HTTPS connection that dials a validated IP (see _dial_validated)
     and then TLS-wraps with the original hostname, so SNI and certificate
-    verification keep working against the name the user asked for."""
+    verification keep working against the name the user asked for.
+
+    Proxying is refused structurally: build_opener passes ProxyHandler({})
+    so no environment proxy is ever installed, and a tunnel request that
+    somehow reaches this class is rejected here. Without both, urllib's
+    proxy branch (request.py:775-800) would set _tunnel_host and rewrite
+    req.host to the proxy, and this connect() would then TLS-handshake and
+    verify the certificate of the PROXY while sending an origin-form
+    request line -- i.e. the release host would never be authenticated."""
 
     def connect(self):
+        if self._tunnel_host:
+            raise NetworkError('refusing to tunnel https through a proxy')
         self.sock = self._context.wrap_socket(
             _dial_validated(self.host, self.port, self.timeout),
             server_hostname=self.host)
@@ -227,6 +242,13 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
         total = 0
         try:
             while True:
+                # Arm the socket with the remaining budget before each read,
+                # exactly as fetch_text does: read() can otherwise block for
+                # the full socket timeout, and with max_hops hops a stalling
+                # server would overshoot the whole-request deadline by that
+                # factor before the elapsed check ever ran.
+                _arm_socket(fp, _remaining_or_raise(
+                    req.full_url, start, deadline, 'redirect body drain'))
                 chunk = fp.read(_CHUNK)
                 if not chunk:
                     return
@@ -235,16 +257,14 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
                     raise NetworkError(
                         f'{req.full_url}: redirect body exceeds '
                         f'{_MAX_REDIRECT_BODY_BYTES} bytes')
-                if time.monotonic() - start > deadline:
-                    raise NetworkError(f'{req.full_url}: redirect body '
-                                       'drain deadline exceeded')
         except NetworkError:
             raise
         except Exception as e:
             raise NetworkError(f'{req.full_url}: redirect body: {e}') from e
 
 
-_opener = urllib.request.build_opener(_ValidatingRedirectHandler(),
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                      _ValidatingRedirectHandler(),
                                       _PinnedHTTPSHandler())
 
 
@@ -336,10 +356,17 @@ def fetch_text(url: str, timeout: float = DEFAULT_TIMEOUT,
 
 
 def fetch_json(url: str, timeout: float = DEFAULT_TIMEOUT):
-    """GET `url` and parse the body as JSON (raises NetworkError)."""
+    """GET `url` and parse the body as JSON (raises NetworkError).
+
+    RecursionError is caught with the parse errors on purpose: nested
+    arrays/objects make json.loads recurse in C, and a ~200 kB body of
+    '[' x N raises RecursionError on CPython 3.14 (probe: 8144 kB of C
+    stack at 200k nesting). Both call sites only handle NetworkError, so
+    letting it escape would turn a hostile 200 into an unexpected
+    traceback instead of the network-error path."""
     try:
         return json.loads(fetch_text(url, timeout=timeout))
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, RecursionError, ValueError) as e:
         raise NetworkError(f'{url}: invalid JSON ({e})') from e
 
 

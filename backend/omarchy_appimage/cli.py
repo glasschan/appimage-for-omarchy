@@ -1024,8 +1024,12 @@ def cmd_list_installed(args: list) -> int:
     # the panel polls this every 10 s and each sweep is an unbounded
     # listdir + stat walk of the shared temp dir in this process's
     # foreground (the job-start hook in _cmd_update_async stays
-    # unthrottled). Best-effort by contract: never raises.
-    janitor.sweep_throttled()
+    # unthrottled). Best-effort by contract: never raises. The icon sweep
+    # is handed the managed folder's .icons: an icon installed by a
+    # pre-sanitiser plugin version is still decoded by Panel.qml on every
+    # open, and provider.py only unlinks the stem it is replacing.
+    janitor.sweep_throttled(
+        icons_dir=os.path.join(settings.appimages_folder(), '.icons'))
     apps = appimage_provider.list_installed()
 
     if json_output:

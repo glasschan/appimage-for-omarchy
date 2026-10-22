@@ -352,6 +352,56 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.9.9
+
+- Icons extracted from an AppImage are no longer installed (and therefore
+  no longer decoded by the shared shell process) as raw provider bytes.
+  New `backend/omarchy_appimage/icon.py` rebuilds a PNG from its painting
+  chunks only — IHDR, PLTE, tRNS, IDAT, IEND — dropping every ancillary
+  chunk (`zTXt`, `iTXt`, `tEXt`, `iCCP`, `eXIf`, …) whose inflated size
+  libpng bounds per chunk but not in aggregate, and refuses a frame whose
+  declared geometry exceeds 1024 px per side or 1 048 576 pixels, or
+  whose IDAT does not inflate to exactly the declared byte count. SVG is
+  refused when it carries a `<!doctype>`/`<!entity>`, is not rooted at
+  `<svg>`, or declares dimensions that are not bounded pixel numbers
+  (percentages and `em` are refused). The whole element tree is walked as
+  well: `<image>`, `<script>`, `<style>`, `<filter>` and `fe*` primitives
+  are refused (Qt renders an embedded raster at its *natural* size — a
+  243 KB SVG carrying an 8000×8000 PNG took the decoder from 17 MB to
+  276 MB in our measurement), and only same-document `href="#id"`
+  references are accepted. Non-UTF-8 input is refused so the byte scans
+  and the parser cannot disagree about the same bytes, and a
+  `<?xml-stylesheet?>` instruction is refused with the other external-URI
+  forms. The previous 8 MiB cap only bounded the stored bytes, not what
+  the decoder expands them to.
+- The PNG rebuild emits the spec's chunk order (`IHDR`, `PLTE`, `tRNS`,
+  `IDAT…`, `IEND`) instead of the provider's, refuses a second `PLTE`/
+  `tRNS` or a missing `IEND`, and bounds the palette and transparency
+  table to what libpng accepts — otherwise libpng fails fatally and the
+  user silently loses the icon.
+- An icon installed by an older plugin version is no longer decoded
+  forever: the throttled janitor pass now also sweeps `<managed>/.icons`
+  and removes any PNG whose IHDR exceeds the bounds or any SVG larger
+  than 512 KiB (`icon.installed_icon_is_unsafe`, a header-only read —
+  never a full re-sanitise). `provider.py` additionally unlinks the
+  previous extension's icon when an update installs a different format.
+- A refused candidate falls through to the next one, so an image that
+  embeds only a hostile icon installs without an icon instead of failing.
+- HTTPS requests no longer consult an environment proxy (`https_proxy`,
+  `ALL_PROXY`, …). urllib's proxy branch sets `_tunnel_host` and rewrites
+  the request host to the proxy, so the pinned connection would have
+  TLS-verified the proxy's certificate while sending an origin-form
+  request — a hostile proxy could have answered with arbitrary release
+  metadata. `build_opener` now passes `ProxyHandler({})` and the
+  connection refuses a tunnel outright. Found by our own adversarial
+  review of the redirect fix, not by the marketplace.
+- A deeply nested JSON release document now raises `NetworkError` instead
+  of escaping as a `RecursionError` traceback, and every resolved address
+  of a host is validated before the first socket is dialled (the previous
+  loop validated per iteration and returned on the first success).
+- The redirect-body drain now arms the socket with the remaining budget
+  before each read, so a stalling hop cannot outrun the absolute deadline.
+
 ### 0.9.8
 
 - The all-statuses redirect test now derives the status list from

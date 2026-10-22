@@ -24,7 +24,7 @@ import stat
 import tempfile
 import time
 
-from . import constants, jobs, utils
+from . import constants, icon, jobs, utils
 
 # A terminal (done|error) or interrupted document is removed — together
 # with its per-job log — once this window has passed since its last
@@ -174,11 +174,54 @@ def sweep_update_temp_dirs(now: float = None,
     return removed
 
 
-def sweep(now: float = None, temp_area: str = None) -> dict:
-    """Both sweeps, best-effort: job documents past the acknowledgement
-    window, then orphan download temp dirs (UPDATE_TEMP_PREFIXES) past the
-    grace window. Returns per-surface removal counts; never raises."""
-    counts = {'documents_removed': 0, 'temp_dirs_removed': 0}
+def sweep_icons(icons_dir: str = None) -> int:
+    """Remove installed icons the shell's decoder must not be handed.
+
+    The v0.9.9 sanitiser gates the EXTRACT path only, and provider.py
+    unlinks the icons of the stem it replaces; an icon written by an older
+    plugin version (an 8000x8000 PNG, say) is otherwise decoded by
+    Panel.qml on every panel open. Header-only check per file (see
+    icon.installed_icon_is_unsafe) — never a full re-sanitise, so this
+    stays cheap enough for the throttled listing hook. Symlinks and
+    non-regular files are skipped; returns the number removed; never
+    raises.
+    """
+    if not icons_dir or os.path.islink(icons_dir) \
+            or not os.path.isdir(icons_dir):
+        return 0
+    try:
+        entries = os.listdir(icons_dir)
+    except OSError as e:
+        logging.debug('janitor: cannot list icons dir %s: %s', icons_dir, e)
+        return 0
+    removed = 0
+    for name in entries:
+        if removed >= MAX_REMOVALS_PER_SWEEP:
+            break
+        path = os.path.join(icons_dir, name)
+        try:
+            if not _is_regular_file(path):
+                continue
+            if not icon.installed_icon_is_unsafe(path):
+                continue
+            os.unlink(path)
+            removed += 1
+            logging.debug('janitor: removed unbounded installed icon %s',
+                          path)
+        except Exception as e:
+            logging.debug('janitor: skipped icon %s: %s', path, e)
+    return removed
+
+
+def sweep(now: float = None, temp_area: str = None,
+          icons_dir: str = None) -> dict:
+    """All three sweeps, best-effort: job documents past the
+    acknowledgement window, orphan download temp dirs (UPDATE_TEMP_PREFIXES)
+    past the grace window, then installed icons beyond the decoder's bounds
+    in `icons_dir` (the managed folder's `.icons`). Returns per-surface
+    removal counts; never raises."""
+    counts = {'documents_removed': 0, 'temp_dirs_removed': 0,
+              'icons_removed': 0}
     try:
         counts['documents_removed'] = sweep_job_documents(now=now)
     except Exception:  # belt and braces: sweep() itself never raises
@@ -188,6 +231,10 @@ def sweep(now: float = None, temp_area: str = None) -> dict:
             now=now, temp_area=temp_area)
     except Exception:
         logging.exception('janitor: temp-dir sweep failed')
+    try:
+        counts['icons_removed'] = sweep_icons(icons_dir=icons_dir)
+    except Exception:
+        logging.exception('janitor: icon sweep failed')
     return counts
 
 
@@ -209,7 +256,7 @@ def sweep_marker_path() -> str:
 
 
 def sweep_throttled(interval_seconds: float = SWEEP_THROTTLE_SECONDS,
-                    now: float = None) -> bool:
+                    now: float = None, icons_dir: str = None) -> bool:
     """sweep(), at most once per `interval_seconds`.
 
     For the high-frequency hook (--list-installed) only; sweep() itself
@@ -240,7 +287,7 @@ def sweep_throttled(interval_seconds: float = SWEEP_THROTTLE_SECONDS,
                            repr(float(now)).encode('utf-8'))
     except OSError as e:
         logging.debug('janitor: could not stamp the sweep marker: %s', e)
-    sweep(now=now)
+    sweep(now=now, icons_dir=icons_dir)
     return True
 
 

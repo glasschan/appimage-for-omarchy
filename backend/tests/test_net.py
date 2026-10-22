@@ -150,6 +150,28 @@ class LocalServerTests(FakeXDGTestCase):
         url = self._serve(type('H', (_RawHandler,), {'body': b'hello'}))
         self.assertEqual(net.fetch_text(url), 'hello')
 
+    def test_environment_proxy_does_not_hijack_a_fetch(self):
+        # build_opener passes ProxyHandler({}) on purpose: with an
+        # environment proxy installed, urllib would set _tunnel_host and
+        # rewrite req.host to the proxy, so the pinned connection would
+        # TLS-verify the PROXY's certificate instead of the release host.
+        url = self._serve(type('H', (_RawHandler,), {'body': b'hello'}))
+        bogus = {'http_proxy': 'http://127.0.0.1:1',
+                 'https_proxy': 'http://127.0.0.1:1',
+                 'ALL_PROXY': 'http://127.0.0.1:1'}
+        with mock.patch.dict(os.environ, bogus):
+            self.assertEqual(net.fetch_text(url), 'hello')
+
+    def test_fetch_json_deep_nesting_raises_network_error(self):
+        # ~200k nested arrays: json's recursive parser raises
+        # RecursionError in C on CPython 3.14. Both call sites only handle
+        # NetworkError, so an escaping RecursionError would crash the CLI.
+        body = b'[' * 200000 + b']' * 200000
+        url = self._serve(type('H', (_RawHandler,), {'body': body}))
+        with self.assertRaises(net.NetworkError) as ctx:
+            net.fetch_json(url)
+        self.assertIn('invalid JSON', str(ctx.exception))
+
     def test_fetch_text_chunked_over_cap_raises(self):
         # no Content-Length at all: the running cap must abort the read
         url = self._serve(type('H', (_RawHandler,), {'body': b'x' * 8192}))
@@ -526,6 +548,63 @@ class RedirectBodyDrainTests(unittest.TestCase):
                 net._ValidatingRedirectHandler._drain_redirect_body(
                     _DripFP(), req)
         self.assertIn('drain deadline exceeded', str(ctx.exception))
+
+
+class NoProxyTests(unittest.TestCase):
+    """An https request must never be tunnelled through an environment
+    proxy: that would authenticate the proxy, not the release host."""
+
+    def test_opener_has_no_proxy_dispatch(self):
+        # ProxyHandler({}) creates no <scheme>_open methods, so build_opener
+        # both skips the default ProxyHandler and ends up with no
+        # proxy_open dispatch at all -- an environment proxy cannot be
+        # consulted even if urllib were to look one up later.
+        self.assertFalse(hasattr(net._opener, 'proxy_open'))
+        names = {type(h).__name__ for h in net._opener.handlers}
+        self.assertIn('_PinnedHTTPSHandler', names)
+        self.assertIn('_ValidatingRedirectHandler', names)
+
+    def test_tunnel_request_is_refused_before_any_dial(self):
+        conn = net._PinnedHTTPSConnection('release.example', 443, timeout=5)
+        conn._tunnel_host = 'proxy.example'
+        with mock.patch.object(net, '_dial_validated') as dial:
+            with self.assertRaises(net.NetworkError) as ctx:
+                conn.connect()
+        self.assertIn('tunnel', str(ctx.exception))
+        dial.assert_not_called()
+
+
+class AddressValidationOrderTests(unittest.TestCase):
+    def test_every_answer_is_validated_before_any_dial(self):
+        # The dial loop returns on the first successful connect, so a
+        # per-iteration check would leave the later answers unchecked.
+        infos = [(socket.AF_INET, socket.SOCK_STREAM, 6, '',
+                  ('93.184.216.34', 443)),
+                 (socket.AF_INET, socket.SOCK_STREAM, 6, '',
+                  ('10.0.0.1', 443))]
+        with mock.patch.object(net.socket, 'getaddrinfo', return_value=infos):
+            with mock.patch.object(net.socket, 'socket') as sock:
+                with self.assertRaises(net.NetworkError) as ctx:
+                    net._dial_validated('release.example', 443, 5)
+        self.assertIn('SSRF', str(ctx.exception))
+        sock.assert_not_called()
+
+
+class RedirectDrainSocketTests(unittest.TestCase):
+    def test_drain_arms_the_socket_before_every_read(self):
+        class _FP:
+            reads = 0
+
+            def read(self, n):
+                self.reads += 1
+                return b'x' * n if self.reads < 3 else b''
+
+        fp = _FP()
+        with mock.patch.object(net, '_arm_socket') as arm:
+            net._ValidatingRedirectHandler._drain_redirect_body(
+                fp, mock.Mock(timeout=5.0))
+        self.assertEqual(fp.reads, 3)
+        self.assertEqual(arm.call_count, fp.reads)
 
 
 if __name__ == '__main__':

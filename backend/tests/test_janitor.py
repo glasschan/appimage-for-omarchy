@@ -11,11 +11,14 @@
 
 import json
 import os
+import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -23,7 +26,7 @@ import helpers
 from helpers import FakeXDGTestCase
 from test_cli import InProcessCliMixin
 
-from omarchy_appimage import cli, janitor, jobs
+from omarchy_appimage import cli, icon, janitor, jobs
 
 WINDOW = janitor.JOB_ACK_WINDOW_SECONDS
 GRACE = janitor.UPDATE_TEMP_GRACE_SECONDS
@@ -288,7 +291,8 @@ class JanitorTempDirTests(_DocSeedMixin, FakeXDGTestCase):
         self._orphan('appimage-update-old', age_seconds=GRACE + 300)
         counts = janitor.sweep(temp_area=self.area)
         self.assertEqual(counts, {'documents_removed': 1,
-                                  'temp_dirs_removed': 1})
+                                  'temp_dirs_removed': 1,
+                                  'icons_removed': 0})
         self.assertFalse(os.path.exists(
             os.path.join(self.plugin_jobs_dir, 'fakeapp.json')))
         self.assertFalse(os.path.exists(
@@ -438,3 +442,61 @@ class SweepThrottleTests(_DocSeedMixin, InProcessCliMixin, FakeXDGTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class IconSweepTests(unittest.TestCase):
+    """The on-disk backstop for icons installed before the sanitiser.
+
+    sanitize_icon() runs at extract time only, so a `.icons/<stem>.png`
+    written by an older plugin version is otherwise decoded by Panel.qml on
+    every panel open with no bound at all. The sweep is header-only: a PNG
+    is judged from its IHDR, an SVG from its size.
+    """
+
+    def setUp(self):
+        self.icons = tempfile.mkdtemp(prefix='icons-sweep-')
+        self.addCleanup(shutil.rmtree, self.icons, True)
+
+    def _write(self, name, data):
+        path = os.path.join(self.icons, name)
+        with open(path, 'wb') as handle:
+            handle.write(data)
+        return path
+
+    def _png(self, width, height):
+        ihdr = struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)
+        return (b'\x89PNG\r\n\x1a\n'
+                + struct.pack('>I', 13) + b'IHDR' + ihdr
+                + struct.pack('>I', zlib.crc32(b'IHDR' + ihdr) & 0xFFFFFFFF))
+
+    def test_oversized_png_is_removed(self):
+        bomb = self._write('bomb.png', self._png(60000, 60000))
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 1)
+        self.assertFalse(os.path.exists(bomb))
+
+    def test_oversized_svg_is_removed(self):
+        big = self._write('big.svg',
+                          b'<svg>' + b' ' * (icon.MAX_SVG_BYTES + 1))
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 1)
+        self.assertFalse(os.path.exists(big))
+
+    def test_bounded_icons_survive(self):
+        small = self._write('ok.png', self._png(512, 512))
+        svg = self._write('ok.svg', b'<svg width="16" height="16"/>')
+        other = self._write('notes.txt', b'x' * 4096)
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 0)
+        for path in (small, svg, other):
+            self.assertTrue(os.path.exists(path))
+
+    def test_symlink_is_never_followed_or_removed(self):
+        target = self._write('real.png', self._png(60000, 60000))
+        link = os.path.join(self.icons, 'link.png')
+        os.symlink(target, link)
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 1)
+        self.assertFalse(os.path.exists(target))
+        self.assertTrue(os.path.islink(link))
+
+    def test_missing_directory_is_a_no_op(self):
+        self.assertEqual(janitor.sweep_icons(
+            icons_dir=os.path.join(self.icons, 'absent')), 0)
+        self.assertEqual(janitor.sweep_icons(icons_dir=None), 0)
