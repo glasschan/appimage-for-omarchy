@@ -1,3 +1,4 @@
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 """Provider-supplied icon bytes are made safe to hand to the shell decoder.
 
 An icon is read out of an AppImage the plugin downloaded from a release

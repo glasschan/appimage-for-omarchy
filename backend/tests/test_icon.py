@@ -1,3 +1,4 @@
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 """Icon sanitisation: provider bytes never reach the shell's decoder unbounded."""
 
 import struct
