@@ -352,6 +352,14 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.9.6
+
+- Marketplace review hardening: urllib drains each redirect's intermediate
+  3xx body with an unbounded read before the plugin's response caps could
+  apply, so the hardened transport now drains redirect bodies itself in
+  bounded chunks (1 MiB cap, wall-clock deadline) and refuses to follow a
+  hop whose body exceeds the cap. A normal small redirect still follows.
+
 ### 0.9.5
 
 - An app integrated before 0.9.4 gets its version without waiting for a

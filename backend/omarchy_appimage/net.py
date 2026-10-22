@@ -14,7 +14,10 @@
 #   * DNS-rebinding-safe dialing — the raw socket is pinned to one of the
 #     validated addresses (TLS still verifies the original hostname via
 #     SNI/cert checks), so the resolve-then-connect TOCTOU window is gone;
-#   * manual redirects — max 5 hops, each hop re-validated;
+#   * manual redirects — max 5 hops, each hop re-validated, and the
+#     intermediate 3xx body is drained in bounded chunks (stdlib drains
+#     it with an unbounded fp.read() before the final-response byte
+#     caps could ever apply);
 #   * byte caps — metadata responses are capped at MAX_METADATA_BYTES,
 #     downloads at MAX_DOWNLOAD_BYTES (a running cap aborts mid-stream
 #     even when the server lies about or omits Content-Length);
@@ -54,6 +57,13 @@ MAX_METADATA_BYTES = 4 * 1024 * 1024            # 4 MiB
 MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024     # 4 GiB
 
 _MAX_REDIRECTS = 5
+# An intermediate 3xx body is never a payload, but urllib's redirect
+# handling drains it with an unbounded fp.read() before following the
+# redirect — a hostile hop could buffer an arbitrarily large body in
+# helper memory before the final-response byte caps are ever reached.
+# The drain is therefore performed here, in bounded chunks, and an
+# oversized (or endless) redirect body fails the request outright.
+_MAX_REDIRECT_BODY_BYTES = 1024 * 1024
 _CHUNK = 64 * 1024
 
 # Test-only seam: loopback/private targets for the loopback test servers.
@@ -174,7 +184,12 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Manual redirect handling: the chain is capped at _MAX_REDIRECTS
     hops and every hop is re-validated eagerly (https-only, no userinfo,
     public addresses) — the pinned connection re-checks at dial time, the
-    eager check just makes the failure message point at the right hop."""
+    eager check just makes the failure message point at the right hop.
+
+    Intermediate 3xx bodies are drained by http_error_302 in bounded
+    chunks and capped at _MAX_REDIRECT_BODY_BYTES; stdlib drains them
+    with an unbounded fp.read(), which would let a hostile hop exhaust
+    helper memory before the final-response byte caps apply."""
 
     max_hops = _MAX_REDIRECTS
 
@@ -188,6 +203,39 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
         if new is not None:
             new.redirect_hops = hops
         return new
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        # Reached for 301/302/303/307/308 (the stdlib aliases all call
+        # http_error_302). Drain the intermediate body here, in bounded
+        # chunks, before the stdlib follows the redirect; its own
+        # fp.read() then sees EOF.
+        self._drain_redirect_body(fp, req)
+        return super().http_error_302(req, fp, code, msg, headers)
+
+    @staticmethod
+    def _drain_redirect_body(fp, req) -> None:
+        deadline = getattr(req, 'timeout', None)
+        if not isinstance(deadline, (int, float)) or deadline <= 0:
+            deadline = DEFAULT_TIMEOUT
+        start = time.monotonic()
+        total = 0
+        try:
+            while True:
+                chunk = fp.read(_CHUNK)
+                if not chunk:
+                    return
+                total += len(chunk)
+                if total > _MAX_REDIRECT_BODY_BYTES:
+                    raise NetworkError(
+                        f'{req.full_url}: redirect body exceeds '
+                        f'{_MAX_REDIRECT_BODY_BYTES} bytes')
+                if time.monotonic() - start > deadline:
+                    raise NetworkError(f'{req.full_url}: redirect body '
+                                       'drain deadline exceeded')
+        except NetworkError:
+            raise
+        except Exception as e:
+            raise NetworkError(f'{req.full_url}: redirect body: {e}') from e
 
 
 _opener = urllib.request.build_opener(_ValidatingRedirectHandler(),

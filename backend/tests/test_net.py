@@ -205,6 +205,54 @@ class LocalServerTests(FakeXDGTestCase):
         with open(dest, 'rb') as f:
             self.assertEqual(f.read(), body)
 
+    def test_redirect_small_body_follows(self):
+        # end-to-end through http_error_302: a normal small redirect body
+        # is drained and the hop is followed
+        url = self._serve(type('H', (_RedirectHandler,),
+                               {'body': b'next', 'final_hits': 0}))
+        self.assertEqual(net.fetch_text(url), 'final')
+
+    def test_redirect_intermediate_body_over_cap_raises(self):
+        # the stdlib drains the intermediate 3xx body with an unbounded
+        # fp.read(); the bounded drain must fail the request before the
+        # hop is followed (final_hits stays 0)
+        handler = type('H', (_RedirectHandler,),
+                       {'body': b'x' * (net._MAX_REDIRECT_BODY_BYTES + 1),
+                        'final_hits': 0})
+        url = self._serve(handler)
+        with self.assertRaises(net.NetworkError) as ctx:
+            net.fetch_text(url)
+        self.assertIn('redirect body exceeds', str(ctx.exception))
+        self.assertEqual(handler.final_hits, 0)
+
+
+class _RedirectHandler(BaseHTTPRequestHandler):
+    """Serves a 302 to /final carrying a fixed intermediate body, then a
+    200 'final' — exercises the bounded redirect-body drain end to end."""
+    body = b'next'
+    final_hits = 0
+
+    def do_GET(self):
+        if self.path == '/final':
+            type(self).final_hits += 1
+            payload = b'final'
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        self.send_response(302)
+        self.send_header('Location', '/final')
+        self.send_header('Content-Length', str(len(self.body)))
+        self.end_headers()
+        try:
+            self.wfile.write(self.body)
+        except OSError:
+            pass  # the bounded drain may legitimately hang up mid-body
+
+    def log_message(self, format, *args):  # silence the test output
+        pass
+
 
 class EnvKillSwitchTests(unittest.TestCase):
     """Round 2: the old OMARCHY_APPIMAGE_ALLOW_LOCAL_HTTP environment
@@ -407,6 +455,37 @@ class RedirectValidationTests(unittest.TestCase):
             with self.assertRaises(net.NetworkError):
                 self._redirect('https://releases.example/5',
                                hops=net._MAX_REDIRECTS)
+
+
+class RedirectBodyDrainTests(unittest.TestCase):
+    """The bounded drain of intermediate 3xx bodies (byte cap + wall-
+    clock deadline); the stdlib's http_error_302 drains with an
+    unbounded fp.read(). Unit-tested without sockets."""
+
+    def test_redirect_body_over_cap_raises(self):
+        class _EndlessFP:
+            def read(self, n):
+                return b'x' * n
+
+        req = urllib.request.Request('https://releases.example/a')
+        with self.assertRaises(net.NetworkError) as ctx:
+            net._ValidatingRedirectHandler._drain_redirect_body(
+                _EndlessFP(), req)
+        self.assertIn('redirect body exceeds', str(ctx.exception))
+
+    def test_drain_deadline_exceeded(self):
+        class _DripFP:
+            def read(self, n):
+                return b'x' * n
+
+        req = urllib.request.Request('https://releases.example/a')
+        req.timeout = 0.2
+        ticks = iter([0.0, 0.01, 10.0, 10.0])
+        with mock.patch.object(net.time, 'monotonic', lambda: next(ticks)):
+            with self.assertRaises(net.NetworkError) as ctx:
+                net._ValidatingRedirectHandler._drain_redirect_body(
+                    _DripFP(), req)
+        self.assertIn('drain deadline exceeded', str(ctx.exception))
 
 
 if __name__ == '__main__':
