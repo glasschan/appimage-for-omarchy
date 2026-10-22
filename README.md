@@ -352,6 +352,21 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.9.10
+
+- The process-fixture test (`RealProcessTests`) no longer copies
+  `/bin/sleep`. Ubuntu ships uutils coreutils, where `/bin/sleep` is a
+  multicall binary that refuses any executable name it does not know
+  (`Security violation: Requested utility ... does not match executable
+  name`), so the copy exited 1 within 20 ms of exec — after the kernel
+  had already recorded the temp path in `/proc/<pid>/exe`, which is the
+  only thing the identity scan reads, so the scan came back empty and the
+  suite went red on that platform alone. The fixture now copies the
+  interpreter that runs the test and spawns it with `-c`, which dispatches
+  on nothing, and `setUp` re-checks liveness right after exec and reports
+  the child's exit code and stderr, so a platform that refuses the copy
+  says so instead of failing as an empty scan. Test-only.
+
 ### 0.9.9
 
 - Icons extracted from an AppImage are no longer installed (and therefore

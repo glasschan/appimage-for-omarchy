@@ -3,9 +3,9 @@
 #
 # Test suite written for this plugin. Every branch of the identity scan
 # and of the quit walk is driven through the probe seam with a fake; the
-# ONE exception is RealProcessTests, which copies /bin/sleep to a temp
-# "AppImage" path, spawns it as its own child and is the only test in the
-# suite allowed to signal anything — and only that child.
+# ONE exception is RealProcessTests, which copies the running interpreter
+# to a temp "AppImage" path, spawns it as its own child and is the only
+# test in the suite allowed to signal anything — and only that child.
 #
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 
@@ -13,6 +13,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -522,32 +523,34 @@ def _pid_alive(pid: int) -> bool:
 
 class RealProcessTests(unittest.TestCase):
     """The one test allowed to signal anything: a child of this test
-    process (a copy of /bin/sleep at a temp path, so its exe IS that
-    path) is detected and then quit. Nothing else is ever signalled."""
+    process (a copy of the running interpreter at a temp path, so its exe
+    IS that path) is detected and then quit. Nothing else is ever
+    signalled."""
 
     def setUp(self):
         self.tmpdir = os.path.realpath(
             tempfile.mkdtemp(prefix='omarchy-appimage-proc-'))
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
         self.appimage = os.path.join(self.tmpdir, 'probe-test.appimage')
-        shutil.copy2('/bin/sleep', self.appimage)
+        # The fixture is a copy of the interpreter running this test: it
+        # is known to work on this machine and, unlike /bin/sleep, it
+        # dispatches on nothing. Ubuntu ships uutils coreutils as
+        # /bin/sleep, a multicall binary that refuses any executable name
+        # it does not know ("Security violation: Requested utility
+        # `probe-test` does not match executable name"), so the previous
+        # /bin/sleep fixture exited 1 within 20 ms on the CI runner —
+        # after the kernel had recorded the temp path in /proc/<pid>/exe,
+        # which is the only thing the identity scan reads, so the scan
+        # came back empty on exactly one platform.
+        shutil.copy2(sys.executable, self.appimage)
         os.chmod(self.appimage, 0o755)
 
         try:
-            # argv[0] is the applet name, never the temp path: the CI
-            # runner ships uutils coreutils, whose /bin/sleep is a
-            # multicall binary that picks its applet from the basename of
-            # argv[0] (busybox and GNU coreutils' single binaries do the
-            # same), so a copy launched as `probe-test.appimage` printed
-            # an applet error and exited 1 within 20 ms — after the kernel
-            # had already recorded the temp path in /proc/<pid>/exe, which
-            # is the only thing the identity scan reads. Naming the applet
-            # keeps the fixture alive on every coreutils flavour.
-            self.child = subprocess.Popen(['sleep', '60'],
-                                          executable=self.appimage,
-                                          stdin=subprocess.DEVNULL,
-                                          stdout=subprocess.DEVNULL,
-                                          stderr=subprocess.DEVNULL)
+            self.child = subprocess.Popen(
+                [self.appimage, '-c', 'import time; time.sleep(60)'],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE)
         except PermissionError:
             # a noexec /tmp: this test needs an executable temp path
             self.skipTest('temp dir is mounted noexec')
@@ -564,7 +567,8 @@ class RealProcessTests(unittest.TestCase):
             except OSError:
                 pass
             if self.child.poll() is not None:
-                self.fail('child exited before detection')
+                self.fail('child exited before detection '
+                          f'({self._child_death()})')
             time.sleep(0.01)
         else:
             self.fail('child never exec\'d the temp path')
@@ -575,12 +579,23 @@ class RealProcessTests(unittest.TestCase):
         time.sleep(0.05)
         if self.child.poll() is not None:
             self.fail('fixture exited right after exec '
-                      f'(rc={self.child.returncode})')
+                      f'({self._child_death()})')
+
+    def _child_death(self):
+        """What the dead fixture said, so a platform that refuses to
+        run a copied binary explains itself instead of failing as an
+        empty scan."""
+        said = b''
+        if self.child.stderr is not None:
+            said = self.child.stderr.read()[-400:]
+        return f'rc={self.child.returncode} stderr={said!r}'
 
     def _reap_child(self):
         if self.child.poll() is None:
             self.child.kill()
         self.child.wait(timeout=10)
+        if self.child.stderr is not None:
+            self.child.stderr.close()
 
     def test_detects_and_quits_its_own_child(self):
         found = procs.pids_for(self.appimage)
