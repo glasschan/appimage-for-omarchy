@@ -534,7 +534,17 @@ class RealProcessTests(unittest.TestCase):
         os.chmod(self.appimage, 0o755)
 
         try:
-            self.child = subprocess.Popen([self.appimage, '60'],
+            # argv[0] is the applet name, never the temp path: the CI
+            # runner ships uutils coreutils, whose /bin/sleep is a
+            # multicall binary that picks its applet from the basename of
+            # argv[0] (busybox and GNU coreutils' single binaries do the
+            # same), so a copy launched as `probe-test.appimage` printed
+            # an applet error and exited 1 within 20 ms — after the kernel
+            # had already recorded the temp path in /proc/<pid>/exe, which
+            # is the only thing the identity scan reads. Naming the applet
+            # keeps the fixture alive on every coreutils flavour.
+            self.child = subprocess.Popen(['sleep', '60'],
+                                          executable=self.appimage,
                                           stdin=subprocess.DEVNULL,
                                           stdout=subprocess.DEVNULL,
                                           stderr=subprocess.DEVNULL)
@@ -558,6 +568,14 @@ class RealProcessTests(unittest.TestCase):
             time.sleep(0.01)
         else:
             self.fail('child never exec\'d the temp path')
+
+        # the scan below must observe a live process: a fixture that dies
+        # just after exec is a broken test environment, not a detection
+        # bug, and must say so instead of surfacing as an empty scan
+        time.sleep(0.05)
+        if self.child.poll() is not None:
+            self.fail('fixture exited right after exec '
+                      f'(rc={self.child.returncode})')
 
     def _reap_child(self):
         if self.child.poll() is None:
