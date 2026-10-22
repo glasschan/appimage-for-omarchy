@@ -352,6 +352,14 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.9.8
+
+- The all-statuses redirect test now derives the status list from
+  `urllib.request.HTTPRedirectHandler` itself instead of hardcoding
+  (301, 302, 303, 307, 308), so a status added to the stdlib is covered
+  automatically and a regression to an `http_error_302`-only hook fails
+  for the aliased statuses. Test-only.
+
 ### 0.9.7
 
 - Follow-up to 0.9.6: the bounded redirect-body drain now runs from

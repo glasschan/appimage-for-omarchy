@@ -226,13 +226,32 @@ class LocalServerTests(FakeXDGTestCase):
         self.assertIn('redirect body exceeds', str(ctx.exception))
         self.assertEqual(handler.final_hits, 0)
 
+    @staticmethod
+    def _stdlib_redirect_statuses() -> list:
+        """Every 3xx status the stdlib's redirect handler serves, read from
+        urllib itself instead of written down here.
+
+        The premise of this test is that a subclass hook can silently miss
+        statuses: CPython declares 301/303/307/308 as class-level ALIASES of
+        the base http_error_302 function, so `dir()` — not a hand-kept tuple
+        — is what decides which statuses exist. A hardcoded list would miss
+        whatever CPython adds next, which is exactly how the 0.9.6 fix
+        shipped half-covered."""
+        prefix = 'http_error_'
+        return sorted({int(name[len(prefix):])
+                       for name in dir(urllib.request.HTTPRedirectHandler)
+                       if name.startswith(prefix)
+                       and name[len(prefix):].isdigit()})
+
     def test_every_redirect_status_drains_the_body(self):
-        # 301/303/307/308 are class-level aliases of the base
-        # http_error_302 FUNCTION in CPython, so an http_error_302
-        # override would never run for them; the drain lives in
-        # redirect_request (dynamically dispatched for all of them) and
-        # every status must therefore abort on an oversized body.
-        for status in (301, 302, 303, 307, 308):
+        # The drain lives in redirect_request, not in an http_error_30x
+        # override: an override would only ever fire for the status it is
+        # named after, because the other statuses are aliases of the base
+        # function object. Every status the stdlib serves must therefore
+        # abort on an oversized intermediate body, however that set grows.
+        statuses = self._stdlib_redirect_statuses()
+        self.assertIn(302, statuses)  # sanity: the derivation works
+        for status in statuses:
             with self.subTest(status=status):
                 handler = type('H', (_RedirectHandler,),
                                {'body': b'x'
