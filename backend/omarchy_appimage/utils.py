@@ -167,7 +167,8 @@ def atomic_write(path: str, data: bytes):
 
 
 def is_app_running(file_path: str,
-                   mounts_path: str = None) -> bool:
+                   mounts_path: str = None,
+                   probe=None) -> bool:
     """True when the executable at `file_path` is currently running
     (ported from GearLever's AppImageProvider.is_app_running).
 
@@ -182,12 +183,15 @@ def is_app_running(file_path: str,
       2. `file_path` is the mount source of an active FUSE mount
          (see is_fuse_mounted).
 
-    `mounts_path` overrides the /proc/mounts location (tests)."""
-    return (_running_by_ps(file_path)
-            or is_fuse_mounted(file_path, mounts_path))
+    `mounts_path` overrides the /proc/mounts location (tests), and
+    `probe` is procs' seam: a listing passes ONE cached probe so N rows
+    cost one `ps` and one mounts read instead of one of each per row."""
+    from . import procs
+    return (_running_by_ps(file_path, probe)
+            or is_fuse_mounted(file_path, mounts_path, probe=probe))
 
 
-def _running_by_ps(file_path: str) -> bool:
+def _running_by_ps(file_path: str, probe=None) -> bool:
     """True when a process's exe IS `file_path`.
 
     One rule with procs.pids_for — one bounded `ps -eo pid=,exe=` scan
@@ -202,7 +206,7 @@ def _running_by_ps(file_path: str) -> bool:
     from . import procs
 
     try:
-        return bool(procs.pids_for(file_path)['parent'])
+        return bool(procs.pids_for(file_path, probe=probe)['parent'])
     except Exception as e:
         # Best-effort, like the `ps` lookup it replaces: no answer means
         # "nothing attributable", never a caller error.
@@ -244,7 +248,8 @@ def parse_proc_mounts(path: str = None) -> list:
     return entries
 
 
-def is_fuse_mounted(file_path: str, mounts_path: str = None) -> bool:
+def is_fuse_mounted(file_path: str, mounts_path: str = None,
+                    probe=None) -> bool:
     """True when `file_path` is the source of an active FUSE mount.
 
     While a type-2 AppImage runs, its runtime FUSE-mounts the image at
@@ -265,7 +270,7 @@ def is_fuse_mounted(file_path: str, mounts_path: str = None) -> bool:
     # would be a cycle.
     from . import procs
 
-    return bool(procs.mount_points_for(file_path, mounts_path))
+    return bool(procs.mount_points_for(file_path, mounts_path, probe=probe))
 
 
 def gnu_naturalsize(value: int, precision: int = 1) -> str:

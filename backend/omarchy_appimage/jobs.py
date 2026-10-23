@@ -199,6 +199,33 @@ def open_job_log_fd(desktop_id: str) -> int:
     return fd
 
 
+def claim_held(desktop_id: str) -> bool:
+    """True when some live run holds this app's update claim (issue #46).
+
+    `active_job` answers from the job DOCUMENT, which only exists once the
+    async grandchild writes it — a synchronous `--update` holds the claim
+    while writing nothing. Removal has to ask the claim itself, or it
+    could uninstall an app the sync path is replacing. This never
+    truncates and never creates anything: it opens the log (which the
+    claim's holder already created), tries the same exclusive flock, and
+    closes its own descriptor, so the kernel drops only this probe.
+    """
+    path = job_log_path(desktop_id)
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False  # nothing to open: no log, so no claim
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return False
+
+
 def _truncate_log_over_cap(path: str):
     """Drop an over-cap log to empty. Must only be called by the holder
     of the job claim (the flock in open_job_log_fd)."""

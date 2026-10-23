@@ -92,8 +92,6 @@ Panel {
   // and must never judge the launch. On a failed verdict the banner gets
   // the fuse2 hint line only when that same listing's runtime block says
   // "missing" (Model.launchFailureBanner decides).
-  property string settleLaunchId: ""
-  property real settleLaunchMs: 0
   // Status notices fade on their own after this long (matching the
   // backend's desktop-notification expire time); errors never auto-hide.
   readonly property int statusTimeoutMs: 5000
@@ -329,11 +327,15 @@ Panel {
 
   function syncFromModel() {
     items = Model.state.items.slice()
-    busyList = Model.state.busy.list === true
-    busyIntegrate = Model.state.busy.integrate === true
-    busyPick = Model.state.busy.pick === true
-    busyRemove = Model.state.busy.remove === true
-    busyUpdates = Model.state.busy.updates === true
+    // One snapshot of the operation state (ticket #42): the panel and the
+    // service read the same shape, so a second surface can never disagree
+    // about who owns a run.
+    var ops = Model.snapshot()
+    busyList = ops.busy.list
+    busyIntegrate = ops.busy.integrate
+    busyPick = ops.busy.pick
+    busyRemove = ops.busy.remove
+    busyUpdates = ops.busy.updates
     // Per-row job views (ticket #11): mirror the adopted decisions into a
     // reactive map — rows read jobStates[id] and nothing else.
     var jobs = {}
@@ -372,14 +374,9 @@ Panel {
     // Parked, not run: the cache-first refresh below may occupy the shared
     // backend process, and tryConsumePendingDrop waits that out.
     readDropPayload(payloadJson)
-    // Release flags a DESTROYED panel instance left behind before mirroring
-    // the store: closing the panel unloads this whole QML object, which
-    // SIGTERMs its backend child (the shell's kill is `running: false`) and
-    // so never runs the onDone callback that would have cleared the flag.
-    // `lib/Model.js` is engine-wide, so without this the "Integrating…" of a
-    // run that died with the last panel instance is permanent — and the
-    // busy guard then refuses every retry (see releaseOrphanedRuns).
-    Model.releaseOrphanedRuns()
+    // Mirror the store. Run flags left by a DESTROYED instance were already
+    // released in Component.onCompleted — never here, because the shell
+    // re-delivers open() to a live panel.
     syncFromModel()
     // Settle the python3 state first: with it missing, refresh() below is
     // a no-op and the install card takes over the body instead.
@@ -425,8 +422,12 @@ Panel {
     // synthetically instead (same result shape as Backend.handleExit's
     // timeout report) so the caller's normal failure path runs.
     if (runCtx && runCtx.active === true) {
+      // A second call is a WAIT, never a failure (ticket #42): the caller's
+      // normal failure path would otherwise invent "Backend call failed
+      // (list)" and wipe the status line of the run that is still healthy.
       onDone({ ok: false, exitCode: -1, stdout: "", stderr: "", json: null,
-               timedOut: false, spawnFailed: false, error: "busy" })
+               timedOut: false, spawnFailed: false, error: "busy",
+               wait: true })
       return
     }
     var ctx = Backend.run(backendProc, backendTimer, backendCommand, args, options || {}, onDone)
@@ -436,12 +437,27 @@ Panel {
   // Map a finished Backend.run result onto the store's error/status state.
   // Covers: watchdog timeout, spawn failure (python3 missing), non-JSON
   // stdout, and the backend's own {"result":"error"} documents.
-  function reportFailure(result, what) {
+  //
+  // `app` is the row this call concerned ({ id, name }) or null: an error
+  // about one app must name it (ticket #48), and only that same app's next
+  // outcome may replace it.
+  function reportFailure(result, what, app) {
+    var subject = app ? app.id : ""
+    var detail = function(message) {
+      return app ? Model.appErrorBanner(app.name, message) : message
+    }
+    // Another operation owns the shared Process (ticket #42): say so quietly
+    // and leave whatever status the running operation set exactly as it is —
+    // this is a wait, not an outcome.
+    if (result.wait === true) {
+      Model.setTransientStatus(strings.operationBusy)
+      return
+    }
     // A watchdog timeout means the backend ran but overran its budget —
     // a different problem from "never ran at all", and blaming python3
     // here sent users hunting for the wrong fix during slow updates.
     if (result.timedOut) {
-      Model.setError(strings.timeout)
+      Model.setError(detail(strings.timeout), subject)
       return
     }
     if (result.spawnFailed || result.error === "no-backend-command") {
@@ -458,15 +474,16 @@ Panel {
     // garbage stdout parses to null and falls through to the stderr line.
     var doc = Backend.parseJson(result.stdout)
     if (doc && doc.result === "error" && doc.error) {
-      Model.setError(String(doc.error))
+      // The backend's own message already names the target where it can.
+      Model.setError(String(doc.error), subject)
       return
     }
     if (result.stderr !== "" || result.stdout !== "") {
-      Model.setError(strings.backendFailed + ": "
-        + Backend.elide(result.stderr || result.stdout))
+      Model.setError(detail(strings.backendFailed + ": "
+        + Backend.elide(result.stderr || result.stdout)), subject)
       return
     }
-    Model.setError(strings.backendFailed + " (" + what + ")")
+    Model.setError(detail(strings.backendFailed + " (" + what + ")"), subject)
   }
 
   // ---- python3 dependency (authorized install) ------------------------------
@@ -625,9 +642,11 @@ Panel {
       if (result.ok) {
         var parsed = Model.parseListJson(result.stdout)
         if (parsed.ok) {
-          Model.setItems(parsed.items, parsed.runtime)
-          Model.clearError()
-          root.settleLaunch(parsed, refreshStartedMs)
+          // A listing that settled an armed launch verdict just raised the
+          // failure banner; clearing here would erase it before it paints.
+          var settled = Model.setItems(
+                parsed.items, parsed.runtime, refreshStartedMs)
+          if (settled !== true) Model.clearError()
         } else {
           Model.setError(parsed.error)
         }
@@ -658,11 +677,11 @@ Panel {
       .filter(function(a) { return a && !/^%[fFuUicdk]$/.test(a) })
     Quickshell.execDetached(["env", "DESKTOPINTEGRATION=1", item.path].concat(args))
     Model.markRunning(item.id, true)
-    // Arm the launch verdict: the settle listing decides whether the app
-    // really came up (see settleLaunch below — spawn success says nothing
-    // about the AppImage runtime).
-    root.settleLaunchId = item.id
-    root.settleLaunchMs = Date.now()
+    // Arm the launch verdict in the STORE (ticket #47): spawn success says
+    // nothing about the AppImage runtime, and this click closes the panel,
+    // so the verdict has to outlive this object. Any later listing settles
+    // it — the timer below only asks for one soon.
+    Model.armLaunchVerdict(item.id)
     launchSettleTimer.restart()
     // The panel is a full-screen overlay with exclusive keyboard focus, so
     // a freshly launched app would sit behind it and the user would have
@@ -671,31 +690,6 @@ Panel {
     // consistent. A pinned panel is a compact floating window that is
     // meant to stay open.
     if (!root.pinned) root.requestClose()
-  }
-
-  // Consume the armed launch verdict on a completed listing. Only a
-  // listing that started AFTER the launch click may judge it — its ps
-  // snapshot is the first one that can see the new process; anything
-  // already in flight at click time (or any earlier snapshot) would read
-  // a false "not running" and blame a healthy launch. App gone from the
-  // list (removed elsewhere) and running apps are silent: a missing row
-  // is no claim, and a successful launch must never show a banner. A
-  // failed verdict raises the launch-failure banner, whose fuse2 hint
-  // line appears only when that same listing's runtime block reports
-  // "missing" (Model.launchFailureBanner; text only — no command, no
-  // button). The store-side error means the banner also survives the
-  // post-launch panel close and greets the next open.
-  function settleLaunch(parsed, startedMs) {
-    if (root.settleLaunchId === "") return
-    if (startedMs < root.settleLaunchMs) return
-    var item = null
-    for (var i = 0; i < parsed.items.length; i++) {
-      if (parsed.items[i].id === root.settleLaunchId) { item = parsed.items[i]; break }
-    }
-    root.settleLaunchId = ""
-    root.settleLaunchMs = 0
-    if (!item || item.running) return
-    Model.setError(Model.launchFailureBanner(item.name, parsed.runtime.fuse2))
   }
 
   // F3: first click arms the inline confirmation, second click runs
@@ -727,10 +721,10 @@ Panel {
           Model.removeById(item.id)
           Model.clearError()
         } else {
-          reportFailure(result, "remove")
+          reportFailure(result, "remove", item)
         }
       } else {
-        reportFailure(result, "remove")
+        reportFailure(result, "remove", item)
       }
       syncFromModel()
       refresh()
@@ -798,7 +792,7 @@ Panel {
     Model.setStatus(strings.checkingUpdates)
     syncFromModel()
     callBackend(["--list-updates", "--json"], { timeoutMs: checkTimeoutMs }, function(result) {
-      Model.releaseUpdateCheck()
+      Model.releaseUpdateCheck("panel")
       if (result.ok) {
         var parsed = Model.parseUpdatesJson(result.stdout)
         if (parsed.ok) {
@@ -908,12 +902,13 @@ Panel {
             JobDocs.provisionalActiveDecision(item.id))
         } else {
           // job-started is the only success shape --async reports.
-          Model.setError(strings.backendFailed + " (update)")
+          Model.setError(Model.appErrorBanner(item.name,
+            strings.backendFailed + " (update)"), item.id)
         }
       } else {
         // Refusals arrive as error documents — the backend's own message
         // (the active-job refusal names the pid) surfaces verbatim.
-        reportFailure(result, "update")
+        reportFailure(result, "update", item)
       }
       syncFromModel()
       // Converge the row with whatever its job document says now — the
@@ -1016,6 +1011,8 @@ Panel {
     if (seen) return
     Model.markJobConsumed(id, parsed.heartbeat > 0 ? parsed.heartbeat : -1)
     if (d.state === "done") {
+      // This app reached an outcome, so an older error about it is spent.
+      Model.noteOutcome(id)
       // "updated" changed the AppImage (and its desktop entry's version):
       // re-list so names, versions and manager columns stay truthful.
       if (d.status === "updated") {
@@ -1031,9 +1028,9 @@ Panel {
     } else if (d.state === "error") {
       // G: the error line also carries the closed-app clause when the job
       // closed the app and THEN failed (force_quit on an error document)
-      Model.setError(Model.jobErrorBanner(d, strings.backendFailed))
+      Model.setError(Model.jobErrorBanner(d, strings.backendFailed), id)
     } else { // interrupted: dead updater or a heartbeat stale past 120 s
-      Model.setError(strings.jobInterrupted)
+      Model.setError(strings.jobInterrupted, id)
     }
     syncFromModel()
   }
@@ -1631,6 +1628,17 @@ Panel {
   }
 
   Component.onCompleted: {
+    // Release flags a DESTROYED panel instance left behind. Only a fresh
+    // instance can run this: closing the panel unloads this whole QML
+    // object, which SIGTERMs its backend child (the shell's kill is
+    // `running: false`) and so never runs the onDone callback that would
+    // have cleared the flag. `lib/Model.js` is engine-wide, so without this
+    // the "Integrating…" of a run that died with the last instance is
+    // permanent and the busy guard refuses every retry. It must NOT live in
+    // open(): the shell re-delivers open() to the live panel (summon, bar
+    // drop), and a live panel releasing its own claim lets the service
+    // start a second sweep beside it.
+    Model.releaseOrphanedRuns()
     syncFromModel()
     unsubscribe = Model.subscribe(syncFromModel)
     probePython()
@@ -3093,7 +3101,12 @@ Panel {
                             // document, not a click.
                             PanelActionButton {
                               id: updateButton
+                              // A source that cannot prove its artifact
+                              // (ticket #39) offers no update action: the
+                              // backend would refuse the install, so the row
+                              // shows "cannot verify" instead.
                               visible: rowOuter.modelData.updateVersion !== ""
+                                && rowOuter.modelData.installable !== false
                               enabled: !root.jobActive(rowOuter.modelData.id)
                               tooltipText: root.strings.updateAction
                               foreground: root.foreground

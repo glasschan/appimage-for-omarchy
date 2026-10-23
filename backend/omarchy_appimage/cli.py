@@ -25,7 +25,7 @@ import time
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from . import (constants, extractor, janitor, jobs, net, pick_file, procs,
-               settings, utils)
+               settings, updaters, utils)
 from .extractor import read_desktop_entry_in_place
 from .ini_config import Config
 from .provider import (AppImageListElement, AppImageProvider,
@@ -194,7 +194,10 @@ def _running_pid_count(el, probe=None) -> int:
 def _make_app_json(el, manager=None, running=None, probe=None) -> dict:
     if running is None:
         try:
-            running = appimage_provider.is_app_running(el)
+            # `probe` is the listing's ONE cached scan: asking the question
+            # per row would spawn a fresh `ps` for every app, every poll
+            # (ticket #41)
+            running = appimage_provider.is_app_running(el, probe=probe)
         except Exception:
             running = False
             logging.exception('is_app_running failed')
@@ -208,6 +211,13 @@ def _make_app_json(el, manager=None, running=None, probe=None) -> dict:
         'available_version': manager.available_version if manager else None,
         'download_size': manager.download_size if manager else None,
         'manager': manager.name if manager else None,
+        # additive (schema_version stays 1), issue #39: the method a fetch
+        # would use to prove the artifact, and whether that fetch would even
+        # be attempted. `null` means no verdict yet (no check has run, or
+        # there is no source); the policy itself is unchanged — a source
+        # that cannot prove its artifact still refuses the install.
+        'verification': _verification_of(manager),
+        'installable': _installable_of(manager),
         'embedded_source': bool(manager and manager.embedded),
         'running': running,
         # additive (schema_version stays 1): how many processes belong to
@@ -220,8 +230,47 @@ def _make_app_json(el, manager=None, running=None, probe=None) -> dict:
     }
 
 
+# The four verification methods a source can report (issue #39). Only the
+# two digest methods let download() accept an artifact, which is what makes
+# installability derivable instead of a second opinion.
+DIGEST_VERIFICATIONS = ('sha256', 'zsync-sha1')
+VERIFICATIONS = DIGEST_VERIFICATIONS + ('size', 'none')
+
+
+def _verification_of(manager) -> str:
+    """The method this source would use, normalised to the contract's set."""
+    if manager is None:
+        return 'none'
+    method = manager.verification_method()
+    return method if method in VERIFICATIONS else 'none'
+
+
+def _installable_of(manager):
+    """True/False once a check reached a verdict, None before one.
+
+    Derived from the method so the two fields can never disagree: only a
+    digest lets the fetch path install, and #39 changes reporting only."""
+    if manager is None:
+        return None
+    verdict = manager.installable()
+    if verdict is None:
+        return None
+    return bool(verdict) and _verification_of(manager) in DIGEST_VERIFICATIONS
+
+
 def _remove_flag_value(args: list, flags: list) -> list:
     return [a for a in args if a not in flags]
+
+
+def _reject_unknown_options(args: list, allowed: set):
+    """Raise UsageError for any '-'-prefixed token outside `allowed`.
+
+    Every verb validates its own option set: an option it does not
+    implement is a usage error, never a silently ignored token (same rule
+    CONTRACT.md states for the preview verb)."""
+    for a in args:
+        if a.startswith('-') and a not in allowed:
+            raise UsageError(f'unknown option: {a!r}')
 
 
 def _resolve_target(target: str):
@@ -298,6 +347,34 @@ def _update_signature(manager) -> str:
     """What changed about an update between two background checks."""
     return (str(manager.available_version or '') + '|'
             + str(manager.download_size or ''))
+
+
+def _update_state_entry(manager) -> dict:
+    """One app's remembered check result (issue #39/#43): the signature
+    that drives notifications, the installability verdict so a later
+    listing can warn about an update that cannot be installed, and the
+    AppImage path so a later sweep can tell "this app is gone" from "this
+    sweep could not list it" — the listing silently skips an app whose
+    desktop entry is momentarily unreadable (VS Code forks rewrite their
+    own entry on first launch), and forgetting its signature would
+    re-notify for a release already seen."""
+    entry = {'signature': _update_signature(manager),
+             'installable': manager.installable()}
+    el = getattr(manager, 'el', None)
+    path = getattr(el, 'file_path', '') or ''
+    if path:
+        entry['path'] = path
+    return entry
+
+
+def _update_state_signature(entry):
+    """The signature out of a stored entry.
+
+    Legacy files map an app straight to the signature string; newer ones map
+    it to a record. Both are read, so upgrading never loses the dedupe."""
+    if isinstance(entry, dict):
+        return str(entry.get('signature', ''))
+    return str(entry or '')
 
 
 # ----------------------------------------------------------------- commands
@@ -393,48 +470,6 @@ def _classify_integrate_url(url: str):
     return 'static', {'url': url}
 
 
-def _download_and_verify_github(url: str, src: dict, dest_dir: str) -> str:
-    """Download the GitHub release asset into `dest_dir`, verifying its
-    sha256 digest from the GitHub API (mandatory) and the AppImage magic.
-    Returns the downloaded file path; raises OperationError on any
-    verification failure (partial file is cleaned up via dest_dir)."""
-    api_url = ('https://api.github.com/repos/'
-               f'{src["owner"]}/{src["repo"]}/releases/tags/'
-               f'{quote(src["tag"], safe="")}')
-    try:
-        release = net.fetch_json(api_url)
-    except net.NetworkError as e:
-        raise OperationError(f'could not verify the release: {e}') from e
-
-    asset = next((a for a in release.get('assets', [])
-                  if a.get('name') == src['filename']), None)
-    if not asset:
-        raise OperationError(
-            f'asset {src["filename"]!r} not found in release '
-            f'{src["tag"]} of {src["owner"]}/{src["repo"]}')
-
-    # authenticity is mandatory (same contract as GithubUpdater.download):
-    # the release asset's sha256 digest — a digest is required, so a
-    # malicious or metadata-less asset is refused before any byte is spent
-    digest = asset.get('digest') or ''
-    if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
-        raise OperationError('GitHub release asset exposes no sha256 '
-                             'digest; refusing to install an unverified '
-                             'artifact')
-
-    dest = os.path.join(dest_dir, 'download.appimage')
-    net.download_to_file(url, dest)
-
-    expected = digest[len('sha256:'):]
-    actual = get_file_hash(dest, alg='sha256')
-    if actual != expected:
-        raise OperationError('Downloaded AppImage failed the sha256 digest '
-                             f'check (expected {expected}, got {actual})')
-    if not appimage_provider.can_install_file(dest):
-        raise OperationError('downloaded file is not an AppImage')
-    return dest
-
-
 def _glob_for_version(filename: str, version: str) -> str:
     """`filename` with the release `version` (tag minus a leading 'v')
     substituted by `*`, so a future release still matches. When the
@@ -526,80 +561,6 @@ def _auto_set_source(el, kind: str, info: dict):
         _auto_set_static_source(el, info['url'])
 
 
-def _verify_reduced_assurance(dest: str, expected_size: int = None):
-    """Post-download guard for sources that expose no publisher digest: the
-    artifact must still be an AppImage and, when a size was advertised
-    (release-API `size`; HTTP `Content-Length` is already enforced by
-    net.download_to_file), exactly that many bytes. Logs that assurance
-    was reduced — this relaxation applies only to --integrate <url>, never
-    to --update."""
-    if not appimage_provider.can_install_file(dest):
-        raise OperationError('downloaded file is not an AppImage')
-    actual = os.path.getsize(dest)
-    if expected_size is not None and actual != expected_size:
-        raise OperationError(
-            'downloaded file size mismatch (expected '
-            f'{expected_size} bytes, got {actual})')
-    logging.warning(
-        '%s: no publisher digest available; verified only the AppImage '
-        'magic bytes%s', dest,
-        ' and the advertised size' if expected_size is not None else '')
-
-
-def _download_static(url: str, dest_dir: str, expected_size: int = None) -> str:
-    """Download `url` verbatim and apply the reduced-assurance checks."""
-    dest = os.path.join(dest_dir, 'download.appimage')
-    net.download_to_file(url, dest)
-    _verify_reduced_assurance(dest, expected_size)
-    return dest
-
-
-def _fetch_zsync_control(zsync_url: str) -> tuple:
-    """(target_url, sha1_or_None) from a .zsync control file, mirroring
-    StaticFileUpdater._fetch_zsync: the target is the absolute `URL:` line
-    when present, else the .zsync name with the suffix stripped; sha1 is
-    the control file's `SHA-1:` line when it carries one."""
-    zsync = net.fetch_text(zsync_url)
-    header = zsync.split('\n\n', 1)[0]
-    match = re.search(r'URL:\s*(\S+)', header)
-    if match:
-        target = match.group(1)
-        if target.startswith(('https://', 'http://')):
-            resolved = target
-        else:
-            parts = urlsplit(zsync_url)
-            path = posixpath.join(posixpath.dirname(parts.path), target)
-            resolved = urlunsplit(parts._replace(path=path, query='',
-                                                 fragment=''))
-    else:
-        resolved = re.sub(r'\.zsync$', '', zsync_url)
-    sha = re.search(r'SHA-1:\s*([0-9a-f]{40})', header)
-    return resolved, (sha.group(1) if sha else None)
-
-
-def _download_and_verify_zsync(zsync_url: str, dest_dir: str) -> str:
-    """Download the artifact a .zsync control file points at. The control
-    file's SHA-1 is verified when present (a publisher digest — never
-    weakened); otherwise the reduced-assurance checks apply."""
-    target, expected_sha1 = _fetch_zsync_control(zsync_url)
-    if not target:
-        raise OperationError(
-            f'{zsync_url}: zsync control file points at no download URL')
-    dest = os.path.join(dest_dir, 'download.appimage')
-    net.download_to_file(target, dest)
-    if expected_sha1:
-        actual = get_file_hash(dest, alg='sha1')
-        if actual != expected_sha1:
-            raise OperationError(
-                'Downloaded AppImage failed the zsync SHA-1 check '
-                f'(expected {expected_sha1}, got {actual})')
-        if not appimage_provider.can_install_file(dest):
-            raise OperationError('downloaded file is not an AppImage')
-        return dest
-    _verify_reduced_assurance(dest)
-    return dest
-
-
 def _release_api_url(kind: str, info: dict) -> str:
     """The release-list API endpoint for the gitlab/codeberg/forgejo
     cases, mirroring the matching updater's request shape."""
@@ -648,28 +609,54 @@ def _lookup_release_asset(kind: str, info: dict):
 
 def _fetch_integrate_artifact(kind: str, info: dict, raw_url: str,
                               dest_dir: str):
+    # The fetch itself lives in updaters (issue #45); its refusals are
+    # UpdateError, which this CLI layer reports as an operation failure.
+    try:
+        return _fetch_integrate_artifact_through_source(kind, info, raw_url,
+                                                        dest_dir)
+    except UpdateError as e:
+        raise OperationError(str(e)) from e
+
+
+def _fetch_integrate_artifact_through_source(kind: str, info: dict,
+                                             raw_url: str, dest_dir: str):
     """Fetch the artifact for a classified URL, returning
     (file_path, kind, info) — `kind`/`info` are updated on the case 3-5
     fallback to a static install and carry the `pattern` computed from the
     release tag for the auto-source step."""
+    # Every download below goes through updaters' fetchers under the
+    # REDUCED policy (issue #45): the user pasted this URL, so its lack of
+    # a publisher digest is their choice — while --update always fetches
+    # under the strict one.
+    policy = updaters.POLICY_REDUCED
+    magic = appimage_provider.can_install_file
     if kind == 'github':
-        return _download_and_verify_github(raw_url, info, dest_dir), kind, info
+        # GitHub does publish digests, so its assets are demanded, digest
+        # or no digest, whichever policy brought the caller here.
+        return (updaters.download_github_asset(
+            dict(info, url=raw_url), dest_dir, updaters.POLICY_STRICT,
+            magic), kind, info)
     if kind == 'zsync':
-        return _download_and_verify_zsync(raw_url, dest_dir), kind, info
+        return (updaters.download_zsync(raw_url, dest_dir, policy, magic),
+                kind, info)
     if kind in ('gitlab', 'codeberg', 'forgejo'):
         asset = _lookup_release_asset(kind, info)
         if asset is None:
             logging.warning('%s: no release metadata for %s; installing the '
                             'pasted URL as a static source', kind, raw_url)
-            return (_download_static(raw_url, dest_dir), 'static',
+            return (updaters.download_plain(raw_url, dest_dir, policy,
+                                            is_appimage=magic), 'static',
                     {'url': raw_url})
-        dest = _download_static(asset['url'], dest_dir, asset['size'])
+        dest = updaters.download_plain(asset['url'], dest_dir, policy,
+                                       asset['size'], magic)
         info = dict(info,
                     pattern=_glob_for_version(info['filename'], asset['tag']),
                     version=asset['tag'] or '')
         return dest, kind, info
     # case 6: a plain URL
-    return _download_static(raw_url, dest_dir), 'static', {'url': raw_url}
+    return (updaters.download_plain(raw_url, dest_dir, policy,
+                                    is_appimage=magic), 'static',
+            {'url': raw_url})
 
 
 def _find_name_conflict(list_element):
@@ -691,6 +678,7 @@ def _find_name_conflict(list_element):
 
 
 def cmd_integrate(args: list) -> int:
+    _reject_unknown_options(args, {'--json', '--yes', '-y', '--replace'})
     json_output = '--json' in args
     assume_yes = ('-y' in args) or ('--yes' in args)
     replace = '--replace' in args
@@ -704,7 +692,7 @@ def cmd_integrate(args: list) -> int:
         return EXIT_USAGE
 
     positional = _remove_flag_value(
-        args, ['--json', '--yes', '-y', '--replace', '--keep-both'])
+        args, ['--json', '--yes', '-y', '--replace'])
     target_arg = positional[0] if positional else None
 
     url_kind = None
@@ -817,7 +805,8 @@ def _verification_preview(kind: str) -> dict:
     conditional."""
     if kind == 'github':
         return {
-            'method': 'github-sha256',
+            'method': 'sha256',
+            'policy': updaters.POLICY_STRICT,
             'reduced_assurance': False,
             'note': "the release asset's sha256 digest is fetched from "
                     'the GitHub API and verified at integrate time; a '
@@ -826,6 +815,7 @@ def _verification_preview(kind: str) -> dict:
     if kind == 'zsync':
         return {
             'method': 'zsync-sha1',
+            'policy': updaters.POLICY_REDUCED,
             'reduced_assurance': False,
             'note': "the .zsync control file's SHA-1 line is verified at "
                     'integrate time when the publisher publishes one; '
@@ -835,6 +825,7 @@ def _verification_preview(kind: str) -> dict:
     if kind == 'local':
         return {
             'method': 'none',
+            'policy': None,
             'reduced_assurance': False,
             'note': 'no download: the local file itself is integrated '
                     '(AppImage magic-byte check only)',
@@ -842,6 +833,7 @@ def _verification_preview(kind: str) -> dict:
     # gitlab / codeberg / forgejo / static: no publisher digest exists
     return {
         'method': 'none',
+        'policy': updaters.POLICY_REDUCED,
         'reduced_assurance': True,
         'note': 'no publisher digest exists for this source; the '
                 'artifact installs with reduced assurance (AppImage '
@@ -851,21 +843,14 @@ def _verification_preview(kind: str) -> dict:
 
 def _preview_destination(source_basename: str, desktop_name,
                          version: str) -> dict:
-    """The destination block of the preview document: the exact file
-    name --integrate would pick, derived with the install-time naming
-    helper (GearLever conflict suffixing included)."""
-    folder = settings.appimages_folder()
-    try:
-        existing_names = os.listdir(folder)
-    except OSError:
-        existing_names = []
-    filename, _prefix = resolve_install_names(
-        source_basename=source_basename,
-        desktop_name=desktop_name,
-        version=version or '',
-        existing_names=existing_names)
-    return {'folder': folder, 'filename': filename,
-            'path': os.path.join(folder, filename)}
+    """The destination block of the preview document.
+
+    Produced by the install plan's own naming rule (issue #45), so a
+    preview cannot promise a file name the install would not use."""
+    planned = appimage_provider.plan_destination(
+        source_basename, desktop_name, version)
+    return {'folder': planned['folder'], 'filename': planned['filename'],
+            'path': planned['path']}
 
 
 def _as_url(value: str):
@@ -1017,6 +1002,7 @@ def cmd_preview_integrate(args: list) -> int:
 
 
 def cmd_list_installed(args: list) -> int:
+    _reject_unknown_options(args, {'--json'})
     json_output = '--json' in args
     # janitor sweep (ticket 03): fossils — terminal/interrupted job
     # documents past the acknowledgement window and orphan update temp
@@ -1031,13 +1017,14 @@ def cmd_list_installed(args: list) -> int:
     janitor.sweep_throttled(
         icons_dir=os.path.join(settings.appimages_folder(), '.icons'))
     apps = appimage_provider.list_installed()
+    # ONE process table + one mounts read for the whole listing (ticket
+    # #41): the panel polls this every 10 s, so the cost of a listing must
+    # not grow with the number of installed apps. Every running answer and
+    # every process count below reads through this one scan.
+    scan = procs._cached_probe()
 
     if json_output:
         table = []
-        # ONE process table + one mounts read for the whole listing: the
-        # panel polls this every 10 s and a scan per running row would
-        # spawn a fresh `ps` each time
-        scan = procs._cached_probe()
         for a in apps:
             # check_url_for_app is local-only (apps.ini config + the
             # embedded .upd_info ELF section) and fills the manager /
@@ -1062,7 +1049,7 @@ def cmd_list_installed(args: list) -> int:
 
     rows = []
     for a in apps:
-        running = ' (running)' if appimage_provider.is_app_running(a) else ''
+        running = ' (running)' if appimage_provider.is_app_running(a, probe=scan) else ''
         rows.append([a.name + running,
                      a.version or 'Not specified',
                      a.file_path])
@@ -1072,6 +1059,7 @@ def cmd_list_installed(args: list) -> int:
 
 
 def cmd_remove(args: list) -> int:
+    _reject_unknown_options(args, {'--json', '--yes', '-y', '--delete'})
     json_output = '--json' in args
     assume_yes = ('-y' in args) or ('--yes' in args)
     force = '--delete' in args
@@ -1086,11 +1074,32 @@ def cmd_remove(args: list) -> int:
 
     positional = _remove_flag_value(args, ['--json', '--yes', '-y',
                                            '--delete'])
-    positional = [a for a in positional if not a.startswith('--')]
     if not positional:
         raise UsageError('missing argument: --remove <name-or-desktop-id>')
 
     el = _resolve_target(positional[0])
+
+    # Issue #46: removal during that app's update job is refused here,
+    # by the module that owns the job, and not only by the panel's
+    # button. A job that cannot name a document cannot exist for this
+    # app, so an unusable id simply has nothing to refuse.
+    try:
+        job_id = _job_desktop_id(el)
+    except OperationError:
+        job_id = ''
+    if job_id:
+        active = jobs.active_job(job_id)
+        if active is not None:
+            raise OperationError(
+                f'{el.file_path} is being updated by a running job '
+                f'(pid {active.get("pid")}); refusing to remove it')
+        # A synchronous --update writes no job document, so the document
+        # check alone would let this command uninstall the file it is
+        # replacing; ask the claim itself (issue #46).
+        if jobs.claim_held(job_id):
+            raise OperationError(
+                f'{el.file_path} is being updated right now; refusing to '
+                'remove it')
 
     q = 'Do you really want to delete this AppImage?'
     if force:
@@ -1118,16 +1127,19 @@ def cmd_remove(args: list) -> int:
 
 # ------------------------------------------------------- update commands
 
-def _check_updates() -> list:
+def _check_updates():
     """All installed apps that have an update source and report an update
-    (manager.is_update_available() is True), as (element, manager) pairs.
+    (manager.is_update_available() is True), as (element, manager) pairs,
+    plus the state keys of every installed app the walk saw.
 
     Ported from the check loop of upstream Cli.list_updates: apps without
     a source are skipped and per-app errors are logged and skipped so one
     broken source cannot hide the others. Callers decide on connectivity
     first (net.check_internet)."""
     updates = []
+    installed_keys = set()
     for el in appimage_provider.list_installed():
+        installed_keys.add(_updates_state_key(el))
         manager = UpdateManagerChecker.check_url_for_app(el)
         if not manager:
             continue
@@ -1141,11 +1153,14 @@ def _check_updates() -> list:
 
         # tri-state: only a definite True counts (None = not determinable)
         if status is True:
+            # a verdict exists, so installability is reportable (#39)
+            manager.checked = True
             updates.append((el, manager))
-    return updates
+    return updates, installed_keys
 
 
 def cmd_list_updates(args: list) -> int:
+    _reject_unknown_options(args, {'--json'})
     json_output = '--json' in args
 
     if not net.check_internet():
@@ -1159,7 +1174,7 @@ def cmd_list_updates(args: list) -> int:
             print('Internet connection not available', file=sys.stderr)
         return EXIT_ERROR
 
-    updates = _check_updates()
+    updates, _ = _check_updates()
 
     if json_output:
         scan = procs._cached_probe()
@@ -1224,8 +1239,10 @@ class _ManagerStageProxy:
     def __getattr__(self, name):
         return getattr(self._manager, name)
 
-    def download(self, dest_dir: str, progress_cb=None) -> str:
-        result = self._manager.download(dest_dir, progress_cb)
+    def fetch(self, dest_dir: str, policy: str, progress_cb=None,
+              is_appimage=None) -> str:
+        result = self._manager.fetch(dest_dir, policy, progress_cb,
+                                     is_appimage)
         if self._on_replacing is not None:
             try:
                 self._on_replacing()
@@ -1330,7 +1347,57 @@ def run_update(target: str, keep_both: bool = False,
                force: bool = False, progress_cb=None,
                on_stage=None, kill_running: bool = False,
                confirm_close=None, probe=None,
-               force_quit_sink: dict = None) -> UpdateResult:
+               force_quit_sink: dict = None,
+               claim_owned: bool = True) -> UpdateResult:
+    """The update lifecycle, entered through its single-flight claim.
+
+    Issue #46: the claim lives here, not in a caller, so a second update
+    of the same app is refused the same way whoever starts it — the
+    panel's background job and a terminal `--update` both end up in the
+    one rule below. `claim_owned=False` is the async grandchild's door:
+    it inherits the flock through the log description its spawner opened
+    and kept alive across the fork, so taking it again would conflict
+    with itself.
+    """
+    if not claim_owned:
+        return _run_update_body(
+            target, keep_both=keep_both, force=force,
+            progress_cb=progress_cb, on_stage=on_stage,
+            kill_running=kill_running, confirm_close=confirm_close,
+            probe=probe, force_quit_sink=force_quit_sink)
+
+    el = _resolve_target(target)
+    # A desktop id the job store cannot name a document for cannot have a
+    # job either, so the synchronous path claims nothing for it — the
+    # documented sync `--update` on such an app keeps working.
+    try:
+        job_id = _job_desktop_id(el)
+    except OperationError:
+        job_id = ''
+    claim_fd = None
+    if job_id:
+        try:
+            claim_fd = jobs.open_job_log_fd(job_id)
+        except BlockingIOError:
+            raise OperationError(
+                f'an update is already running for {el.file_path}; '
+                'refusing to start a second one')
+    try:
+        return _run_update_body(
+            target, keep_both=keep_both, force=force,
+            progress_cb=progress_cb, on_stage=on_stage,
+            kill_running=kill_running, confirm_close=confirm_close,
+            probe=probe, force_quit_sink=force_quit_sink)
+    finally:
+        if claim_fd is not None:
+            os.close(claim_fd)
+
+
+def _run_update_body(target: str, keep_both: bool = False,
+                     force: bool = False, progress_cb=None,
+                     on_stage=None, kill_running: bool = False,
+                     confirm_close=None, probe=None,
+                     force_quit_sink: dict = None) -> UpdateResult:
     """The shared update pipeline: resolve target → update-source check →
     availability check → running guard → download to temp → verify →
     atomic replace → scoped temp-dir cleanup → pending-notification drop.
@@ -1508,6 +1575,9 @@ def cmd_update(args: list) -> int:
     JSON document / plain line and exit code (byte-identical to the
     pre-extraction inline pipeline). --async detaches the pipeline into a
     double-forked grandchild and reports `job-started` instead."""
+    _reject_unknown_options(
+        args, {'--json', '--yes', '-y', '--keep-both', '--force',
+               '--kill-running', '--async'})
     json_output = '--json' in args
     assume_yes = ('-y' in args) or ('--yes' in args)
     keep_both = '--keep-both' in args
@@ -1526,7 +1596,6 @@ def cmd_update(args: list) -> int:
     positional = _remove_flag_value(
         args, ['--json', '--yes', '-y', '--keep-both', '--force',
                '--kill-running', '--async'])
-    positional = [a for a in positional if not a.startswith('--')]
     if not positional:
         raise UsageError('missing argument: --update <name-or-desktop-id>')
 
@@ -1575,7 +1644,7 @@ def cmd_update(args: list) -> int:
             'schema_version': constants.JSON_SCHEMA_VERSION,
             'result': 'updated',
             'message': result.message,
-            'app': _make_app_json(result.el),
+            'app': _make_app_json(result.el, manager=result.manager),
             'downloaded_bytes': result.downloaded_bytes,
         })
     else:
@@ -1743,7 +1812,7 @@ def _job_entrypoint(desktop_id: str, target: str, keep_both: bool,
                                 kill_running=kill_running,
                                 progress_cb=writer.progress_cb,
                                 on_stage=writer.stage,
-                                force_quit_sink=sink)
+                                force_quit_sink=sink, claim_owned=False)
         except Exception as e:
             # the traceback lands in the bounded per-job log (stderr is
             # redirected there), never on stdout
@@ -1896,6 +1965,7 @@ def _spawn_update_job(desktop_id: str, target: str, keep_both: bool,
 
 
 def cmd_set_update_source(args: list) -> int:
+    _reject_unknown_options(args, {'--json', '--unset', '--manager'})
     json_output = '--json' in args
     do_unset = '--unset' in args
 
@@ -1986,10 +2056,10 @@ def cmd_set_update_source(args: list) -> int:
 
 
 def cmd_get_update_source(args: list) -> int:
+    _reject_unknown_options(args, {'--json'})
     json_output = '--json' in args
 
     positional = _remove_flag_value(args, ['--json'])
-    positional = [a for a in positional if not a.startswith('--')]
     if not positional:
         raise UsageError('missing argument: --get-update-source <target>')
     if len(positional) > 1:
@@ -2030,6 +2100,7 @@ def cmd_get_update_source(args: list) -> int:
 
 
 def cmd_list_update_managers(args: list) -> int:
+    _reject_unknown_options(args, {'--json'})
     json_output = '--json' in args
     managers = UpdateManagerChecker.manager_metadata()
 
@@ -2051,6 +2122,7 @@ def cmd_fetch_updates(args: list) -> int:
     notifies on every run; the signature-based dedupe is this project's
     deviation). The QML timer service invokes this every
     update_check_interval_minutes."""
+    _reject_unknown_options(args, {'--json'})
     json_output = '--json' in args
     offline = not net.check_internet()
 
@@ -2067,12 +2139,12 @@ def cmd_fetch_updates(args: list) -> int:
             print('Internet connection not available', file=sys.stderr)
         return EXIT_OK
 
-    updates = _check_updates()
+    updates, installed_keys = _check_updates()
 
     state = settings.load_updates_state()
     new_updates = [(el, manager) for el, manager in updates
                    if _update_signature(manager)
-                   != state.get(_updates_state_key(el))]
+                   != _update_state_signature(state.get(_updates_state_key(el)))]
 
     notified = False
     if new_updates:
@@ -2087,15 +2159,29 @@ def cmd_fetch_updates(args: list) -> int:
         except Exception as e:
             logging.warning('notify-send failed: %s', e)
 
-    # remember every currently-available signature (new or not) so
-    # unchanged updates do not re-notify on the next run. A state-file
-    # failure must not turn a successful sweep into a failed exit
+    # Remember every currently-available signature (new or not) so
+    # unchanged updates do not re-notify on the next run. MERGE, do not
+    # replace (issue #43): a sweep that cannot see an app — network error,
+    # source temporarily unreachable, a check that raised — must not erase
+    # what the previous run learned about it. Entries for apps that are no
+    # longer installed are dropped, so the map cannot grow forever. A
+    # state-file failure must not turn a successful sweep into a failed exit
     # (CONTRACT.md: --fetch-updates always exits 0).
+    remembered = {}
+    for key, value in state.items():
+        if key in installed_keys:
+            remembered[key] = value
+            continue
+        # Not listed: keep the entry while the file it names still exists —
+        # an invisible app is not an uninstalled one, and dropping it would
+        # re-notify for a release this plugin already saw.
+        path = value.get('path', '') if isinstance(value, dict) else ''
+        if path and os.path.exists(path):
+            remembered[key] = value
+    for el, manager in updates:
+        remembered[_updates_state_key(el)] = _update_state_entry(manager)
     try:
-        settings.save_updates_state({
-            _updates_state_key(el): _update_signature(manager)
-            for el, manager in updates
-        })
+        settings.save_updates_state(remembered)
     except OSError as e:
         logging.warning('saving updates state failed: %s', e)
 
@@ -2123,6 +2209,7 @@ def cmd_pick_file(args: list) -> int:
     heavy lifting (probe order, deadline, URI validation, typed results)
     lives in pick_file.py; this wrapper only maps the payload to the
     output contract."""
+    _reject_unknown_options(args, {'--json'})
     json_output = '--json' in args
     payload = pick_file.run_pick()
     result = payload.get('result')
@@ -2151,6 +2238,7 @@ def cmd_pick_file(args: list) -> int:
 
 
 def cmd_settings(args: list) -> int:
+    _reject_unknown_options(args, {'--json'})
     json_output = '--json' in args
     data = settings.load_settings()
 
@@ -2167,6 +2255,7 @@ def cmd_settings(args: list) -> int:
 
 
 def cmd_set_setting(args: list) -> int:
+    _reject_unknown_options(args, {'--json'})
     json_output = '--json' in args
 
     tokens = [a for a in args if a != '--json']

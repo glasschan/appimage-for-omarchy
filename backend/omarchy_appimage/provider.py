@@ -21,12 +21,13 @@ import shlex
 import stat
 import tempfile
 from enum import Enum
+from types import SimpleNamespace
 from typing import List, Optional
 
-from . import elf, extractor, settings, trash
+from . import elf, extractor, settings, trash, updaters
 from .desktop_entry import DesktopEntry
 from .ini_config import Config
-from .utils import (extract_terminal_arguments, get_file_hash,
+from .utils import (atomic_write, extract_terminal_arguments, get_file_hash,
                     is_app_running, remove_special_chars, run_command)
 
 
@@ -108,25 +109,23 @@ def _resolve_install_names(source_basename: str, desktop_name, version: str,
 resolve_install_names = _resolve_install_names
 
 
-def _atomic_install(src: str, dest: str, mode: int, before_replace=None):
-    """Descriptor-safe install of `src` at `dest` (marketplace review).
+def _replace_destination(dest: str, mode: int, write_body, before_replace=None):
+    """Descriptor-safe replace of `dest` with whatever `write_body` writes.
 
-    The bytes land in a fresh temp file next to `dest` (created
-    exclusively by mkstemp and written straight through its descriptor,
-    so no window ever exists where a planted name could swap the inode),
-    are chmod'd + fsync'd, then os.replace()'d over the final name —
-    rename never follows a symlink at `dest`, so a planted symlink gets
-    replaced instead of written through, and a crash can never leave a
-    truncated AppImage behind. The source is the user's own chosen file:
-    its final component is resolved with realpath first (following a
-    symlink there is correct), then opened O_NOFOLLOW.
+    Shared by `_atomic_install` (a file on disk) and `_atomic_write_bytes`
+    (in-memory bytes): the payload lands in a fresh temp file next to
+    `dest` (created exclusively by mkstemp and written straight through
+    its descriptor, so no window ever exists where a planted name could
+    swap the inode), is chmod'd + fsync'd, then os.replace()'d over the
+    final name — rename never follows a symlink at `dest`, so a planted
+    symlink gets replaced instead of written through, and a crash can
+    never leave a truncated file behind.
 
     `before_replace` is the narrow seam for the running-app grant (ticket
     26): it is called once, right before os.replace(), with the complete
-    but not yet visible temp file on disk. It defaults to None, so every
-    caller that does not pass one behaves exactly as before; an exception
-    from it aborts the install and the temp file is removed like any other
-    failure."""
+    but not yet visible temp file on disk. It defaults to None; an
+    exception from it aborts the install and the temp file is removed
+    like any other failure."""
     try:
         if stat.S_ISDIR(os.lstat(dest).st_mode):
             raise InternalError(f'refusing to install over a directory: '
@@ -137,19 +136,10 @@ def _atomic_install(src: str, dest: str, mode: int, before_replace=None):
     dest_dir = os.path.dirname(dest) or '.'
     fd, tmp_path = tempfile.mkstemp(prefix='.gearlever-tmp-', dir=dest_dir)
 
-    src_fd = None
     try:
-        # O_NONBLOCK keeps a planted FIFO from blocking the open — the
-        # regular-file check below rejects it right after (regular
-        # files ignore the flag)
-        src_fd = os.open(os.path.realpath(src),
-                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        if not stat.S_ISREG(os.fstat(src_fd).st_mode):
-            raise InternalError(f'source is not a regular file: {src}')
-        with os.fdopen(fd, 'wb') as out, os.fdopen(src_fd, 'rb') as f:
-            fd = src_fd = None  # the fdopen contexts own them now
-            for chunk in iter(lambda: f.read(1 << 20), b''):
-                out.write(chunk)
+        with os.fdopen(fd, 'wb') as out:
+            fd = None  # the fdopen context owns it now
+            write_body(out)
             os.fchmod(out.fileno(), mode)
             out.flush()
             os.fsync(out.fileno())
@@ -157,17 +147,55 @@ def _atomic_install(src: str, dest: str, mode: int, before_replace=None):
             before_replace()
         os.replace(tmp_path, dest)
     except BaseException:
-        for open_fd in (fd, src_fd):
-            if open_fd is not None:
-                try:
-                    os.close(open_fd)
-                except OSError:
-                    pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
+
+
+def _atomic_install(src: str, dest: str, mode: int, before_replace=None):
+    """Descriptor-safe install of `src` at `dest` (marketplace review).
+
+    The source is the user's own chosen file: its final component is
+    resolved with realpath first (following a symlink there is correct),
+    then opened O_NOFOLLOW; the bytes themselves are written by
+    `_replace_destination`, which owns the temp-file/replace dance and
+    the `before_replace` hook (see there)."""
+    def _copy_source(out):
+        # O_NONBLOCK keeps a planted FIFO from blocking the open — the
+        # regular-file check below rejects it right after (regular
+        # files ignore the flag)
+        src_fd = os.open(os.path.realpath(src),
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(src_fd).st_mode):
+                raise InternalError(f'source is not a regular file: {src}')
+            with os.fdopen(src_fd, 'rb') as f:
+                src_fd = None  # the fdopen context owns it now
+                for chunk in iter(lambda: f.read(1 << 20), b''):
+                    out.write(chunk)
+        finally:
+            if src_fd is not None:
+                try:
+                    os.close(src_fd)
+                except OSError:
+                    pass
+
+    _replace_destination(dest, mode, _copy_source, before_replace)
+
+
+def _atomic_write_bytes(data: bytes, dest: str, mode: int):
+    """Descriptor-safe install of in-memory bytes (the sanitised icon).
+
+    Same temp-file/fsync/replace contract as `_atomic_install`, without a
+    source file that could change between planning and commit."""
+    _replace_destination(dest, mode, lambda out: out.write(data))
 
 
 @dataclasses.dataclass
@@ -208,6 +236,32 @@ class AppImageListElement():
 
     def get_config(self):
         return Config.get_app_config(self)
+
+
+@dataclasses.dataclass
+class InstallPlan:
+    """Everything an install will write, resolved and validated up front.
+
+    `AppImageProvider.plan_install` returns one of these after reading the
+    source image (extraction into a temp dir is a read) and proving the
+    whole install can succeed; `commit_install` then performs every write
+    in the order the ported GearLever flow used. Splitting the two means a
+    refused install — no root desktop entry, no desktop file to point at,
+    an Exec line that does not parse — leaves the managed folder, `.icons`,
+    the applications directory and apps.ini untouched."""
+    source_appimage: str
+    dest_appimage_file: str
+    desktop_id: str                       # app/desktop/icon file stem
+    dest_desktop_file_path: str
+    dest_icon_file: Optional[str]
+    icon_bytes: Optional[bytes]
+    desktop_content: bytes
+    exec_arguments: str
+    default_exec_arguments: str
+    env_variables: List[str]
+    app_config: dict
+    version: str
+    remove_original: bool
 
 
 class AppImageProvider():
@@ -434,8 +488,8 @@ class AppImageProvider():
 
         return False
 
-    def is_app_running(self, el: AppImageListElement) -> bool:
-        return is_app_running(el.file_path)
+    def is_app_running(self, el: AppImageListElement, probe=None) -> bool:
+        return is_app_running(el.file_path, probe=probe)
 
     # ---------------------------------------------------------- file checks
 
@@ -576,95 +630,130 @@ class AppImageProvider():
         el.version = installed.version
         return True
 
-    def install_file(self, el: AppImageListElement, before_replace=None):
-        """Ported from AppImageProvider.install_file (naming, conflict
-        resolution and desktop entry rewriting follow upstream).
+    def plan_destination(self, source_basename: str, desktop_name,
+                         version: str) -> dict:
+        """The names an install would use: ONE naming rule, shared by
+        plan_install and the preview document (issue #45).
 
-        `before_replace` is forwarded to the AppImage's own
-        _atomic_install only (never to the icon write): it is the last
-        moment before the new file becomes visible at its final name, so
-        an update that was granted permission to close the running app
-        can close whatever was (re)started during the download. Default
-        None keeps every existing caller byte-identical."""
-        logging.info('Installing appimage: %s', el.file_path)
-        el.installed_status = InstalledStatus.INSTALLING
-        appimages_destination_path = self._get_appimages_default_destination_path()
-        os.makedirs(appimages_destination_path, exist_ok=True)
+        Reading the folder's existing names is a read; nothing here
+        creates the folder or touches a file. The conflict suffix comes
+        from GearLever's helper (round-4 review: desktop Name and
+        X-AppImage-Version are embedded, attacker-controlled fields)."""
+        folder = self._get_appimages_default_destination_path()
+        existing_names = (os.listdir(folder)
+                          if os.path.isdir(folder) else [])
+        filename, desktop_prefix = _resolve_install_names(
+            source_basename=source_basename,
+            desktop_name=desktop_name,
+            version=version or '',
+            existing_names=existing_names)
+        return {'folder': folder, 'filename': filename,
+                'desktop_prefix': desktop_prefix,
+                'path': os.path.join(folder, filename)}
 
+    def plan_install(self, el: AppImageListElement) -> InstallPlan:
+        """Read and validate everything an install is about to write.
+
+        Extraction into a temporary folder is a READ (the extractor never
+        executes the image), so nothing here touches the managed folder,
+        `.icons`, the applications directory or apps.ini. Every refusal is
+        an InternalError with a human message: an image with no root
+        desktop entry, a desktop file that cannot be read, or an Exec
+        command that does not parse is rejected BEFORE the first write —
+        never an AttributeError halfway through, and never a half-applied
+        install.
+
+        The returned record is complete: destination names, the exact
+        desktop-entry bytes, the sanitised icon bytes, the apps.ini keys,
+        and which source file (if any) to move away after the replace.
+        `commit_install` performs every write."""
         extracted_appimage = self._load_appimage_metadata(el)
+
+        # A root-level .desktop is mandatory: its Exec arguments and its
+        # Icon drive the installed entry. Checking it BEFORE any write is
+        # the whole point of the plan (ticket 40; the old guard sat after
+        # the binary replace, where the missing entry had already
+        # crashed on .getExec()).
+        if extracted_appimage.desktop_entry is None \
+                or not extracted_appimage.desktop_file:
+            raise InternalError(
+                'Could not find a .desktop file inside this AppImage')
+        if not os.path.isfile(extracted_appimage.desktop_file):
+            raise InternalError(
+                'Could not read the .desktop file inside this AppImage')
+        try:
+            jd_desktop_entry = DesktopEntry(
+                path=extracted_appimage.desktop_file)
+        except OSError as e:
+            raise InternalError(
+                'Could not read the .desktop file inside this AppImage: '
+                f'{e}') from e
+
+        source_appimage = extracted_appimage.appimage_file
+        if not source_appimage or not os.path.isfile(source_appimage):
+            raise InternalError(
+                f'Could not read the AppImage file: {source_appimage}')
+
         version = self._get_app_version(extracted_appimage)
+        appimages_destination_path = \
+            self._get_appimages_default_destination_path()
 
         # how the appimage will be called
         if el.update_logic == AppImageUpdateLogic.REPLACE \
                 and el.updating_from is not None:
+            if not el.updating_from.file_path \
+                    or not el.updating_from.desktop_file_path:
+                raise InternalError(
+                    'Could not resolve the app this install replaces')
             appimage_filename = os.path.basename(el.updating_from.file_path)
             desktop_file_path = os.path.basename(
                 el.updating_from.desktop_file_path)
             prefixed_filename = os.path.splitext(desktop_file_path)[0]
         else:
-            # Naming and conflict resolution live in a pure helper so the
-            # sanitization contract is unit-testable without an extraction
-            # (round-4 review: desktop Name and X-AppImage-Version are
-            # embedded, attacker-controlled fields).
-            desktop_name = (extracted_appimage.desktop_entry.getName()
-                            if extracted_appimage.desktop_entry else None)
-            appimage_filename, prefixed_filename = _resolve_install_names(
-                source_basename=os.path.basename(el.file_path),
-                desktop_name=desktop_name,
-                version=version,
-                existing_names=os.listdir(appimages_destination_path))
+            # The naming rule is plan_destination's, so the preview cannot
+            # disagree with the install (issue #45).
+            planned_names = self.plan_destination(
+                os.path.basename(el.file_path),
+                extracted_appimage.desktop_entry.getName(), version)
+            appimage_filename = planned_names['filename']
+            prefixed_filename = planned_names['desktop_prefix']
 
         dest_appimage_file = os.path.join(appimages_destination_path,
                                           appimage_filename)
-        original_appimage_path = extracted_appimage.appimage_file
 
-        _atomic_install(original_appimage_path, dest_appimage_file, 0o755,
-                        before_replace=before_replace)
-        logging.debug('file copied to %s', appimages_destination_path)
-
-        el.file_path = dest_appimage_file
-        el.set_trusted()
-
-        # copy the icon file
+        # The icon bytes are read NOW, so what commit writes is exactly
+        # what this plan validated (the extractor already sanitised them;
+        # see icon.sanitize_icon).
         dest_appimage_icon_file = None
+        icon_bytes = None
         icon_file = extracted_appimage.icon_file
         if icon_file and os.path.exists(icon_file):
-            icons_folder = os.path.join(appimages_destination_path, '.icons')
-            os.makedirs(icons_folder, exist_ok=True)
+            try:
+                with open(icon_file, 'rb') as f:
+                    icon_bytes = f.read()
+            except OSError as e:
+                raise InternalError(
+                    f'Could not read the icon inside this AppImage: '
+                    f'{e}') from e
 
             icon_file_ext = os.path.splitext(icon_file)[1]
             dest_appimage_icon_file = os.path.join(
                 appimages_destination_path, '.icons',
                 prefixed_filename + icon_file_ext)
-            _atomic_install(icon_file, dest_appimage_icon_file, 0o644)
-
-        # A previous icon of the same stem must not survive: the panel
-        # renders .icons/<stem>.png|svg by file name (not through the
-        # desktop entry's Icon=), so a stale file would keep being decoded
-        # by the shared shell even after an update whose new icon is
-        # refused -- and a stale .png would win the panel's png-first probe
-        # over a freshly installed .svg.
-        icons_folder = os.path.join(appimages_destination_path, '.icons')
-        keep_ext = (os.path.splitext(dest_appimage_icon_file)[1]
-                    if dest_appimage_icon_file else None)
-        for stale_ext in ('.png', '.svg', '.xpm'):
-            if stale_ext == keep_ext:
-                continue
-            try:
-                os.remove(os.path.join(icons_folder,
-                                       prefixed_filename + stale_ext))
-            except OSError:
-                pass
 
         # Move .desktop file to its default location
-        os.makedirs(self.user_desktop_files_path, exist_ok=True)
         dest_desktop_file_path = os.path.join(
             self.user_desktop_files_path, prefixed_filename + '.desktop')
         dest_desktop_file_path = dest_desktop_file_path.replace(' ', '_')
 
         # Get default exec arguments shipped by this version of the appimage
-        term_arguments = extract_terminal_arguments(
-            extracted_appimage.desktop_entry.getExec())
+        try:
+            term_arguments = extract_terminal_arguments(
+                extracted_appimage.desktop_entry.getExec())
+        except ValueError as e:
+            raise InternalError(
+                'Could not parse the Exec command in the .desktop file '
+                f'inside this AppImage: {e}') from e
         exec_arguments = term_arguments['arguments']
         new_default_exec_arguments = ' '.join(exec_arguments)
 
@@ -676,15 +765,13 @@ class AppImageProvider():
                 'default_exec_arguments', '')
 
             if el.updating_from.exec_arguments != previous_default_exec_arguments:
-                exec_arguments = shlex.split(el.updating_from.exec_arguments)
-
-        el.exec_arguments = ' '.join(exec_arguments)
-
-        if not extracted_appimage.desktop_file:
-            raise InternalError(
-                'Could not find a .desktop file inside this AppImage')
-
-        jd_desktop_entry = DesktopEntry(path=extracted_appimage.desktop_file)
+                try:
+                    exec_arguments = shlex.split(
+                        el.updating_from.exec_arguments)
+                except ValueError as e:
+                    raise InternalError(
+                        'Could not parse the recorded Exec arguments for '
+                        f'this app: {e}') from e
 
         jd_desktop_entry.TryExec = dest_appimage_file
         jd_desktop_entry.Exec = shlex.join([dest_appimage_file,
@@ -705,36 +792,57 @@ class AppImageProvider():
 
         jd_desktop_entry.Icon = desktop_icon
 
-        for _action_id, action in jd_desktop_entry.Actions.items():
-            a_exec_args = extract_terminal_arguments(action.Exec)
-            action.Icon = desktop_icon
-            action.Exec = shlex.join([dest_appimage_file,
-                                      *a_exec_args['arguments']])
+        try:
+            for _action_id, action in jd_desktop_entry.Actions.items():
+                a_exec_args = extract_terminal_arguments(action.Exec)
+                action.Icon = desktop_icon
+                action.Exec = shlex.join([dest_appimage_file,
+                                          *a_exec_args['arguments']])
+        except ValueError as e:
+            raise InternalError(
+                'Could not parse a desktop action in the .desktop file '
+                f'inside this AppImage: {e}') from e
 
         if version:
             jd_desktop_entry.set_custom('X-AppImage-Version', version)
         jd_desktop_entry.set_custom(
             'X-AppImage-Name', extracted_appimage.desktop_entry.getName())
 
-        # finally, write the new .desktop file (atomically)
-        jd_desktop_entry.write_file(dest_desktop_file_path)
-
-        if os.path.exists(dest_desktop_file_path):
-            el.desktop_entry = DesktopEntry(path=dest_desktop_file_path)
-            el.desktop_file_path = dest_desktop_file_path
-            el.installed_status = InstalledStatus.INSTALLED
-
+        # install_file used to rewrite the entry once more through
+        # update_desktop_file() so it runs with `env VAR=...`. Compute
+        # that FINAL text here instead of writing the file twice, keeping
+        # the exact same precedence: the previous app's env vars are
+        # adopted for an update, and DESKTOPINTEGRATION=1 is appended when
+        # no variable carries it.
+        env_variables = list(el.env_variables)
+        rewrite_exec = False
         if el.updating_from and el.updating_from.env_variables:
-            el.env_variables = el.updating_from.env_variables
-            self.update_desktop_file(el)
-
+            env_variables = list(el.updating_from.env_variables)
+            rewrite_exec = True
         has_desktop_integration = any(
-            v.startswith('DESKTOPINTEGRATION=') for v in el.env_variables)
+            v.startswith('DESKTOPINTEGRATION=') for v in env_variables)
         if not has_desktop_integration:
-            el.env_variables.append('DESKTOPINTEGRATION=1')
-            self.update_desktop_file(el)
+            env_variables.append('DESKTOPINTEGRATION=1')
+            rewrite_exec = True
 
-        app_config = Config.get_app_config(el)
+        exec_arguments_text = ' '.join(exec_arguments)
+        if rewrite_exec:
+            env_vars_prefix = (f'env {" ".join(env_variables)} '
+                               if env_variables else '')
+            jd_desktop_entry.Exec = ''.join([
+                env_vars_prefix,
+                shlex.quote(dest_appimage_file),
+                f' {exec_arguments_text}' if exec_arguments_text else '',
+            ])
+
+        desktop_content = jd_desktop_entry.get_text().encode('utf-8')
+
+        # The record is keyed by the INSTALLED path (el.file_path becomes
+        # `dest_appimage_file`); an existing record for the same path (the
+        # REPLACE case) is merged exactly like Config.get_app_config(el)
+        # did after the binary was in place.
+        app_config = dict(Config.get_app_config(
+            SimpleNamespace(file_path=dest_appimage_file)))
         app_config['default_exec_arguments'] = new_default_exec_arguments
         # provenance for the containment-bound uninstall: the desktop
         # entry is mutable, so uninstall never trusts its Icon/TryExec
@@ -742,13 +850,87 @@ class AppImageProvider():
         app_config['appimage_path'] = dest_appimage_file
         app_config['desktop_file_path'] = dest_desktop_file_path
         app_config['icon_path'] = dest_appimage_icon_file or ''
-        Config.set_app_config(el, app_config)
 
-        if settings.load_settings()['move_appimage_on_integration']:
-            if os.path.dirname(original_appimage_path) != appimages_destination_path:
-                logging.info('Deleting original appimage file from: %s',
-                             original_appimage_path)
-                os.unlink(original_appimage_path)
+        remove_original = (
+            settings.load_settings()['move_appimage_on_integration']
+            and os.path.dirname(source_appimage)
+            != appimages_destination_path)
+
+        return InstallPlan(
+            source_appimage=source_appimage,
+            dest_appimage_file=dest_appimage_file,
+            desktop_id=prefixed_filename,
+            dest_desktop_file_path=dest_desktop_file_path,
+            dest_icon_file=dest_appimage_icon_file,
+            icon_bytes=icon_bytes,
+            desktop_content=desktop_content,
+            exec_arguments=exec_arguments_text,
+            default_exec_arguments=new_default_exec_arguments,
+            env_variables=env_variables,
+            app_config=app_config,
+            version=version,
+            remove_original=remove_original,
+        )
+
+    def commit_install(self, el: AppImageListElement, plan: InstallPlan,
+                       before_replace=None):
+        """Perform every write of an install, in the ported flow's order.
+
+        Binary replace first (that is where `before_replace` fires — the
+        force-quit grant of ticket 26), then its mode, the icon and its
+        stale siblings, the desktop entry, apps.ini, the original
+        download's removal and the desktop-database refresh."""
+        appimages_destination_path = os.path.dirname(
+            plan.dest_appimage_file)
+        os.makedirs(appimages_destination_path, exist_ok=True)
+
+        _atomic_install(plan.source_appimage, plan.dest_appimage_file,
+                        0o755, before_replace=before_replace)
+        logging.debug('file copied to %s', appimages_destination_path)
+
+        el.file_path = plan.dest_appimage_file
+        el.exec_arguments = plan.exec_arguments
+        el.env_variables = list(plan.env_variables)
+        el.set_trusted()
+
+        # copy the icon file (the bytes the plan validated)
+        if plan.icon_bytes is not None and plan.dest_icon_file:
+            os.makedirs(os.path.dirname(plan.dest_icon_file), exist_ok=True)
+            _atomic_write_bytes(plan.icon_bytes, plan.dest_icon_file, 0o644)
+
+        # A previous icon of the same stem must not survive: the panel
+        # renders .icons/<stem>.png|svg by file name (not through the
+        # desktop entry's Icon=), so a stale file would keep being decoded
+        # by the shared shell even after an update whose new icon is
+        # refused -- and a stale .png would win the panel's png-first probe
+        # over a freshly installed .svg.
+        icons_folder = os.path.join(appimages_destination_path, '.icons')
+        keep_ext = (os.path.splitext(plan.dest_icon_file)[1]
+                    if plan.dest_icon_file else None)
+        for stale_ext in ('.png', '.svg', '.xpm'):
+            if stale_ext == keep_ext:
+                continue
+            try:
+                os.remove(os.path.join(icons_folder,
+                                       plan.desktop_id + stale_ext))
+            except OSError:
+                pass
+
+        # Write the new .desktop file (atomically) at its default
+        # location; the plan rendered the exact final content once.
+        os.makedirs(self.user_desktop_files_path, exist_ok=True)
+        atomic_write(plan.dest_desktop_file_path, plan.desktop_content)
+
+        el.desktop_entry = DesktopEntry(path=plan.dest_desktop_file_path)
+        el.desktop_file_path = plan.dest_desktop_file_path
+        el.installed_status = InstalledStatus.INSTALLED
+
+        Config.set_app_config(el, plan.app_config)
+
+        if plan.remove_original:
+            logging.info('Deleting original appimage file from: %s',
+                         plan.source_appimage)
+            os.unlink(plan.source_appimage)
 
         try:
             run_command(['update-desktop-database',
@@ -758,6 +940,25 @@ class AppImageProvider():
             logging.debug('update-desktop-database failed: %s', e)
 
         el.updating_from = None
+
+    def install_file(self, el: AppImageListElement, before_replace=None):
+        """Ported from AppImageProvider.install_file (naming, conflict
+        resolution and desktop entry rewriting follow upstream).
+
+        Since ticket 40 this is plan + commit: `plan_install` reads and
+        validates the whole install without writing anything, then
+        `commit_install` performs every write in the original order.
+
+        `before_replace` is forwarded to the AppImage's own
+        _atomic_install only (never to the icon write): it is the last
+        moment before the new file becomes visible at its final name, so
+        an update that was granted permission to close the running app
+        can close whatever was (re)started during the download. Default
+        None keeps every existing caller byte-identical."""
+        logging.info('Installing appimage: %s', el.file_path)
+        el.installed_status = InstalledStatus.INSTALLING
+        plan = self.plan_install(el)
+        self.commit_install(el, plan, before_replace=before_replace)
 
     def update_from_url(self, manager, el: AppImageListElement,
                         keep_both=False, progress_cb=None,
@@ -783,7 +984,11 @@ class AppImageProvider():
             before the atomic replace.
         Raises InternalError when the download is not an AppImage."""
         dest_dir = extractor.new_temp_dir(prefix='appimage-update-')
-        update_file_path = manager.download(dest_dir, progress_cb)
+        # An update is the strict path (issue #45): a source that cannot
+        # prove its artifact is refused before any byte is downloaded.
+        update_file_path = manager.fetch(dest_dir, updaters.POLICY_STRICT,
+                                         progress_cb,
+                                         is_appimage=self.can_install_file)
 
         if not self.can_install_file(update_file_path):
             raise InternalError('The downloaded file is not a valid AppImage, '

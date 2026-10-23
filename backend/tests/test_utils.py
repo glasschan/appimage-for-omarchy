@@ -174,7 +174,8 @@ class RunningByPsRuleTests(unittest.TestCase):
                                return_value={'parent': [11],
                                              'children': []}) as scan:
             self.assertTrue(utils._running_by_ps(FUSE_APP))
-        scan.assert_called_once_with(FUSE_APP)
+        # probe is threaded through so a listing can share one scan
+        scan.assert_called_once_with(FUSE_APP, probe=None)
 
     def test_children_alone_are_not_the_app_itself(self):
         with mock.patch.object(procs, 'pids_for',

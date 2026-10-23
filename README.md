@@ -70,9 +70,11 @@ DNS-rebinding-safe dialing, validated redirects), hard byte caps and
 absolute whole-operation deadlines on responses; downloaded updates are
 installed only after verification against a mandatory cryptographic
 digest (GitHub sha256 asset digest, zsync SHA-1 control-file line) —
-sources that expose no digest refuse to *update*; an AppImage integrated
-directly from a URL is the one exception (reduced assurance: AppImage
-magic bytes + advertised size); the trust boundaries
+sources that expose no digest refuse to *update*, and the panel says so
+before you press the button (`verification` / `installable` per app, a
+`cannot verify` row state, no update badge or action); an AppImage
+integrated directly from a URL is the one exception (reduced assurance:
+AppImage magic bytes + advertised size); the trust boundaries
 cannot be disabled from the environment; installs are atomic (a planted
 symlink at a destination is replaced, not written through), uninstalls
 only remove paths provably bound to the app, extraction is quota-limited
@@ -351,6 +353,54 @@ named after the plugin id), and publishes a GitHub Release with
 auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
+
+### 0.10.0
+
+- **A check now says whether its update can be installed.** Every app in
+  `--list-installed --json` / `--list-updates --json` carries
+  `verification` (`sha256`, `zsync-sha1`, `size`, `none`) and
+  `installable` (`true` / `false` / `null` until a check reaches a
+  verdict). A source that cannot prove its artifact is reported as not
+  installable instead of advertising an update the fetch must then
+  refuse, and the panel row shows `cannot verify` with no badge and no
+  update button. Additive: `schema_version` stays 1, the verification
+  policy is unchanged.
+- **One fetch path per publisher, with the policy as a parameter.**
+  `describe()` (offline: candidate release, advertised version and size,
+  verification method) and `fetch(destination, policy)` replaced the
+  CLI's duplicate download/verify code. `strict` is every update; a
+  non-GitHub URL pasted into `--integrate` fetches `reduced`; an unknown
+  policy is an error, never a silent fallback. The preview now reports
+  the method and policy it will actually use, and takes its destination
+  from the install plan, so it cannot promise a file the install would
+  not write.
+- **Install is planned before it is committed.** A refusal (for example
+  an image with no usable desktop entry) now writes nothing at all; the
+  old order replaced the binary and wrote the icon before the check that
+  could fail, which left a half-integrated install and an
+  `AttributeError` behind.
+- **One update per app at a time, enforced by the pipeline.** The claim
+  (an exclusive `flock` on the app's job log) moved out of the panel's
+  code into the update pipeline, so a terminal `--update` and the
+  background job refuse a second start identically, and `--remove` is
+  refused while that app's job runs.
+- **A failed check forgets nothing.** `updates-state.json` is merged per
+  app (entries are objects with `signature` + `installable`; legacy plain
+  strings still read) instead of being rebuilt from only the apps this
+  sweep could reach.
+- **A listing scans once.** One process table and one mounts read answer
+  every running question, so cost no longer grows with the number of
+  installed apps.
+- **Panel state has one owner.** Update-check and startup claims carry an
+  owner and a lease (`lib/Model.js`), so a panel that closes mid-run no
+  longer wedges background checks; a second operation is a quiet wait
+  rather than `Backend call failed (list)`; an armed launch verdict lives
+  in the store and settles from any later listing, even after the panel
+  closed; and an error names its app and is only replaced by that app's
+  next outcome.
+- **Typos fail loudly.** Every verb validates its own option set: an
+  undocumented option is `unknown option: '--bogus'`, usage on stderr,
+  exit 2 — never a silently ignored token.
 
 ### 0.9.10
 

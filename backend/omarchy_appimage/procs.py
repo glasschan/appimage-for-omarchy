@@ -187,7 +187,8 @@ def iter_processes(probe=None):
         yield pid, exe
 
 
-def mount_points_for(appimage_path: str, mounts_path: str = None) -> list:
+def mount_points_for(appimage_path: str, mounts_path: str = None,
+                     probe=None) -> list:
     """The mount points /proc/mounts attributes to this AppImage.
 
     The match is on the mount's SOURCE BASENAME, because that field only
@@ -204,6 +205,10 @@ def mount_points_for(appimage_path: str, mounts_path: str = None) -> list:
     location (tests)."""
     if not appimage_path:
         return []
+    if probe is not None and mounts_path is None:
+        # the caller already holds a scan (a listing's _ScanCache): reuse
+        # its mounts table instead of re-reading /proc/mounts per row
+        return _mount_points(_probe_or_default(probe).mounts(), appimage_path)
     return _mount_points(parse_proc_mounts(mounts_path), appimage_path)
 
 

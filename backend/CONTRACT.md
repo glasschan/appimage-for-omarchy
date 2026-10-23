@@ -190,9 +190,13 @@ download starts:
 | source `kind` | `verification.method` | `reduced_assurance` |
 |---|---|---|
 | `local` | `none` | `false` — no download; the AppImage magic-byte check only |
-| `github` | `github-sha256` | `false` — API digest mandatory at integrate time |
+| `github` | `sha256` | `false` — API digest mandatory at integrate time |
 | `zsync` | `zsync-sha1` | `false` — SHA-1 when the control file publishes one, else the reduced checks; the control file is only readable at integrate time |
 | `gitlab` / `codeberg` / `forgejo` / `static` | `none` | `true` — reduced assurance |
+
+The `method` vocabulary is the same one `<app>.verification` uses, and each
+entry also names the fetch `policy` it will run under (`reduced`, or `null`
+when nothing is fetched) — see Fetch policies.
 
 Flags: `already_integrated` is true when the file's content already
 matches an installed AppImage (integrate would print
@@ -209,6 +213,11 @@ within `schema_version` 1 (same policy as `exec_arguments`).
 
 ### `--remove <target> [--yes] [--delete] [--json]`
 
+Refused while an update job for that app is active — exit 1,
+`<path> is being updated by a running job (pid <pid>); refusing to remove
+it`. Removing the file under a job that is about to replace it would leave
+the job installing a file with no installation record.
+
 Removes an integrated app. `<target>` is resolved in this order:
 
 1. exact AppImage file path (e.g. `~/AppImages/neovim.appimage`)
@@ -224,6 +233,13 @@ Per-app config entries (including the update source) are deleted either way.
 
 Nothing is ever removed automatically: a stale record is only cleaned up
 when the user asks for it explicitly (`--remove <desktop id> --yes`).
+
+The guard asks the update **claim** (the `flock` on that app's job log), not
+just the job document: a synchronous `--update` holds the claim for the whole
+download-and-replace window without ever writing a document, so a
+document-only guard would let a removal uninstall the file the updater is
+about to replace, and `commit_install` would then resurrect the app after it
+was reported removed.
 
 ### `--list-updates [--json]`
 
@@ -251,8 +267,20 @@ per-app errors are logged (stderr) and skipped.
 ### `--update <target> [--yes] [--keep-both] [--force] [--kill-running] [--json]`
 
 Downloads the new release through the app's update source and installs it.
+Every fetch here runs under the **strict** verification policy (see Fetch
+policies): a source that cannot prove its artifact is refused before any
+byte is downloaded.
 
 - `--json` requires `--yes` (exit 2 otherwise).
+- **One update per app at a time.** The claim belongs to the update
+  pipeline itself, not to a caller, so a second update of the same app is
+  refused identically whether it was started by the panel's background job
+  or by this command: exit 1, error
+  `an update is already running for <path>; refusing to start a second one`.
+  The claim is an exclusive `flock` on that app's job log, released by the
+  kernel when its last holder dies — never a claim file, so nothing goes
+  stale. An app whose desktop id cannot name a job file claims nothing and
+  updates synchronously as before.
 - No update source configured: exit 1, error
   `No update method was found for this AppImage (set one with --set-update-source)`.
 - App currently running (the `running` flag, `utils.is_app_running`: a
@@ -582,10 +610,23 @@ Behaviour:
 
    `notified` is `true` only if `notify-send` ran and exited 0 (missing
    binary / non-zero exit → `false`, never an error).
-4. The state file is saved with the signatures of **all** currently
-   available updates (so unchanged updates do not re-notify).
+4. The state file is updated **per app**, never replaced wholesale. An app
+   that is still installed keeps its entry when this sweep could not check
+   it (network error, unreachable source); this run's own results overwrite
+   theirs. An entry is dropped only when the app is not listed **and** the
+   AppImage it names is gone — the listing silently skips an app whose
+   desktop entry is momentarily unreadable (VS Code forks rewrite their own
+   entry on first launch), and that is not an uninstall. A failed sweep
+   therefore learns nothing and forgets nothing, instead of re-notifying
+   every app it could not see. Each entry is an object
+   `{"signature": "<available_version>|<download_size>", "installable": true | false | null, "path": "<absolute AppImage path>"}`
+   — a legacy plain-string entry is still read as its signature, and an
+   entry without `path` is pruned as before.
 5. `--update` clears the updated app's entry, which re-arms the
    notification for the next genuinely new release.
+6. The state lives at `<plugin config dir>/updates-state.json`; a save
+   failure is logged and never turns the sweep into a failure (this verb
+   always exits 0).
 
 Real example output (update available, first run, notification delivered):
 
@@ -705,6 +746,11 @@ Real example output:
 | `--delete` | Bypass the trash (irreversible) |
 | `--help` / `-h` | Usage text, exit 0 |
 
+Every verb validates its own option set. An option it does not document is a
+usage error — `Error: unknown option: '--bogus'`, the usage text on stderr,
+exit 2 (plus the JSON error document with `--json`) — never a silently
+ignored token.
+
 ## Security model (marketplace security-review hardening)
 
 - **https-only egress** — every request URL must be `https://`; plain
@@ -819,15 +865,18 @@ No arguments prints usage and exits **2**.
 | `available_version` | string or null | Release tag of the available update (`null` unless filled by a check; static-file sources have no version) |
 | `download_size` | int or null | Byte size of the available update (`null` unless filled by a check) |
 | `manager` | string or null | Update manager name (`StaticFileUpdater`, `GithubUpdater`, `GitlabUpdater`, `CodebergUpdater`, `ForgejoUpdater`) or `null` when no source exists |
+| `verification` | string | How this app's source would prove an artifact: `sha256` (a published digest), `zsync-sha1` (the zsync control file's `SHA-1:` line), `size` (a byte count only) or `none` (no source, or a source that publishes nothing). Only the two digest methods are accepted by a fetch, so `size`/`none` describe an update that can be **reported** but not installed. A zsync control file the last check read without a `SHA-1:` line reports `size`: that source cannot install, so the report must not promise a digest |
+| `installable` | boolean or null | `true` when a fetch under the strict verification policy would be attempted, `false` when the source must refuse it, `null` when nothing has decided yet (no check has run, or the app has no source). Derived from `verification` plus the check's verdict, so the two keys can never disagree. Reporting only: the verification policy is not relaxed, and a source that cannot prove its artifact still refuses the install |
 | `embedded_source` | boolean | True when the source comes from the AppImage's embedded `.upd_info` string (false for custom configs and for no source) |
 | `running` | boolean | True when the AppImage is currently running. Computed by **one rule shared with `running_pids`** (`utils._running_by_ps` → `procs.pids_for`'s `parent` list, plus the `fuse.*` mount signal for the runtime that has no attributable exe): a process whose `/proc/<pid>/exe` is the AppImage path (compared through `os.path.realpath`, so a symlinked install directory matches either way round), or a `fuse.*` mount in `/proc/mounts` attributed to it (matched on the mount source's basename — see Process identity under Security model). Because the mount signal can outlive the processes, `running: true` with `running_pids: 0` is possible: the mount is still there, no process of ours is |
 | `running_pids` | int | How many processes belong to this AppImage: the runtime parent (its `exe` is the AppImage path) **plus** the helpers running out of the `fuse.*` mount attributed to it — the set `--kill-running` would close (`procs.pids_for`). `0` when the app is not running (a non-running row is never scanned) and `0` when the count cannot be determined (a failed scan is a warning, never an error, and never flips `running`). **Display-only**: the panel's prompt names it; no command reads it back. A listing builds one process table (and one `/proc/mounts` read) and reuses it for every running row, because the panel polls the listing every 10 s |
 | `exec_arguments` | string | The desktop entry's `Exec=` arguments, e.g. `"--no-sandbox %U"` or `"%U"`; `""` when the app has none. The desktop field codes (`%f %F %u %U %i %c %k`) stay **verbatim** — stripping them is the UI's job. The current desktop entry wins; when it carries no arguments, the install-time `default_exec_arguments` from `apps.ini` is used instead |
 
-> `exec_arguments` and `running_pids` are **additive** keys: every other
-> key keeps its meaning, and a reader that ignores unknown keys (the QML
-> layer does) is unaffected — the same way `manager` / `embedded_source` /
-> `download_size` were added. `schema_version` therefore stays **1**.
+> `verification`, `installable`, `exec_arguments` and `running_pids` are
+> **additive** keys: every other key keeps its meaning, and a reader that
+> ignores unknown keys (the QML layer does) is unaffected — the same way
+> `manager` / `embedded_source` / `download_size` were added.
+> `schema_version` therefore stays **1**.
 
 ### `--list-installed --json`
 
@@ -864,7 +913,7 @@ Other `result` values: `already-integrated` (exit 0, app unchanged).
 ### `--preview-integrate <path-or-url> --json`
 
 ```json
-{"schema_version": 1, "result": "preview", "source": {"kind": "local", "input": "<path-or-url as given>"}, "verification": {"method": "github-sha256|zsync-sha1|none", "reduced_assurance": true|false, "note": "<human-readable sentence for the panel>"}, "destination": {"folder": "<managed folder, absolute>", "filename": "<file name integrate would pick>" | null, "path": "<folder>/<filename>" | null}, "app": {"name": "...", "version": "..."} | null, "already_integrated": false, "name_conflict": false, "advisory": true}
+{"schema_version": 1, "result": "preview", "source": {"kind": "local", "input": "<path-or-url as given>"}, "verification": {"method": "sha256|zsync-sha1|none", "policy": "strict" | "reduced" | null, "reduced_assurance": true|false, "note": "<human-readable sentence for the panel>"}, "destination": {"folder": "<managed folder, absolute>", "filename": "<file name integrate would pick>" | null, "path": "<folder>/<filename>" | null}, "app": {"name": "...", "version": "..."} | null, "already_integrated": false, "name_conflict": false, "advisory": true}
 ```
 
 | Key | Meaning |
@@ -937,6 +986,29 @@ it can be overridden with `appimages_default_folder` in `settings.json`
 | `update_check_enabled` | `true` | Master switch for the background update check (the service should not call `--fetch-updates` when false) |
 | `update_check_interval_minutes` | `360` | How often the service checks (minimum 15) |
 | `update_check_delay_minutes` | `5` | Delay before the first check after startup |
+
+## Fetch policies (issue #45)
+
+Every publisher is reached through one module with two halves:
+
+- **describe** — offline: the candidate release, its advertised version and
+  size, and the verification method it would use. Never touches the
+  network; this is what `--list-installed` reports.
+- **fetch(destination, policy)** — online: the artifact, under a named
+  verification policy.
+
+| policy | used by | rule |
+|---|---|---|
+| `strict` | every `--update`, the background job, a GitHub URL pasted into `--integrate` | A digest must exist. A source that cannot prove its artifact is refused **before any byte is downloaded** |
+| `reduced` | a non-GitHub URL pasted into `--integrate` (a release the user already vouched for) | The artifact may arrive without a publisher digest; the AppImage magic bytes and, when advertised, the exact byte size are checked instead |
+
+An unknown policy is an error, never a silent fallback to a permissive one.
+Reduced exists only for the pasted-URL path: nothing in `--update`,
+`--async` or the periodic sweep ever fetches unverified bytes, and GitHub
+assets demand their `sha256` digest under **both** policies. The preview's
+destination block (name, version, icon, install path) comes from the
+install plan, so a preview cannot promise a different file than the install
+would write.
 
 ## Update-source selection (GearLever semantics)
 

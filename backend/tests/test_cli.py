@@ -100,7 +100,8 @@ class OfflineCliTests(FakeXDGTestCase):
         self.assertEqual(set(app), {
             'name', 'path', 'desktop_id', 'current_version',
             'available_version', 'download_size', 'manager',
-            'embedded_source', 'running', 'running_pids', 'exec_arguments'})
+            'embedded_source', 'running', 'running_pids', 'exec_arguments',
+            'verification', 'installable'})
         self.assertEqual(app['name'], 'Fake App')
         self.assertEqual(app['path'], appimage)
         self.assertEqual(app['desktop_id'], 'fakeapp.desktop')
@@ -114,6 +115,9 @@ class OfflineCliTests(FakeXDGTestCase):
         self.assertEqual(app['running_pids'], 0)
         # the fake desktop entry carries no Exec arguments
         self.assertEqual(app['exec_arguments'], '')
+        # no source -> nothing to prove and no verdict to report
+        self.assertEqual(app['verification'], 'none')
+        self.assertIsNone(app['installable'])
 
         # the runtime block rides every successful envelope, with or
         # without installed apps
@@ -778,9 +782,9 @@ class InProcessUpdateCliTests(InProcessCliMixin, FakeXDGTestCase):
         self.assertIn('--expire-time=5000', argv)
         self.assertEqual(argv[-2], 'AppImage updates available')
 
-        # the state now remembers the signature...
+        # the state now remembers the signature (as a per-app record, #39)...
         state = appimage_settings.load_updates_state()
-        self.assertEqual(state.get('fakeapp.desktop'), '|5000')
+        self.assertEqual(state['fakeapp.desktop']['signature'], '|5000')
 
         # ...so the next run sees the same update WITHOUT notifying again
         with mock.patch.object(net, 'check_internet', return_value=True), \
@@ -801,8 +805,8 @@ class InProcessUpdateCliTests(InProcessCliMixin, FakeXDGTestCase):
         self.assertEqual(payload['notified'], False)
         self.assertEqual(len(payload['updates']), 1)
         # the state is still saved (the release was seen)
-        self.assertEqual(appimage_settings.load_updates_state()
-                         .get('fakeapp.desktop'), '|5000')
+        entry = appimage_settings.load_updates_state()['fakeapp.desktop']
+        self.assertEqual(entry['signature'], '|5000')
 
     def test_fetch_updates_nonzero_notify_exit(self):
         self._app_with_source({'/f.appimage': (200, {}, b'B' * 5000)})

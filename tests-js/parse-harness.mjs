@@ -555,6 +555,7 @@ check("drop no-AppImage list typed", dropNone.ok === false
 // the python hint when the probe has not already confirmed python missing
 // (then the install card owns the screen and the banner is cleared).
 function reportFailureLike(result, pythonMissing) {
+  if (result.wait === true) return "wait"
   if (result.timedOut) return "timeout"
   if (result.spawnFailed || result.error === "no-backend-command") {
     if (result.spawnFailed && pythonMissing === true) return "cleared"
@@ -569,6 +570,8 @@ check("spawn failure → hint", reportFailureLike({ timedOut: false, spawnFailed
 check("spawn failure with python confirmed missing → card owns it",
   reportFailureLike({ timedOut: false, spawnFailed: true, error: "exit--1" }, true) === "cleared")
 check("timeout → its own message", reportFailureLike({ timedOut: true }) === "timeout")
+check("a second operation is a wait, not a failure",
+  reportFailureLike({ ok: false, error: "busy", wait: true }) === "wait")
 check("exit1 error doc → backend message",
   reportFailureLike({ ok: false, exitCode: 1, stdout: cap("error.json"), stderr: "", error: "exit-1" })
     .includes("not integrated"))
@@ -1556,6 +1559,197 @@ check("title keeps a parenthetical that is not hash-shaped",
   rowName("App (Fork)", "1.0") === "App (Fork)")
 check("title keeps a long hex parenthetical that is not the hash shape",
   rowName("App (abcdefa)", "1.0") === "App (abcdefa)")
+
+
+// ---- #42 run state: claims, expiry, waits -----------------------------------
+// One claim table for the engine: an owner, a token and a deadline. A claim
+// whose owner died (the shell unloads the panel and kills its Process) must
+// not outlive its deadline, and a second attempt must be a wait.
+Model.releaseUpdateCheck()
+check("#42 first claim wins", Model.claimUpdateCheck("panel") === true)
+check("#42 second claimant waits", Model.claimUpdateCheck("service") === false)
+const liveClaim = Model.state.claims.updates
+check("#42 claim records owner and deadline",
+  liveClaim.owner === "panel" && liveClaim.deadlineMs > Date.now())
+// The owner died: its deadline passed, so anyone may take over.
+liveClaim.deadlineMs = Date.now() - 1
+check("#42 an expired claim is taken over",
+  Model.claimUpdateCheck("service") === true
+  && Model.state.updateCheckOwner === "service")
+Model.releaseUpdateCheck()
+check("#42 release frees the claim", Object.keys(Model.state.claims).length === 0)
+Model.releaseUpdateCheck()
+check("#42 double release is harmless", Object.keys(Model.state.claims).length === 0)
+
+// A stale handle must not free a claim that has since been re-taken.
+const staleHandle = Model.claimOperation("updates", "panel", 1000)
+Model.releaseOperation(staleHandle)
+const freshHandle = Model.claimOperation("updates", "panel", 1000)
+check("#42 a stale token cannot free a newer claim",
+  Model.releaseOperation(staleHandle) === false
+  && Model.state.claims.updates.token === freshHandle.token)
+Model.releaseOperation(freshHandle)
+
+// One snapshot, same shape for both surfaces.
+const opsSnapshot = Model.snapshot()
+check("#42 snapshot carries busy, claims and outcomes",
+  opsSnapshot.busy.list === false && typeof opsSnapshot.claims === "object"
+  && opsSnapshot.status === Model.state.status
+  && opsSnapshot.lastError === Model.state.lastError)
+
+// The wait notice must never wipe the operation that is still running.
+Model.clearStatus()
+Model.setStatus(Model.strings.integrateWorking)
+Model.setTransientStatus(Model.strings.operationBusy)
+check("#42 a wait never wipes a live status",
+  Model.state.status === Model.strings.integrateWorking)
+// #48 changed setStatus: it no longer displaces an error, so clear the one
+// the previous section left behind before asking what a wait does.
+Model.clearError()
+Model.clearStatus()
+Model.setTransientStatus(Model.strings.operationBusy)
+check("#42 a wait speaks when nothing else is showing",
+  Model.state.status === Model.strings.operationBusy)
+check("#42 a wait is never an error", Model.state.lastError === "")
+Model.clearStatus()
+
+// The claim carries its owner, so a surface whose claim was taken over
+// cannot free the winner's: the panel's late onDone must leave the
+// service's sweep alone.
+Model.releaseUpdateCheck("panel")
+if (!Model.claimUpdateCheck("service")) throw new Error("service could not claim")
+check("#42 a non-owner cannot release the claim",
+  Model.releaseUpdateCheck("panel") === false
+  && Model.state.updateCheckOwner === "service")
+check("#42 the owner releases its own claim",
+  Model.releaseUpdateCheck("service") !== false
+  && Model.state.claims.updates === undefined)
+
+// ---- #39 installability: the row never offers a refused install -------------
+// Distinct desktop ids: applyUpdates merges by id, so two rows must not share one.
+const parsedWithSource = (overrides) => Model.parseListJson(JSON.stringify({
+  schema_version: 1,
+  installed: [Object.assign({
+    name: "Gitlab App", desktop_id: "gitlabapp.desktop",
+    path: "/x/gitlabapp.appimage",
+    current_version: "1.0", available_version: "2.0",
+    manager: "GitlabUpdater", embedded_source: false,
+    running: false, running_pids: 0, exec_arguments: ""
+  }, overrides)]
+})).items[0]
+
+const unverifiable = parsedWithSource({ installable: false, verification: "size" })
+check("#39 installability carried onto the item",
+  unverifiable.installable === false && unverifiable.verification === "size")
+check("#39 an absent field means not determinable",
+  parsedWithSource({}).installable === null)
+const verifiable = parsedWithSource({
+  installable: true, verification: "sha256",
+  name: "Github App", desktop_id: "githubapp.desktop",
+  path: "/x/githubapp.appimage", manager: "GithubUpdater"
+})
+
+Model.setItems([unverifiable, verifiable])
+Model.applyUpdates([unverifiable, verifiable])
+check("#39 the badge excludes a non-installable update",
+  Model.updateCount() === 1, String(Model.updateCount()))
+const unverifiableSegs = Model.rowMeta(
+  Model.findItem("gitlabapp.desktop"), "").map((s) => s.text)
+const verifiableSegs = Model.rowMeta(
+  Model.findItem("githubapp.desktop"), "").map((s) => s.text)
+check("#39 a non-installable row says cannot verify",
+  unverifiableSegs.includes(Model.strings.cannotVerify), unverifiableSegs.join("|"))
+check("#39 a non-installable row drops the pending release",
+  !unverifiableSegs.some((t) => t.indexOf("available") !== -1), unverifiableSegs.join("|"))
+check("#39 a verifiable row keeps its pending release",
+  verifiableSegs.some((t) => t.indexOf("available") !== -1), verifiableSegs.join("|"))
+check("#39 the row hides the update action for a refused install",
+  unverifiable.installable === false && verifiable.installable !== false)
+
+// ---- #47 the launch verdict outlives the panel -----------------------------
+// The click closes the panel, so the verdict cannot live on the panel object;
+// it lives in the store and any later listing settles it.
+const launchRow = (overrides) => parsedWithSource(Object.assign({
+  name: "Launch App", desktop_id: "launch.desktop", path: "/x/launch.appimage",
+  current_version: "1.0", available_version: null, manager: null
+}, overrides))
+
+Model.setItems([])
+Model.clearError()
+Model.armLaunchVerdict("launch.desktop")
+check("#47 arming the verdict records it",
+  Model.state.launchVerdict !== null
+  && Model.state.launchVerdict.id === "launch.desktop")
+const armedAt = Model.state.launchVerdict.atMs
+
+// A listing that began before the click cannot judge it.
+Model.setItems([launchRow({ running: false })], { fuse2: "present" }, armedAt - 1)
+check("#47 an earlier listing does not settle the verdict",
+  Model.state.launchVerdict !== null && Model.state.lastError === "")
+
+// A running app is a silence, not a banner.
+Model.setItems([launchRow({ running: true })], { fuse2: "present" }, armedAt + 1)
+check("#47 a running app settles silently",
+  Model.state.launchVerdict === null && Model.state.lastError === "")
+check("#47 a settled verdict never names an app in the banner",
+  Model.state.lastErrorSubject === "")
+
+// A present, non-running row is the failure, and the listing's own runtime
+// block decides the fuse2 hint.
+Model.clearError()
+Model.armLaunchVerdict("launch.desktop", armedAt + 10)
+Model.setItems([launchRow({ running: false })], { fuse2: "missing" }, armedAt + 11)
+const launchBanner = Model.state.lastError
+check("#47 a dead launch raises the banner",
+  launchBanner.indexOf("Launch App") !== -1, launchBanner)
+check("#47 the fuse2 hint rides the same listing",
+  launchBanner.indexOf(Model.strings.launchFuse2Hint) !== -1)
+check("#47 the banner belongs to that app",
+  Model.state.lastErrorSubject === "launch.desktop")
+
+// An app that vanished from the list is no claim at all.
+Model.clearError()
+Model.armLaunchVerdict("gone.desktop", armedAt + 20)
+Model.setItems([launchRow({})], { fuse2: "present" }, armedAt + 21)
+check("#47 a missing row settles without a banner",
+  Model.state.launchVerdict === null && Model.state.lastError === "")
+
+// The caller has to be able to tell a banner it must keep from a refresh
+// it may clear: setItems reports whether it settled one.
+Model.clearError()
+Model.armLaunchVerdict("launch.desktop", armedAt + 30)
+check("#47 a settled banner is reported to the caller",
+  Model.setItems([launchRow({ running: false })],
+                 { fuse2: "present" }, armedAt + 31) === true)
+check("#47 an idle listing reports nothing",
+  Model.setItems([launchRow({ running: true })],
+                 { fuse2: "present" }, armedAt + 32) === false)
+Model.clearError()
+
+// ---- #48 errors persist and name their app ---------------------------------
+Model.clearError()
+Model.clearStatus()
+Model.setError("update failed", "launch.desktop")
+Model.setStatus("checking updates")
+check("#48 a status line never clears an error",
+  Model.state.lastError === "update failed")
+Model.noteOutcome("other.desktop")
+check("#48 another app's outcome leaves the error alone",
+  Model.state.lastError === "update failed")
+Model.noteOutcome("launch.desktop")
+check("#48 the same app's next outcome replaces it",
+  Model.state.lastError === "" && Model.state.lastErrorSubject === "")
+Model.clearStatus()
+Model.setError(Model.appErrorBanner("Launch App", "Backend call failed"), "launch.desktop")
+check("#48 an app error names the app",
+  Model.state.lastError.indexOf("Launch App") === 0, Model.state.lastError)
+Model.setError("no app", "")
+Model.noteOutcome("")
+check("#48 an error about no app is never cleared by an outcome",
+  Model.state.lastError === "no app")
+Model.clearError()
+check("#48 dismissal clears error and subject",
+  Model.state.lastError === "" && Model.state.lastErrorSubject === "")
 
 rmSync(sandbox, { recursive: true, force: true })
 

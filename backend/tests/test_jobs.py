@@ -588,8 +588,9 @@ class AsyncJobCliTests(InProcessCliMixin, FakeXDGTestCase):
             self.assertTrue(f.read().startswith(b'\x7fELF'))
 
     def test_error_terminal_document(self):
-        # a zsync control file without a SHA-1 line fails the download
-        # fail-closed -> terminal error document
+        # a zsync control file without a SHA-1 line is not installable, so
+        # the strict policy refuses it before any byte is downloaded ->
+        # terminal error document
         server = FixtureHTTPServer(
             {'/f.appimage.zsync': (200, {}, b'URL: /x\n\nno sha here\n')})
         self.addCleanup(server.close)
@@ -601,7 +602,10 @@ class AsyncJobCliTests(InProcessCliMixin, FakeXDGTestCase):
         doc = jobs.read_job('fakeapp.desktop')
         self.assertEqual(doc['phase'], 'error')
         self.assertEqual(doc['status'], 'error')
-        self.assertIn('SHA-1', doc['error'])
+        # the refusal now happens at the policy gate, not inside the
+        # download: no SHA-1 line means no usable digest for this source
+        self.assertIn('unverified artifact', doc['error'])
+        self.assertIn('digest', doc['error'])
 
 
 class AsyncJobFlowTests(InProcessCliMixin, FakeXDGTestCase):

@@ -215,7 +215,8 @@ class UrlPreviewTests(InProcessCliMixin, OfflinePreviewMixin,
     def test_github_url_reports_mandatory_sha256(self):
         doc = self._preview(self.GITHUB_URL)
         self._assert_url_common(doc, self.GITHUB_URL, 'github')
-        self.assertEqual(doc['verification']['method'], 'github-sha256')
+        # the preview now names the same method the listing reports
+        self.assertEqual(doc['verification']['method'], 'sha256')
         self.assertFalse(doc['verification']['reduced_assurance'])
 
     def test_zsync_url_reports_sha1_method(self):

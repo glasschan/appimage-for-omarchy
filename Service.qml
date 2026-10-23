@@ -193,7 +193,7 @@ Item {
     var ctx = Backend.run(fetchProc, fetchTimer, backendCommand,
       ["--fetch-updates", "--json"], { timeoutMs: fetchTimeoutMs }, function(result) {
         fetchCtx = null
-        Model.releaseUpdateCheck()
+        Model.releaseUpdateCheck("service")
         if (result.ok) {
           var parsed = Model.parseUpdatesJson(result.stdout)
           // An offline empty list says nothing about newly integrated
