@@ -1,5 +1,8 @@
 # test_availability.py — issue #39 (a check says whether its update can be
 # installed) and issue #43 (a failed check keeps what the last one learned).
+#
+# Test suite written for this plugin. Released under the GNU GPL-3.0 — see
+# the repo's LICENSE for terms.
 
 import io
 import json

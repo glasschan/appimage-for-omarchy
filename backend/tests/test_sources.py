@@ -1,5 +1,8 @@
 # test_sources.py — issue #45: one source module per publisher, with the
 # verification policy as a parameter of the fetch.
+#
+# Test suite written for this plugin. Released under the GNU GPL-3.0 — see
+# the repo's LICENSE for terms.
 
 import os
 import unittest

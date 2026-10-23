@@ -1,6 +1,9 @@
 # test_inventory.py — issue #41: one listing pass answers every running
 # question from ONE process-table and ONE mounts read, so the cost of a
 # listing does not grow with the number of installed apps.
+#
+# Test suite written for this plugin. Released under the GNU GPL-3.0 — see
+# the repo's LICENSE for terms.
 
 import json
 import os

@@ -4,6 +4,9 @@
 # refused the same way whether it was started by the panel's background job
 # or by a terminal --update. Removal during that app's job is refused by the
 # same module that owns the job.
+#
+# Test suite written for this plugin. Released under the GNU GPL-3.0 — see
+# the repo's LICENSE for terms.
 
 import io
 import os

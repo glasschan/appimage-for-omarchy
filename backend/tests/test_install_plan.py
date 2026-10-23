@@ -1,5 +1,6 @@
 # test_install_plan.py — ticket 40: an install is planned before it is
-# committed.
+# committed. Test suite written for this plugin. Released under the GNU
+# GPL-3.0 — see the repo's LICENSE for terms.
 #
 # The old install_file wrote as it went: metadata load, binary replace,
 # icon, then `extract_terminal_arguments(desktop_entry.getExec())` — which
@@ -8,6 +9,7 @@
 # pin the new shape: plan_install() reads and validates everything and
 # writes NOTHING; commit_install() performs every write in the ported
 # order, with before_replace still firing only at the binary replace.
+#
 
 import os
 import stat
