@@ -28,6 +28,9 @@ fail() {
 }
 
 # --- Gate 1: backend invariant greps. ---------------------------------------
+# The scans are RECURSIVE (rglob): the CLI verbs live in
+# backend/omarchy_appimage/commands/ since ticket #56, and a subpackage
+# must never be a scan blind spot.
 # One scan per review finding; each violation prints a ::error:: line so the
 # GitHub run annotation points at the guilty rule.
 if python3 - <<'PY'
@@ -57,7 +60,7 @@ def read_lines(path):
 # variables must never gate a trust boundary (round-2 finding #1: the
 # ALLOW_LOCAL kill switch). Matches any `.environ` access AND os.getenv,
 # so an aliased import or the idiomatic getenv cannot evade the scan.
-for path in sorted(PKG.glob('*.py')):
+for path in sorted(PKG.rglob('*.py')):
     if path.name == 'constants.py':
         continue
     for i, line in enumerate(read_lines(path), 1):
@@ -68,7 +71,7 @@ for path in sorted(PKG.glob('*.py')):
 
 # Rule 2: no direct urllib egress outside net.py. All requests must flow
 # through the hardened opener (redirect/SSRF/deadline enforcement).
-for path in sorted(PKG.glob('*.py')):
+for path in sorted(PKG.rglob('*.py')):
     if path.name == 'net.py':
         continue
     for i, line in enumerate(read_lines(path), 1):
@@ -101,7 +104,7 @@ for i, line in enumerate(read_lines(extractor), 1):
 # this pins: an unbounded wait must never hang the backend. `from subprocess
 # import` and aliased imports are flagged too — a bare `run(...)` alias must not
 # escape the scan.
-for path in sorted(PKG.glob('*.py')):
+for path in sorted(PKG.rglob('*.py')):
     if path.name == 'utils.py':
         continue
     lines = read_lines(path)

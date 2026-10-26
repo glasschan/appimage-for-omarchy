@@ -380,7 +380,13 @@ byte is downloaded.
   the Update button — goes away at once, and the next `--fetch-updates`
   does not re-notify for the now-installed release. The same retirement
   runs on the definite `up-to-date` path above, because both are truths
-  the pipeline proved about that app (`cli._retire_update_verdict`).
+  the pipeline proved about that app (`commands/update.py`'s
+  `_retire_update_verdict`, re-exported as `cli._retire_update_verdict`;
+  ticket #56 split cli.py into per-verb modules under
+  backend/omarchy_appimage/commands/ — envelope helpers, integrate/preview,
+  listing, checks, update, jobs, settings, urls — with cli.py keeping the
+  usage text, dispatch table and main, and re-exporting every moved name
+  so `omarchy_appimage.cli.<name>` stays the public import surface).
 
 Real example output (success):
 
