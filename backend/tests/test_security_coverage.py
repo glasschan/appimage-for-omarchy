@@ -20,6 +20,7 @@ from pathlib import Path
 TESTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TESTS_DIR.parents[1]
 PARSE_HARNESS = REPO_ROOT / 'tests-js' / 'parse-harness.mjs'
+SECURITY_GATES = REPO_ROOT / 'scripts' / 'ci' / 'security-gates.sh'
 
 # Required scenarios. Each row is (description, [alternative slug-sets],
 # harness_pool) and is satisfied when SOME single test name (or, for rows
@@ -89,6 +90,18 @@ REQUIRED_SCENARIOS = [
      [{'span'}], False),
     ('round 7: the metadata/stream caches are bounded',
      [{'cache'}], False),
+    ('launch contract: the handover forwards the image and its arguments '
+     'verbatim as argv, never through a shell',
+     [{'verbatim', 'arguments'}], False),
+    ('launch contract: the verb stamps DESKTOPINTEGRATION onto the app '
+     'environment (the detached panel spawn cannot carry env vars)',
+     [{'verb', 'stamp'}], False),
+    ('launch contract: an unusable compositor query inherits the caller '
+     'environment unchanged (a launch never fails on the scale)',
+     [{'inherits', 'environment'}], False),
+    ('launch contract: the panel launch argv is built by the ONE launch '
+     'builder and matches the QML assembly',
+     [{'qml', 'assembly'}], False),
 ]
 
 
@@ -151,6 +164,41 @@ class SecurityRegressionCoverageTests(unittest.TestCase):
             lines.append('Add the missing regression test (name it with the '
                          'slug) — do not delete this manifest row.')
             self.fail('\n'.join(lines))
+
+
+class GateScriptLaunchPathTests(unittest.TestCase):
+    """The gate script itself is part of the launch contract (ticket #36):
+    `launch-argv-constancy` (rule 7b) must keep scanning the launch path —
+    launch.py, exec_scale.py, commands/exec_scale.py — for the shell
+    vectors the launch contract forbids. Deleting or narrowing the rule
+    fails here, before a shell-interpolated launch command can land
+    unnoticed."""
+
+    def setUp(self):
+        self.gate_text = SECURITY_GATES.read_text(encoding='utf-8')
+
+    def _assert_pinned(self, needle, why):
+        self.assertIn(needle, self.gate_text, why)
+
+    def test_the_launch_path_rule_scans_the_three_launch_modules(self):
+        for module in ("PKG / 'launch.py'", "PKG / 'exec_scale.py'",
+                       "PKG / 'commands' / 'exec_scale.py'"):
+            self._assert_pinned(
+                module, 'the launch path file list lost a module')
+
+    def test_the_rule_forbids_each_shell_vector(self):
+        for pattern, why in [
+                (r"shell\s*=\s*True", 'shell=True subprocesses'),
+                (r"os\.(?:system|popen)", 'os.system / os.popen'),
+                (r'ba|z|da|k', 'the `sh -c` argv pair'),
+                (r'os\.exec\w*', 'the env-dropping exec family'),
+                (r"DESKTOPINTEGRATION", 'the marker literal pin')]:
+            self._assert_pinned(pattern, f'rule 7b lost its {why} match')
+
+    def test_the_rule_is_wired_into_the_scan(self):
+        self._assert_pinned(
+            "err('launch-argv-constancy'",
+            'the launch-argv-constancy rule no longer reports violations')
 
 
 if __name__ == '__main__':

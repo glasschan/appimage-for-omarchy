@@ -7,7 +7,8 @@
 #
 # Gates in this script:
 #   1  backend invariant greps (os.environ / urllib egress / atomic copy /
-#      bounded subprocess / QML collector wiring / shell-source constancy /
+#      bounded subprocess / QML collector wiring / shell-source constancy,
+#      python side: launch-argv constancy on the launch path /
 #      no editable native text input — round-3 finding, marketplace #11415)
 # The former gate 2 (shellcheck on the bundled install/uninstall scripts)
 # and gate 3 (install.sh deploy smoke test) died with those scripts: the
@@ -263,6 +264,56 @@ for path in sorted(ROOT.glob('lib/*.js')) + QML:
                         'source — the presented string must be constant; '
                         'environment values only as expansion/argv data')
 
+# Rule 7b: launch-argv constancy (tickets #32-#35; the python side of
+# rule 7's shell-source-constancy). The launch path — launch.py (the ONE
+# launch-command builder), exec_scale.py (the mechanism) and
+# commands/exec_scale.py (the verb) — builds its commands as ARGV lists
+# end to end and hands the image to `os.execve`; nothing may ever pass
+# through a shell again. Forbidden on that path:
+#   - shell execution vectors: `shell=True`, `os.system`/`os.popen`,
+#     a `bash -c` / `sh -c` argv pair (any bang-shell spelling, with or
+#     without a /bin prefix) — each is how a shell-interpolated launch
+#     command would be reintroduced;
+#   - any `os.exec*` other than `os.execve(` — only the env-map handover
+#     is the contract; a `execv`/`execl`/`execvp` silently drops the
+#     computed environment (GDK_SCALE, the DESKTOPINTEGRATION stamp);
+#   - a `DESKTOPINTEGRATION` string literal outside launch.py — the
+#     marker is launch.py's `DESKTOPINTEGRATION_ENV` constant and every
+#     other module must import it, so the entry writer, the panel argv
+#     and the verb's stamp cannot drift into different spellings.
+LAUNCH_PATH_FILES = [PKG / 'launch.py', PKG / 'exec_scale.py',
+                     PKG / 'commands' / 'exec_scale.py']
+LAUNCH_SHELL_RES = [
+    (re.compile(r'\bshell\s*=\s*True\b'),
+     'shell=True on the launch path — commands are argv lists, never '
+     'shell source'),
+    (re.compile(r'\bos\.(?:system|popen)\s*\('),
+     'os.system/os.popen on the launch path — commands are argv lists, '
+     'never shell source'),
+    (re.compile(r'["\'](?:/(?:usr/)?bin/)?(?:ba|z|da|k)?sh["\']'
+                r'\s*,\s*["\']-c["\']'),
+     'a `sh -c` argv pair on the launch path — commands are argv lists, '
+     'never shell source'),
+]
+for path in LAUNCH_PATH_FILES:
+    for i, line in enumerate(read_lines(path), 1):
+        for res, msg in LAUNCH_SHELL_RES:
+            if res.search(line):
+                err('launch-argv-constancy', path, i, msg)
+        if re.search(r'\bos\.exec\w*\s*\(', line) \
+                and not re.search(r'\bos\.execve\s*\(', line):
+            err('launch-argv-constancy', path, i,
+                'os.exec* other than os.execve — only execve hands over '
+                'the computed environment (GDK_SCALE, the '
+                'DESKTOPINTEGRATION stamp)')
+        if path.name != 'launch.py' \
+                and re.search(r'["\']DESKTOPINTEGRATION', line):
+            err('launch-argv-constancy', path, i,
+                'DESKTOPINTEGRATION string literal outside launch.py — '
+                'import launch.DESKTOPINTEGRATION_ENV; the marker must '
+                'not drift between the entry writer, the panel argv and '
+                'the verb stamp')
+
 # Rule 8: no editable native text input (marketplace #11415, round 3).
 # Qt 6.12 automatically retrieves foreign clipboard text on every clipboard
 # change for any QQuickTextInput with readOnly: false — no paste action, no
@@ -325,7 +376,8 @@ if errors:
     sys.exit(1)
 print('gate 1: backend invariants OK '
       '(env boundary, egress, atomic install, bounded subprocess, '
-      'QML collectors, shell-source constancy, no editable native input)')
+      'QML collectors, shell-source constancy, launch-argv constancy, '
+      'no editable native input)')
 PY
 then
   printf 'PASS: gate 1 — backend invariant greps\n'

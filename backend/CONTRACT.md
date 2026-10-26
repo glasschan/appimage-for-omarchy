@@ -768,13 +768,22 @@ gone) or `not-local` (non-`file://` or remote selection):
 Plain text (no `--json`): `picked` prints the path, `cancelled` /
 `unavailable` print their message, errors go to stderr.
 
-### `--exec-with-scale <image> [args...]`
+### `--exec-with-scale <image> [args...]` — the launch contract
 
-Launches the AppImage at `<image>` with `GDK_SCALE` set to the **focused
-monitor's** scale factor, so an XWayland client started into a scale-1
-focused monitor renders at 1x even when the session exports
-`GDK_SCALE=2` (ticket #33). Mechanism in `omarchy_appimage/exec_scale.py`,
-the verb wrapper in `omarchy_appimage/commands/exec_scale.py`.
+Every launch the plugin performs ends at this verb (tickets #32–#35).
+One module, `omarchy_appimage/launch.py`, is the **single launch-command
+builder**: the desktop-entry writer (`provider_install`), the
+clobbered-desktop repair (`provider_listing._repair_clobbered_desktop`)
+and the listing's panel keys (`launch_argv`, `launch_scale_argv` in
+`commands/envelope.py`) all serialize through it, and nothing passes
+through a shell anywhere on the path — commands are argv lists end to
+end. Mechanism in `omarchy_appimage/exec_scale.py`, the verb wrapper in
+`omarchy_appimage/commands/exec_scale.py`.
+
+**The scale rule.** Launches the AppImage at `<image>` with `GDK_SCALE`
+set to the **focused monitor's** scale factor, so an XWayland client
+started into a scale-1 focused monitor renders at 1x even when the
+session exports `GDK_SCALE=2` (ticket #33).
 
 - **Compositor query** — one bounded `hyprctl -j monitors` (constant
   argv, no shell, through `utils.run_command`: 10 MiB/stream output cap,
@@ -806,16 +815,36 @@ the verb wrapper in `omarchy_appimage/commands/exec_scale.py`.
   the path belongs to the app, so `_reject_unknown_options` does not
   apply.
 
-- **Desktop-entry wiring (ticket #34)** — a freshly integrated (or
-  updated) app's `Exec=` invokes this verb instead of the raw image, so
-  a launcher click gets the scale too: `Exec=env DESKTOPINTEGRATION=1
-  <python> <backend>/main.py --exec-with-scale <image> [args]`, built by
-  `launch.entry_point_exec_text` / `entry_point_argv` (the ONE launch
-  builder). The backend directory is recorded per app at integrate time
-  (`launch_backend_dir` in `apps.ini`) and every install/repair rebuilds
-  the Exec from the CURRENT directory (`constants.backend_dir()`); the
-  listing re-points an entry whose recorded directory no longer matches.
-  `TryExec` stays the raw image.
+**Entry surfaces.** Two surfaces reach the verb; both carry the
+managed-launch marker `DESKTOPINTEGRATION=1` (how the running-app guard
+recognises its own launches):
+
+- **Launcher click (desktop entry, ticket #34)** — a freshly integrated
+  (or updated) app's `Exec=` invokes this verb instead of the raw image:
+  `Exec=env DESKTOPINTEGRATION=1 <python> <backend>/main.py
+  --exec-with-scale <image> [args]`, built by
+  `launch.entry_point_exec_text` / `entry_point_argv`. The env prefix
+  carries `DESKTOPINTEGRATION=1` plus the app's own env variables, and
+  `exec_scale` forwards the wrapper's environment to the image.
+  `TryExec` stays the raw image (see *Desktop entry details* below for
+  the recorded `launch_backend_dir`, the listing's re-point repair and
+  what Remove deletes).
+- **Panel Launch button (ticket #35)** — Quickshell's detached spawn
+  cannot carry env variables, so the listing reports the argv tail as
+  the additive `launch_scale_argv` key (`launch.panel_exec_scale_argv`:
+  image first, then the app's own arguments, desktop field codes
+  `%f %F %u %U %i %c %d %k` dropped), and `Panel.qml` spawns
+  `[backendCommand..., "--exec-with-scale", *launchScaleArgv]` —
+  `backendCommand` is the plugin's own `main.py`. Because the spawn
+  cannot carry the marker, **the verb stamps it itself**:
+  `exec_scale.PLUGIN_LAUNCH_ENV` (split from launch.py's
+  `DESKTOPINTEGRATION_ENV` constant) is merged into the handover
+  environment by `exec_scale.exec_env` with **append-if-absent
+  semantics — a caller value always wins**. The pre-#35 additive
+  `launch_argv` key (`env DESKTOPINTEGRATION=1 <image> [args]`, built by
+  `launch.panel_launch_argv`) stays for an older shell pairing and as
+  the non-scale fallback; both keys come from the same shared token
+  set, so the two surfaces cannot drift.
 
 ### `--settings [--json]`
 
@@ -986,9 +1015,12 @@ No arguments prints usage and exits **2**.
 | `running` | boolean | True when the AppImage is currently running. Computed by **one rule shared with `running_pids`** (`utils._running_by_ps` → `procs.pids_for`'s `parent` list, plus the `fuse.*` mount signal for the runtime that has no attributable exe): a process whose `/proc/<pid>/exe` is the AppImage path (compared through `os.path.realpath`, so a symlinked install directory matches either way round), or a `fuse.*` mount in `/proc/mounts` attributed to it (matched on the mount source's basename — see Process identity under Security model). Because the mount signal can outlive the processes, `running: true` with `running_pids: 0` is possible: the mount is still there, no process of ours is |
 | `running_pids` | int | How many processes belong to this AppImage: the runtime parent (its `exe` is the AppImage path) **plus** the helpers running out of the `fuse.*` mount attributed to it — the set `--kill-running` would close (`procs.pids_for`). `0` when the app is not running (a non-running row is never scanned) and `0` when the count cannot be determined (a failed scan is a warning, never an error, and never flips `running`). **Display-only**: the panel's prompt names it; no command reads it back. A listing builds one process table (and one `/proc/mounts` read) and reuses it for every running row, because the panel polls the listing every 10 s |
 | `exec_arguments` | string | The desktop entry's `Exec=` arguments, e.g. `"--no-sandbox %U"` or `"%U"`; `""` when the app has none. The desktop field codes (`%f %F %u %U %i %c %k`) stay **verbatim** — stripping them is the UI's job. The current desktop entry wins; when it carries no arguments, the install-time `default_exec_arguments` from `apps.ini` is used instead |
+| `launch_argv` | string array | The launch command as argv tokens (`env DESKTOPINTEGRATION=1 <image> [args]`), built by the ONE launch builder (`launch.panel_launch_argv`) — the panel spawns this instead of assembling it in QML. Additive since ticket #32; kept as the non-scale fallback and for an older shell pairing |
+| `launch_scale_argv` | string array | The argv **tail** for the `--exec-with-scale` entry point (`launch.panel_exec_scale_argv`: `<image> [args]`, no env part — the detached spawn cannot carry env variables). The panel spawns `[backendCommand..., "--exec-with-scale", *launch_scale_argv]` so the panel launch shares the launcher's scale mechanism; the verb stamps `DESKTOPINTEGRATION=1` itself (see the launch contract under `--exec-with-scale`). Additive since ticket #35 |
 
 > `verification`, `installable`, `pending_update`, `pending_version`,
-> `pending_installable`, `exec_arguments` and `running_pids` are
+> `pending_installable`, `exec_arguments`, `launch_argv`,
+> `launch_scale_argv` and `running_pids` are
 > **additive** keys: every other key keeps its meaning, and a reader that
 > ignores unknown keys (the QML layer does) is unaffected — the same way
 > `manager` / `embedded_source` / `download_size` were added.
@@ -1009,7 +1041,7 @@ Real example output (app with an embedded `gh-releases-zsync` string; the
 custom-config case looks the same with `embedded_source: false`):
 
 ```json
-{"schema_version": 1, "installed": [{"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "GithubUpdater", "embedded_source": true, "running": false, "running_pids": 0, "exec_arguments": "%F"}], "runtime": {"fuse2": "present"}}
+{"schema_version": 1, "installed": [{"name": "Neovim", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": null, "manager": "GithubUpdater", "embedded_source": true, "running": false, "running_pids": 0, "exec_arguments": "%F", "launch_argv": ["env", "DESKTOPINTEGRATION=1", "/home/user/AppImages/neovim.appimage"], "launch_scale_argv": ["/home/user/AppImages/neovim.appimage"]}], "runtime": {"fuse2": "present"}}
 ```
 
 Empty list:
