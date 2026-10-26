@@ -768,11 +768,20 @@ Panel {
     syncFromModel()
     // A GitHub release URL install downloads the whole AppImage first;
     // give it the long transfer budget so the watchdog doesn't reap a
-    // big download. Local paths keep the fast extract budget.
-    var timeout = /^https?:\/\//i.test(trimmed)
-      ? integrateUrlTimeoutMs : integrateTimeoutMs
+    // big download. Local paths keep the fast extract budget. Only the
+    // URL run streams progress documents (the backend's emitter exists
+    // for URL targets only), so only it attaches the #59 line reader:
+    // each complete stdout line goes through Model.noteIntegrateProgress,
+    // which ignores everything that is not a progress document — the
+    // result document on the same stream still reaches the outcome
+    // handling below through the full stdout text.
+    var isUrl = /^https?:\/\//i.test(trimmed)
+    var options = {
+      timeoutMs: isUrl ? integrateUrlTimeoutMs : integrateTimeoutMs
+    }
+    if (isUrl) options.onStdoutLine = Model.noteIntegrateProgress
     callBackend(["--integrate", trimmed, "--yes", "--json"],
-        { timeoutMs: timeout }, function(result) {
+        options, function(result) {
       Model.setBusy("integrate", false)
       if (result.ok) {
         var action = Model.parseActionJson(result.stdout)

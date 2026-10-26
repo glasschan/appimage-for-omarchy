@@ -394,7 +394,8 @@ def head_headers(url: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
 def download_to_file(url: str, dest_path: str, progress_cb=None,
                      timeout: float = DOWNLOAD_TIMEOUT,
                      max_bytes: int = MAX_DOWNLOAD_BYTES,
-                     deadline: float = DOWNLOAD_DEADLINE_SECONDS) -> int:
+                     deadline: float = DOWNLOAD_DEADLINE_SECONDS,
+                     byte_cb=None) -> int:
     """Stream `url` to `dest_path` in 1 MiB chunks; returns the byte count.
 
     Two independent time bounds: `timeout` is the per-read stall guard
@@ -404,10 +405,15 @@ def download_to_file(url: str, dest_path: str, progress_cb=None,
     runs out of deadline.
 
     progress_cb(fraction) fires at most every ~1% with a value in [0, 1]
-    (or not at all when the server sends no Content-Length). Raises
-    NetworkError on transport failure, a short body, a body over
-    `max_bytes`, or a spent deadline; the partial `dest_path` is always
-    removed on failure."""
+    (or not at all when the server sends no Content-Length). byte_cb(done,
+    total) — the integrate progress stream's seam (ticket #58) — fires
+    once per chunk with the running byte count and the declared
+    Content-Length (0 when the server sent none), so a caller can apply
+    its own throttle even without a declared length. Both callbacks are
+    robust to emission errors: a callback that raises is disabled instead
+    of failing the download. Raises NetworkError on transport failure, a
+    short body, a body over `max_bytes`, or a spent deadline; the partial
+    `dest_path` is always removed on failure."""
     done = 0
     declared = None
     start = time.monotonic()
@@ -444,6 +450,11 @@ def download_to_file(url: str, dest_path: str, progress_cb=None,
                             progress_cb(done / declared)
                         except Exception:
                             progress_cb = None
+                    if byte_cb:
+                        try:
+                            byte_cb(done, declared or 0)
+                        except Exception:
+                            byte_cb = None
     except NetworkError:
         _unlink_quietly(dest_path)
         raise
