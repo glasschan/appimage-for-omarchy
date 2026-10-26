@@ -281,5 +281,47 @@ class PanelLaunchArgvTests(unittest.TestCase):
              '--no-sandbox'])
 
 
+class PanelExecScaleArgvTests(unittest.TestCase):
+    """The argv tail for the backend's `--exec-with-scale` entry point
+    (ticket #35): the image followed by its own arguments — the same
+    token set `panel_launch_argv` puts after the `env` prefix, minus the
+    env part (the backend verb stamps DESKTOPINTEGRATION=1 itself, so
+    no env prefix belongs here). Same splitting rules, pinned for the
+    same reason: the panel must never re-implement them."""
+
+    def test_the_image_leads_and_flags_follow(self):
+        self.assertEqual(
+            launch.panel_exec_scale_argv('/apps/foo.appimage',
+                                         '--no-sandbox'),
+            ['/apps/foo.appimage', '--no-sandbox'])
+
+    def test_field_codes_are_dropped(self):
+        for code in ('%f', '%F', '%u', '%U', '%i', '%c', '%d', '%k'):
+            self.assertEqual(
+                launch.panel_exec_scale_argv('/a', f'--flag {code}'),
+                ['/a', '--flag'], code)
+
+    def test_partial_field_code_is_a_real_argument(self):
+        self.assertEqual(
+            launch.panel_exec_scale_argv('/a', '%U1 file%U'),
+            ['/a', '%U1', 'file%U'])
+
+    def test_empty_arguments_leave_only_the_image(self):
+        self.assertEqual(launch.panel_exec_scale_argv('/a', ''), ['/a'])
+
+    def test_whitespace_runs_split_like_the_qml_regex(self):
+        self.assertEqual(
+            launch.panel_exec_scale_argv('/a', '  --x \t y  '),
+            ['/a', '--x', 'y'])
+
+    def test_the_tail_matches_panel_launch_argv_behind_the_env_prefix(self):
+        # the two keys disagree only by the `env DESKTOPINTEGRATION=1`
+        # prefix — one token set, two serialisations
+        image, args = '/apps/z.appimage', '--no-sandbox %U'
+        self.assertEqual(
+            launch.panel_launch_argv(image, args)[2:],
+            launch.panel_exec_scale_argv(image, args))
+
+
 if __name__ == '__main__':
     unittest.main()

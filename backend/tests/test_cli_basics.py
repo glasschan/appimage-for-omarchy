@@ -73,6 +73,10 @@ class OfflineCliTests(FakeXDGTestCase):
             # additive, ticket #32: the launch command as argv, built by
             # the shared launch builder — the panel spawns this.
             'launch_argv',
+            # additive, ticket #35: the argv tail for the backend's
+            # `--exec-with-scale` entry point — the scale-aware panel
+            # launch shares the launcher's scale mechanism.
+            'launch_scale_argv',
             'verification', 'installable',
             'pending_update', 'pending_version', 'pending_installable'})
         self.assertEqual(app['name'], 'Fake App')

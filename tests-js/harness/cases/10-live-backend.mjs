@@ -54,6 +54,27 @@ export function run() {
         && noArgsApp.launch_argv[2] === noArgsApp.path,
       JSON.stringify(noArgsApp && noArgsApp.launch_argv))
 
+    // #35: the scale-aware launch tail — the image plus its own
+    // arguments, the argv the panel places behind the backend's
+    // `--exec-with-scale`. No env prefix: the verb stamps
+    // DESKTOPINTEGRATION=1 itself.
+    check("launch_scale_argv leads with the image and drops field codes",
+      !!argsApp && Array.isArray(argsApp.launch_scale_argv)
+        && argsApp.launch_scale_argv[0] === argsApp.path
+        && argsApp.launch_scale_argv[1] === "--no-sandbox"
+        && argsApp.launch_scale_argv.length === 2,
+      JSON.stringify(argsApp && argsApp.launch_scale_argv))
+    check("launch_scale_argv without arguments is just the image",
+      !!noArgsApp && Array.isArray(noArgsApp.launch_scale_argv)
+        && noArgsApp.launch_scale_argv.length === 1
+        && noArgsApp.launch_scale_argv[0] === noArgsApp.path,
+      JSON.stringify(noArgsApp && noArgsApp.launch_scale_argv))
+    check("launch_scale_argv agrees with launch_argv behind the prefix",
+      !!argsApp && JSON.stringify(argsApp.launch_argv.slice(2))
+        === JSON.stringify(argsApp.launch_scale_argv),
+      JSON.stringify(argsApp && [argsApp.launch_argv,
+        argsApp.launch_scale_argv]))
+
     // the JS parse logic still handles the live document
     const liveList = Model.parseListJson(listRun.stdout)
     check("live backend document parses in Model", liveList.ok === true

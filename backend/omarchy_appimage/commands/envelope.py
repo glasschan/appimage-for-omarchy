@@ -125,6 +125,15 @@ def _make_app_json(el, manager=None, running=None, probe=None,
         # — the panel spawns this instead of assembling it in QML.
         'launch_argv': launch.panel_launch_argv(
             el.file_path, getattr(el, 'exec_arguments', '') or ''),
+        # additive (schema_version stays 1), ticket #35: the argv tail for
+        # the backend's `--exec-with-scale` entry point — the image and its
+        # own arguments, built by the ONE launch builder. The panel spawns
+        # [backendCommand..., '--exec-with-scale', *launch_scale_argv] so
+        # the panel launch shares the launcher's scale mechanism;
+        # `launch_argv` stays for an older shell pairing and as the
+        # non-scale fallback.
+        'launch_scale_argv': launch.panel_exec_scale_argv(
+            el.file_path, getattr(el, 'exec_arguments', '') or ''),
         # additive (schema_version stays 1), issue #53: the verdict the
         # last check recorded for this app. `pending` is the record's own
         # entry for this app (None when the record has none): an entry

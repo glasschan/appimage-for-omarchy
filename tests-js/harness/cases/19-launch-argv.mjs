@@ -37,4 +37,39 @@ export function run() {
   // A corrupt shape is null, never partially trusted.
   check("#32 a non-array launch_argv is not trusted",
     listed({ launch_argv: "env DESKTOPINTEGRATION=1 /x" }).launchArgv === null)
+
+  // ---- #35 the scale-aware launch tail comes from the backend -----------
+  // The panel spawns [backendCommand..., "--exec-with-scale", ...tail];
+  // the tail is the listing's additive `launch_scale_argv` key. DESKTOP-
+  // INTEGRATION=1 comes from the backend verb (the detached spawn cannot
+  // carry env), so no env prefix belongs in the tail.
+  const withTail = listed({
+    exec_arguments: "--no-sandbox %U",
+    launch_scale_argv: ["/x/launch.appimage", "--no-sandbox"] })
+  check("#35 the listing's launch_scale_argv lands on the item",
+    Array.isArray(withTail.launchScaleArgv)
+      && withTail.launchScaleArgv.length === 2
+      && withTail.launchScaleArgv[0] === "/x/launch.appimage"
+      && withTail.launchScaleArgv[1] === "--no-sandbox",
+    JSON.stringify(withTail.launchScaleArgv))
+
+  // An older backend (no key) is null, not an assembled fallback.
+  check("#35 an older backend reports no scale launch tail",
+    listed({}).launchScaleArgv === null)
+
+  // A corrupt shape is null, never partially trusted.
+  check("#35 a non-array launch_scale_argv is not trusted",
+    listed({ launch_scale_argv: "/x/launch.appimage" })
+      .launchScaleArgv === null)
+
+  // Both keys can coexist on one item without interfering.
+  const both = listed({
+    launch_argv: ["env", "DESKTOPINTEGRATION=1", "/x/launch.appimage",
+      "--no-sandbox"],
+    launch_scale_argv: ["/x/launch.appimage", "--no-sandbox"] })
+  check("#35 launch_argv and launch_scale_argv coexist untouched",
+    both.launchArgv.length === 4 && both.launchArgv[0] === "env"
+      && both.launchScaleArgv.length === 2
+      && both.launchScaleArgv[0] === "/x/launch.appimage",
+    JSON.stringify([both.launchArgv, both.launchScaleArgv]))
 }

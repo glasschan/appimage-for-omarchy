@@ -186,7 +186,8 @@ _APP_CODE = (
     "import json, os, sys; "
     "print(json.dumps({'pid': os.getpid(), "
     "'argv': sys.argv, "
-    "'scale': os.environ.get('GDK_SCALE')}))")
+    "'scale': os.environ.get('GDK_SCALE'), "
+    "'desktopintegration': os.environ.get('DESKTOPINTEGRATION')}))")
 
 
 class ExecHandoverTests(unittest.TestCase):
@@ -238,6 +239,27 @@ class ExecHandoverTests(unittest.TestCase):
                                       1.0)
         self.assertEqual(reported['scale'], '1')
 
+    def test_the_verb_stamp_reaches_the_app_environment(self):
+        # the real handover with the verb's extra_env: the app's own env
+        # carries the managed-launch marker (ticket #35)
+        wrapper = (
+            "import os, sys; "
+            f"sys.path.insert(0, {_BACKEND_ROOT!r}); "
+            "from omarchy_appimage import exec_scale; "
+            f"exec_scale.exec_with_scale(sys.executable, "
+            f"['-c', {_APP_CODE!r}], "
+            "environment={'PATH': '/bin'}, query=lambda: None, "
+            f"extra_env=exec_scale.PLUGIN_LAUNCH_ENV)")
+        result = subprocess.run(
+            [sys.executable, '-c', wrapper],
+            capture_output=True, timeout=30, text=True,
+            env={'PATH': os.environ.get('PATH', ''),
+                 'PYTHONPATH': _BACKEND_ROOT,
+                 'PYTHONDONTWRITEBYTECODE': '1'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reported = json.loads(result.stdout)
+        self.assertEqual(reported['desktopintegration'], '1')
+
 
 class VerbTests(unittest.TestCase):
     """The verb's own contract: no options of its own, everything after
@@ -268,11 +290,58 @@ class VerbTests(unittest.TestCase):
     def test_the_mechanism_receives_image_and_verbatim_arguments(self):
         seen = {}
 
-        def fake_exec(image_path, arguments, environ=None, query=None):
+        def fake_exec(image_path, arguments, environ=None, query=None,
+                      extra_env=None):
             seen['image'] = image_path
             seen['args'] = arguments
+            seen['extra_env'] = extra_env
 
         with mock.patch.object(exec_scale, 'exec_with_scale', fake_exec):
             cmd_exec_with_scale(['/opt/App.AppImage', '--flag', '%f'])
         self.assertEqual(seen['image'], '/opt/App.AppImage')
         self.assertEqual(seen['args'], ['--flag', '%f'])
+        # ticket #35: the verb is the plugin's launch handover — the
+        # panel's detached spawn cannot carry env vars, so the verb
+        # stamps the managed-launch marker itself (append-if-absent)
+        self.assertEqual(seen['extra_env'],
+                         {'DESKTOPINTEGRATION': '1'})
+
+
+class ExtraEnvTests(unittest.TestCase):
+    """The verb's DESKTOPINTEGRATION stamp (ticket #35): merged into the
+    handover env with `setdefault` semantics — the caller's own value
+    always wins (launch.merge_env_variables' precedence), a caller
+    environment is never mutated, and the mechanism's default stays the
+    bare #33 handover (no stamp without an explicit extra_env)."""
+
+    def test_the_stamp_is_appended_when_absent(self):
+        env = exec_scale.exec_env(
+            {'PATH': '/bin'}, None, extra_env={'DESKTOPINTEGRATION': '1'})
+        self.assertEqual(env,
+                         {'PATH': '/bin', 'DESKTOPINTEGRATION': '1'})
+
+    def test_the_callers_own_value_wins(self):
+        env = exec_scale.exec_env(
+            {'PATH': '/bin', 'DESKTOPINTEGRATION': '0'}, None,
+            extra_env={'DESKTOPINTEGRATION': '1'})
+        self.assertEqual(env,
+                         {'PATH': '/bin', 'DESKTOPINTEGRATION': '0'})
+
+    def test_no_extra_env_changes_nothing(self):
+        env = {'PATH': '/bin'}
+        self.assertEqual(exec_scale.exec_env(env, None, extra_env=None),
+                         env)
+
+    def test_the_caller_environment_is_never_mutated(self):
+        env = {'PATH': '/bin'}
+        exec_scale.exec_env(env, None,
+                            extra_env={'DESKTOPINTEGRATION': '1'})
+        self.assertEqual(env, {'PATH': '/bin'})
+
+    def test_the_stamp_survives_a_gdk_scale_adjustment(self):
+        env = exec_scale.exec_env({'PATH': '/bin', 'GDK_SCALE': '2'}, 1.0,
+                                  extra_env={'DESKTOPINTEGRATION': '1'})
+        self.assertEqual(env,
+                         {'PATH': '/bin', 'GDK_SCALE': '1',
+                          'DESKTOPINTEGRATION': '1'})
+

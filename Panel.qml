@@ -679,22 +679,42 @@ Panel {
     })
   }
 
-  // F4: launch the AppImage binary detached. The argv comes from the
-  // backend's ONE launch-command builder (the listing's `launch_argv`,
-  // ticket #32) — the same builder that writes the desktop entry's Exec
-  // line, so DESKTOPINTEGRATION=1 and any future launch-environment rule
-  // live in exactly one place. No shell ever sees the path: it arrives as
-  // a single argv token.
+  // F4: launch the AppImage binary detached. Ticket #35: the spawn goes
+  // through the backend's `--exec-with-scale` entry point —
+  // [backendCommand..., "--exec-with-scale", image, ...args] — so the
+  // panel launch renders at the focused monitor's scale exactly like a
+  // launcher click, and DESKTOPINTEGRATION=1 comes from the verb itself
+  // (execDetached cannot carry env vars). The scale tail and the #32
+  // env-prefixed argv both come from the backend's ONE launch-command
+  // builder (the listing's `launch_scale_argv` / `launch_argv` keys) —
+  // the launch assembly is never re-implemented in QML, and no shell
+  // ever sees the path: it arrives as a single argv token.
   //
   // The backend has already dropped the desktop field codes (%f %F %u %U
-  // %i %c %d %k) it knows the panel cannot fill. A backend older than the
-  // key (never in a paired release) still launches the bare path — the
-  // launch assembly is never re-implemented here.
+  // %i %c %d %k) it knows the panel cannot fill. The fallback ladder for
+  // an older pairing (never in a paired release): the #32 launch_argv,
+  // then the bare path.
+  //
+  // Process semantics carry over: execDetached fully detaches the child,
+  // and the backend's handover is `os.execve` — the detached pid BECOMES
+  // the app (exec keeps the pid), so nothing of the panel outlives the
+  // spawn and there is no watchdog to outlive either. A failed backend
+  // start (missing image, exec error) is indistinguishable from the
+  // ticket-#32 spawn failure it replaces: spawn success says nothing
+  // about the AppImage runtime, and the settle listing below still
+  // judges it.
+  function launchArgvFor(item) {
+    if (backendCommand.length > 0 && item.launchScaleArgv
+        && item.launchScaleArgv.length > 0) {
+      return backendCommand.concat(["--exec-with-scale"], item.launchScaleArgv)
+    }
+    if (item.launchArgv && item.launchArgv.length > 0) return item.launchArgv
+    return [item.path]
+  }
+
   function launchItem(item) {
     if (!item || item.path === "") return
-    var argv = (item.launchArgv && item.launchArgv.length > 0)
-      ? item.launchArgv : [item.path]
-    Quickshell.execDetached(argv)
+    Quickshell.execDetached(launchArgvFor(item))
     Model.markRunning(item.id, true)
     // Arm the launch verdict in the STORE (ticket #47): spawn success says
     // nothing about the AppImage runtime, and this click closes the panel,
