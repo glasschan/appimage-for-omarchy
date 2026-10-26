@@ -15,6 +15,7 @@ import os
 from .. import constants, extractor, jobs, procs, settings
 from ..provider import InternalError
 from ..updaters import UpdateManagerChecker
+from .jobs import _job_desktop_id
 from .envelope import (EXIT_OK, EXIT_USAGE, OperationError, UsageError, _ask_close_running,
                        _make_app_json, _print_json, _reject_unknown_options,
                        _remove_flag_value, _resolve_target,
@@ -173,9 +174,7 @@ def run_update(target: str, keep_both: bool = False,
     # job either, so the synchronous path claims nothing for it — the
     # documented sync `--update` on such an app keeps working.
     try:
-        # late-bound through the facade until commands/jobs.py lands
-        from .. import cli
-        job_id = cli._job_desktop_id(el)
+        job_id = _job_desktop_id(el)
     except OperationError:
         job_id = ''
     claim_fd = None

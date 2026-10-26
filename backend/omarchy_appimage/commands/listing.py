@@ -12,6 +12,7 @@ import os
 
 from .. import constants, janitor, jobs, procs, settings
 from ..updaters import UpdateManagerChecker
+from .jobs import _job_desktop_id
 from .envelope import (EXIT_OK, EXIT_USAGE, OperationError, UsageError, _ask,
                        _make_app_json, _print_json, _print_table,
                        _reject_unknown_options, _remove_flag_value,
@@ -100,11 +101,6 @@ def cmd_remove(args: list) -> int:
         raise UsageError('missing argument: --remove <name-or-desktop-id>')
 
     el = _resolve_target(positional[0])
-
-    # (temporary until commands/jobs.py lands: the job seam is late-bound
-    # through the facade, ticket #56 intermediate commit)
-    from .. import cli
-    _job_desktop_id = cli._job_desktop_id
 
     # Issue #46: removal during that app's update job is refused here,
     # by the module that owns the job, and not only by the panel's
