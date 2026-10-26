@@ -2565,91 +2565,23 @@ Panel {
           }
 
           // ---- "Update all" consent card (issue #52) -------------------
-          // Opened by the header's Update-all action; it starts NOTHING
-          // by itself. The card names the apps the batch would update and
-          // the processes it would close (the listing's `running_pids`;
-          // a count that is not determinable keeps the count-free
-          // sentence). Enter confirms, Esc cancels (PanelKeyCatcher
-          // wiring above); Cancel spawns nothing and closes no app.
-          BorderSurface {
+          // Extracted to UpdateAllCard.qml (ticket #55): the pinned app
+          // list, the derived wording (updateAllSummary) and the batch
+          // spawn queue stay here.
+          UpdateAllCard {
             id: updateAllCard
-            width: parent.width
-            visible: root.updateAllOpen
-            implicitHeight: visible ? updateAllCol.implicitHeight + Style.spacing.sm * 2 : 0
-            color: Util.alpha(root.urgent, 0.09)
-            borderSpec: Border.flat(Util.alpha(root.urgent, 0.45), Math.max(1, Style.normalBorderWidth))
-            radius: Style.cornerRadius
-
-            Column {
-              id: updateAllCol
-              width: parent.width - Style.spacing.sm * 2
-              anchors.centerIn: parent
-              spacing: Style.spacing.xs
-
-              Text {
-                text: root.strings.updateAllTitle
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              Text {
-                text: root.updateAllSummary.appsLine
-                // desktop-entry names are attacker-controlled: never let
-                // Text rich-detect them (adversarial review, 0.11.0)
-                textFormat: Text.PlainText
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
-
-              Text {
-                text: root.updateAllSummary.processLine
-                textFormat: Text.PlainText
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
-
-              Row {
-                spacing: Style.spacing.xs
-
-                Button {
-                  text: root.strings.updateAllConfirm
-                  // The card can outlive a slow spawn: never stack a
-                  // second job for an app that is already updating.
-                  enabled: root.pendingIds.length > 0
-                  foreground: root.foreground
-                  accent: root.urgent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.confirmUpdateAll()
-                }
-
-                Button {
-                  text: root.strings.pickerCancel
-                  foreground: root.foreground
-                  accent: Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.dismissUpdateAll()
-                }
-              }
-
-              Text {
-                text: root.strings.updateAllKeysHint
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
+            updateAllOpen: root.updateAllOpen
+            appsLine: root.updateAllSummary.appsLine
+            processLine: root.updateAllSummary.processLine
+            confirmEnabled: root.pendingIds.length > 0
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            urgent: root.urgent
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            onConfirmed: root.confirmUpdateAll()
+            onDismissed: root.dismissUpdateAll()
           }
 
           // ---- Python dependency card (authorized install) --------------
