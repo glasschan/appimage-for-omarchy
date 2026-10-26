@@ -15,6 +15,7 @@ import fnmatch
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from urllib.parse import quote, unquote, urlsplit
 
@@ -43,23 +44,66 @@ def _get_file_from_args(args) -> str:
     raise OperationError('please specify a valid AppImage file')
 
 
+# Progress documents fire on percent changes of the declared
+# Content-Length; a server that sends none cannot be divided into
+# percent steps, so bytes are reported every _NO_LENGTH_REPORT_BYTES
+# instead (ticket #58).
+_NO_LENGTH_REPORT_BYTES = 32 * 1024 * 1024
+
+
+class _IntegrateProgress:
+    """The `event: progress` line emitter for `--integrate <url> --json`
+    (ticket #58). A plain run constructs nothing, so its human output is
+    untouched. Every document is flushed when written: stdout is
+    block-buffered when piped, and unflushed events would arrive in one
+    burst after the transfer and show nothing."""
+
+    def __init__(self):
+        self._percent = None
+        self._reported = 0
+
+    def emit(self, phase: str, **fields):
+        doc = {'schema_version': constants.JSON_SCHEMA_VERSION,
+               'event': 'progress', 'phase': phase}
+        doc.update(fields)
+        _print_json(doc)
+        sys.stdout.flush()
+
+    def downloading(self, done: int, total: int):
+        """byte_cb for net.download_to_file: (bytes so far, declared
+        Content-Length, 0 when the server sent none)."""
+        if total > 0:
+            percent = done * 100 // total
+            if percent == self._percent:
+                return
+            self._percent = percent
+        elif self._reported and \
+                done - self._reported < _NO_LENGTH_REPORT_BYTES:
+            return
+        else:
+            self._reported = done
+        self.emit('downloading', bytes=done, total=total)
+
+
 def _fetch_integrate_artifact(kind: str, info: dict, raw_url: str,
-                              dest_dir: str):
+                              dest_dir: str, byte_cb=None):
     # The fetch itself lives in updaters (issue #45); its refusals are
     # UpdateError, which this CLI layer reports as an operation failure.
     try:
         return _fetch_integrate_artifact_through_source(kind, info, raw_url,
-                                                        dest_dir)
+                                                        dest_dir, byte_cb)
     except UpdateError as e:
         raise OperationError(str(e)) from e
 
 
 def _fetch_integrate_artifact_through_source(kind: str, info: dict,
-                                             raw_url: str, dest_dir: str):
+                                             raw_url: str, dest_dir: str,
+                                             byte_cb=None):
     """Fetch the artifact for a classified URL, returning
     (file_path, kind, info) — `kind`/`info` are updated on the case 3-5
     fallback to a static install and carry the `pattern` computed from the
-    release tag for the auto-source step."""
+    release tag for the auto-source step. `byte_cb` threads the transfer
+    progress through to net.download_to_file (ticket #58)."""
     # Every download below goes through updaters' fetchers under the
     # REDUCED policy (issue #45): the user pasted this URL, so its lack of
     # a publisher digest is their choice — while --update always fetches
@@ -71,28 +115,30 @@ def _fetch_integrate_artifact_through_source(kind: str, info: dict,
         # or no digest, whichever policy brought the caller here.
         return (updaters.download_github_asset(
             dict(info, url=raw_url), dest_dir, updaters.POLICY_STRICT,
-            magic), kind, info)
+            magic, byte_cb=byte_cb), kind, info)
     if kind == 'zsync':
-        return (updaters.download_zsync(raw_url, dest_dir, policy, magic),
-                kind, info)
+        return (updaters.download_zsync(raw_url, dest_dir, policy, magic,
+                                        byte_cb=byte_cb), kind, info)
     if kind in ('gitlab', 'codeberg', 'forgejo'):
         asset = _lookup_release_asset(kind, info)
         if asset is None:
             logging.warning('%s: no release metadata for %s; installing the '
                             'pasted URL as a static source', kind, raw_url)
             return (updaters.download_plain(raw_url, dest_dir, policy,
-                                            is_appimage=magic), 'static',
+                                            is_appimage=magic,
+                                            byte_cb=byte_cb), 'static',
                     {'url': raw_url})
         dest = updaters.download_plain(asset['url'], dest_dir, policy,
-                                       asset['size'], magic)
+                                       asset['size'], magic,
+                                       byte_cb=byte_cb)
         info = dict(info,
                     pattern=_glob_for_version(info['filename'], asset['tag']),
                     version=asset['tag'] or '')
         return dest, kind, info
     # case 6: a plain URL
     return (updaters.download_plain(raw_url, dest_dir, policy,
-                                    is_appimage=magic), 'static',
-            {'url': raw_url})
+                                    is_appimage=magic, byte_cb=byte_cb),
+            'static', {'url': raw_url})
 
 
 def _find_name_conflict(list_element):
@@ -134,6 +180,12 @@ def cmd_integrate(args: list) -> int:
     url_kind = None
     url_info = None
     tmp_cleanup = None
+    # The progress stream (ticket #58) exists only for a URL integrate
+    # under --json: a plain run emits nothing, and a local-file integrate
+    # has no transfer to report.
+    progress = _IntegrateProgress() if (json_output and _is_url(target_arg
+                                                                or '')) \
+        else None
     if _is_url(target_arg or ''):
         url_kind, url_info = _classify_integrate_url(target_arg)
         tmp_cleanup = tempfile.mkdtemp(prefix=janitor.INTEGRATE_TEMP_PREFIX)
@@ -141,9 +193,13 @@ def cmd_integrate(args: list) -> int:
     try:
         if url_kind:
             file_path, url_kind, url_info = _fetch_integrate_artifact(
-                url_kind, url_info, target_arg, tmp_cleanup)
+                url_kind, url_info, target_arg, tmp_cleanup,
+                byte_cb=progress.downloading if progress else None)
         else:
             file_path = _get_file_from_args(positional)
+
+        if progress:
+            progress.emit('verifying')
 
         list_element = appimage_provider.create_list_element_from_file(file_path)
         if appimage_provider.is_installed(list_element):
@@ -203,6 +259,8 @@ def cmd_integrate(args: list) -> int:
                     list_element.update_logic = AppImageUpdateLogic.REPLACE
                     list_element.updating_from = already_installed
 
+        if progress:
+            progress.emit('installing')
         appimage_provider.install_file(list_element)
 
         # prepopulate the per-app update source from the install URL
