@@ -214,7 +214,6 @@ Panel {
   // AppImages found in ~/Downloads and ~/downloads.
   property bool pickerOpen: false
   property string pickerPath: ""
-  property var pickerFiles: []
 
   // Confirm-before-integrate preview (#18): pressing the integrate action
   // (field Enter, Go button, Downloads row) first runs --preview-integrate
@@ -343,22 +342,6 @@ Panel {
     return shell || null
   }
 
-  // Assemble one row line's segments into a single StyledText: every
-  // dynamic fragment is escaped (Model.escapeHtml) and the accent
-  // segments carry the accent colour. One bounded, elided Text per line
-  // — a Row of separate Texts has no width bound and painted over the
-  // row's action buttons (v0.9.1).
-  function metaText(segs) {
-    var parts = []
-    for (var i = 0; i < segs.length; i++) {
-      parts.push('<span style="color:'
-        + (segs[i].accent ? Color.accent : root.dim)
-        + '">'
-        + Model.escapeHtml(segs[i].text)
-        + "</span>")
-    }
-    return parts.join(" ")
-  }
 
   function syncFromModel() {
     items = Model.state.items.slice()
@@ -395,12 +378,10 @@ Panel {
   // the key catcher's shortcuts (see the keyCatcher binding below). The
   // picker and settings fields are Loader-created (see the field templates
   // at the bottom of this file), so guard on the loaded items.
-  readonly property bool formEditing: (pickerFieldLoader.item
-      ? pickerFieldLoader.item.activeFocus : false)
+  readonly property bool formEditing: pickerCard.fieldFocused
     || textFieldFocusCount > 0
     || root.sourceDropdownOpen
-    || (settingsNumbersLoader.item
-        ? settingsNumbersLoader.item.anyFieldFocused : false)
+    || settingsCard.anyFieldFocused
 
   // ---- lifecycle -----------------------------------------------------------
 
@@ -1433,7 +1414,8 @@ Panel {
     // picker starts at the plain path field.
     clearPreview()
     pickerOpen = true
-    rebuildPickerFiles()
+    // The Downloads quick-picks rebuild inside IntegratePicker when the
+    // card's open flag flips (the old openPicker/rebuildPickerFiles pair).
   }
 
   function closePicker() {
@@ -1532,9 +1514,7 @@ Panel {
     // Hand focus back to the path field so the user can edit what they
     // typed (formEditing re-blocks the key catcher while it holds focus).
     Qt.callLater(function() {
-      if (root.pickerOpen && pickerFieldLoader.item) {
-        pickerFieldLoader.item.forceActiveFocus()
-      }
+      if (root.pickerOpen) pickerCard.focusField()
     })
   }
 
@@ -1557,32 +1537,6 @@ Panel {
       : strings.previewDestinationLater
   }
 
-  // FolderListModel.filePath comes back as a plain path on some Qt builds
-  // and as a file:// URL on others; normalize to a local path.
-  function pickerUrlToPath(value) {
-    var s = String(value || "")
-    if (s.indexOf("file://") === 0) {
-      s = s.substring("file://".length)
-      s = s.split("/").map(decodeURIComponent).join("/")
-    }
-    return s
-  }
-
-  function rebuildPickerFiles() {
-    var picks = []
-    var models = [downloadsUpper, downloadsLower]
-    for (var m = 0; m < models.length; m++) {
-      var count = models[m].count
-      for (var i = 0; i < count; i++) {
-        try {
-          var path = pickerUrlToPath(models[m].get(i, "filePath"))
-          var name = String(models[m].get(i, "fileName"))
-          if (path !== "") picks.push({ name: name, path: path })
-        } catch (e) { /* unreadable entry — skip it */ }
-      }
-    }
-    pickerFiles = picks
-  }
 
   // F2 browse: run --pick-file through the shared watchdog plumbing. The
   // backend orchestrates a crash-isolated native dialog (portal first,
@@ -1649,13 +1603,12 @@ Panel {
     })
   }
 
-  // Put focus into the picker's path field (Loader-created — it exists
-  // only while the card is open) so a picked path can be integrated with
-  // Enter right away. Defensive: a browse that outlived the card is a
-  // quiet store update.
+  // Put focus into the picker's path field so a picked path can be
+  // integrated with Enter right away (the field and its loader live in
+  // IntegratePicker.qml since ticket #55). Defensive: a browse that
+  // outlived the card is a quiet store update.
   function focusPickerField() {
-    var field = pickerFieldLoader.item
-    if (field) field.forceActiveFocus()
+    pickerCard.focusField()
   }
 
   // ---- drop-to-integrate (#21) ------------------------------------------------
@@ -2244,257 +2197,30 @@ Panel {
           spacing: Style.spacing.md
 
           // ---- Header: title, counts, actions --------------------------
-          Item {
-            width: parent.width
-            implicitHeight: headerRow.implicitHeight
-
-            Row {
-              id: headerRow
-              anchors.left: parent.left
-              anchors.right: parent.right
-              spacing: Style.spacing.controlGap
-
-              Column {
-                id: headerText
-                spacing: Style.spacing.xxs
-                anchors.verticalCenter: parent.verticalCenter
-
-                Text {
-                  text: root.strings.panelTitle
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.heading
-                  font.bold: true
-                }
-
-                Text {
-                  text: root.subtitleText
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
-
-              Item { width: 1; height: 1; anchors.verticalCenter: parent.verticalCenter }
-
-              // The shell Button has no image slot (its iconText is a
-              // Nerd Font glyph), so the row below supplies the tabler
-              // icon while Button keeps owning every state visual (hover,
-              // focus, fills); the width override mirrors Button's own
-              // label-based sizing math over that row. The caption lives
-              // in the tooltip, like the icon-only buttons to the right.
-              Button {
-                id: integrateButton
-                text: ""
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.pickerOpen ? root.strings.pickerCancel : root.strings.integrate
-                implicitWidth: integrateRow.implicitWidth
-                  + integrateButton.horizontalPadding * 2
-                  + integrateButton._reservedBorderLeft
-                  + integrateButton._reservedBorderRight
-
-                Row {
-                  id: integrateRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "plus"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: integrateButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: {
-                  if (root.pickerOpen) root.closePicker()
-                  else root.integrateRequested()
-                }
-              }
-
-              Button {
-                id: refreshButton
-                text: ""
-                enabled: !root.busyList
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.strings.refresh
-                implicitWidth: refreshRow.implicitWidth
-                  + refreshButton.horizontalPadding * 2
-                  + refreshButton._reservedBorderLeft
-                  + refreshButton._reservedBorderRight
-
-                Row {
-                  id: refreshRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "refresh"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: refreshButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: root.refresh()
-              }
-
-              // F6 as an icon-only header button (tooltip carries the
-              // caption the row buttons would show); same Button+ThemeIcon
-              // row pattern as Integrate/Refresh above.
-              Button {
-                id: checkUpdatesButton
-                text: ""
-                enabled: !root.busyUpdates
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.strings.checkUpdates
-                implicitWidth: checkUpdatesRow.implicitWidth
-                  + checkUpdatesButton.horizontalPadding * 2
-                  + checkUpdatesButton._reservedBorderLeft
-                  + checkUpdatesButton._reservedBorderRight
-
-                Row {
-                  id: checkUpdatesRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "cloud-download"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: checkUpdatesButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: root.checkUpdates()
-              }
-
-              // "Update all" (issue #52): one action for every pending
-              // app, next to the check-updates action and reusing the
-              // row's arrow-up icon. The click only OPENS the consent
-              // card — nothing is spawned until the user accepts it. The
-              // button is enabled exactly while at least one app has a
-              // pending release the backend would accept.
-              Button {
-                id: updateAllButton
-                text: ""
-                enabled: root.pendingIds.length > 0
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.strings.updateAllTooltip
-                implicitWidth: updateAllRow.implicitWidth
-                  + updateAllButton.horizontalPadding * 2
-                  + updateAllButton._reservedBorderLeft
-                  + updateAllButton._reservedBorderRight
-
-                Row {
-                  id: updateAllRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "arrow-up"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: updateAllButton.enabled
-                      ? updateAllButton.foreground
-                      : root.dim
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: root.requestUpdateAll()
-              }
-
-              // Pin toggle: flips the overlay into a compact floating
-              // window (session-only) so other apps stay clickable.
-              Button {
-                id: pinButton
-                text: ""
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.pinned ? root.strings.pinTooltipUnpin : root.strings.pinTooltip
-                implicitWidth: pinRow.implicitWidth
-                  + pinButton.horizontalPadding * 2
-                  + pinButton._reservedBorderLeft
-                  + pinButton._reservedBorderRight
-
-                Row {
-                  id: pinRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "pin"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: pinButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: root.pinned = !root.pinned
-              }
-
-              // Settings gear: toggles the settings card below.
-              Button {
-                id: settingsButton
-                text: ""
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.strings.settingsTitle
-                implicitWidth: settingsRow.implicitWidth
-                  + settingsButton.horizontalPadding * 2
-                  + settingsButton._reservedBorderLeft
-                  + settingsButton._reservedBorderRight
-
-                Row {
-                  id: settingsRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "settings"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: settingsButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: root.toggleSettings()
-              }
+          // Extracted to CardHeader.qml (ticket #55): the flags it renders
+          // and every action it reports stay here.
+          CardHeader {
+            id: cardHeader
+            pickerOpen: root.pickerOpen
+            busyList: root.busyList
+            busyUpdates: root.busyUpdates
+            pendingIds: root.pendingIds
+            pinned: root.pinned
+            subtitleText: root.subtitleText
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            onIntegrateClicked: {
+              if (root.pickerOpen) root.closePicker()
+              else root.integrateRequested()
             }
+            onRefreshClicked: root.refresh()
+            onCheckUpdatesClicked: root.checkUpdates()
+            onUpdateAllClicked: root.requestUpdateAll()
+            onPinToggled: root.pinned = !root.pinned
+            onSettingsClicked: root.toggleSettings()
           }
 
           PanelSeparator { foreground: root.foreground }
@@ -2546,576 +2272,126 @@ Panel {
           }
 
           // ---- Force-quit confirm card (ticket #27) ---------------------
-          // Shown instead of spawning when Update lands on a row the last
-          // listing said runs. It names the app and how many processes the
-          // confirm will close (the listing's `running_pids`; a count of 0
-          // — unknown — keeps the count-free sentence). Enter confirms, Esc
-          // cancels (PanelKeyCatcher wiring above); Cancel spawns nothing
-          // and leaves the row as it was.
-          BorderSurface {
+          // Extracted to ForceQuitCard.qml (ticket #55): the pinned trio
+          // and the confirm handler (the --kill-running grant) stay here.
+          ForceQuitCard {
             id: forceQuitCard
-            width: parent.width
-            visible: root.forceQuitId !== ""
-            implicitHeight: visible ? forceQuitCol.implicitHeight + Style.spacing.sm * 2 : 0
-            color: Util.alpha(root.urgent, 0.09)
-            borderSpec: Border.flat(Util.alpha(root.urgent, 0.45), Math.max(1, Style.normalBorderWidth))
-            radius: Style.cornerRadius
-
-            Column {
-              id: forceQuitCol
-              width: parent.width - Style.spacing.sm * 2
-              anchors.centerIn: parent
-              spacing: Style.spacing.xs
-
-              Text {
-                text: root.strings.forceQuitTitle
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              Text {
-                text: Model.forceQuitBody(root.forceQuitName, root.forceQuitPids)
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
-
-              Row {
-                spacing: Style.spacing.xs
-
-                Button {
-                  text: root.strings.forceQuitConfirm
-                  // The confirm card can outlive its row's job-start reply
-                  // (a slow backend): never stack a second job by hand.
-                  enabled: !root.jobActive(root.forceQuitId)
-                  foreground: root.foreground
-                  accent: root.urgent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.confirmForceQuit()
-                }
-
-                Button {
-                  text: root.strings.pickerCancel
-                  foreground: root.foreground
-                  accent: Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.dismissForceQuit()
-                }
-              }
-
-              Text {
-                text: root.strings.forceQuitKeysHint
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
+            forceQuitId: root.forceQuitId
+            forceQuitName: root.forceQuitName
+            forceQuitPids: root.forceQuitPids
+            jobActive: root.jobActive(root.forceQuitId)
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            urgent: root.urgent
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            onConfirmed: root.confirmForceQuit()
+            onDismissed: root.dismissForceQuit()
           }
 
           // ---- "Update all" consent card (issue #52) -------------------
-          // Opened by the header's Update-all action; it starts NOTHING
-          // by itself. The card names the apps the batch would update and
-          // the processes it would close (the listing's `running_pids`;
-          // a count that is not determinable keeps the count-free
-          // sentence). Enter confirms, Esc cancels (PanelKeyCatcher
-          // wiring above); Cancel spawns nothing and closes no app.
-          BorderSurface {
+          // Extracted to UpdateAllCard.qml (ticket #55): the pinned app
+          // list, the derived wording (updateAllSummary) and the batch
+          // spawn queue stay here.
+          UpdateAllCard {
             id: updateAllCard
-            width: parent.width
-            visible: root.updateAllOpen
-            implicitHeight: visible ? updateAllCol.implicitHeight + Style.spacing.sm * 2 : 0
-            color: Util.alpha(root.urgent, 0.09)
-            borderSpec: Border.flat(Util.alpha(root.urgent, 0.45), Math.max(1, Style.normalBorderWidth))
-            radius: Style.cornerRadius
-
-            Column {
-              id: updateAllCol
-              width: parent.width - Style.spacing.sm * 2
-              anchors.centerIn: parent
-              spacing: Style.spacing.xs
-
-              Text {
-                text: root.strings.updateAllTitle
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              Text {
-                text: root.updateAllSummary.appsLine
-                // desktop-entry names are attacker-controlled: never let
-                // Text rich-detect them (adversarial review, 0.11.0)
-                textFormat: Text.PlainText
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
-
-              Text {
-                text: root.updateAllSummary.processLine
-                textFormat: Text.PlainText
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
-
-              Row {
-                spacing: Style.spacing.xs
-
-                Button {
-                  text: root.strings.updateAllConfirm
-                  // The card can outlive a slow spawn: never stack a
-                  // second job for an app that is already updating.
-                  enabled: root.pendingIds.length > 0
-                  foreground: root.foreground
-                  accent: root.urgent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.confirmUpdateAll()
-                }
-
-                Button {
-                  text: root.strings.pickerCancel
-                  foreground: root.foreground
-                  accent: Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.dismissUpdateAll()
-                }
-              }
-
-              Text {
-                text: root.strings.updateAllKeysHint
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
+            updateAllOpen: root.updateAllOpen
+            appsLine: root.updateAllSummary.appsLine
+            processLine: root.updateAllSummary.processLine
+            confirmEnabled: root.pendingIds.length > 0
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            urgent: root.urgent
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            onConfirmed: root.confirmUpdateAll()
+            onDismissed: root.dismissUpdateAll()
           }
 
           // ---- Python dependency card (authorized install) --------------
-          // Shown only after the probe positively confirmed python3 is
-          // absent. The button never installs anything by itself: it opens
-          // omarchy's floating terminal presenting `/usr/bin/omarchy pkg
-          // add python` so the user watches and authorizes every step
-          // (hyprmoncfg's plugin-managed-dependency pattern).
-          BorderSurface {
+          // Extracted to PythonDependencyCard.qml (ticket #55): the probe/
+          // install state and the authorized-install bridge stay here; the
+          // card renders them and reports the button press.
+          PythonDependencyCard {
             id: pythonCard
-            width: parent.width
-            visible: root.pythonStateKnown && root.pythonMissing
-            implicitHeight: visible ? pythonCol.implicitHeight + Style.spacing.sm * 2 : 0
-            color: Util.alpha(Color.urgent, 0.06)
-            borderSpec: Border.flat(Util.alpha(Color.urgent, 0.35), Math.max(1, Style.normalBorderWidth))
-            radius: Style.cornerRadius
-
-            Column {
-              id: pythonCol
-              width: parent.width - Style.spacing.sm * 2
-              anchors.centerIn: parent
-              spacing: Style.spacing.xs
-
-              Text {
-                text: root.strings.pythonMissingTitle
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              Text {
-                text: root.strings.pythonMissingHint
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
-
-              Button {
-                width: parent.width
-                text: root.installingPython
-                  ? root.strings.installingPython : root.strings.installPython
-                enabled: !root.installingPython
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                onClicked: root.installPython()
-              }
-            }
+            pythonVisible: root.pythonStateKnown && root.pythonMissing
+            installingPython: root.installingPython
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            onInstallRequested: root.installPython()
           }
 
           // ---- Integrate picker (F2) ------------------------------------
-          BorderSurface {
+          // Extracted to IntegratePicker.qml (ticket #55): the picker
+          // state, the preview flow and every backend call stay here; the
+          // card renders them and reports intent through signals. The
+          // Downloads quick-pick sources and the Loader-gated URL field
+          // moved with it.
+          IntegratePicker {
             id: pickerCard
-            width: parent.width
-            visible: root.pickerOpen
-            implicitHeight: visible ? pickerCol.implicitHeight + Style.spacing.sm * 2 : 0
-            color: Util.alpha(Color.accent, 0.06)
-            borderSpec: Border.flat(Util.alpha(Color.accent, 0.35), Math.max(1, Style.normalBorderWidth))
-            radius: Style.cornerRadius
-
-            Column {
-              id: pickerCol
-              width: parent.width - Style.spacing.sm * 2
-              anchors.centerIn: parent
-              spacing: Style.spacing.xs
-
-              Text {
-                text: root.strings.pickerTitle
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
+            pickerOpen: root.pickerOpen
+            pickerPath: root.pickerPath
+            busyPick: root.busyPick
+            busyIntegrate: root.busyIntegrate
+            busyPreview: root.busyPreview
+            previewOpen: root.previewOpen
+            previewDoc: root.previewDoc
+            pickerBusy: root.pickerBusy
+            previewAppLine: root.previewAppLine()
+            previewDestinationLine: root.previewDestinationLine()
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            homeDir: root.homeDir
+            onPathEdited: function(v) {
+              root.pickerPath = v
+              // A preview computed for the old text is stale the moment
+              // the path changes: drop it so Confirm can never install
+              // anything other than what is on screen (same-trimmed edits
+              // keep it).
+              if (root.previewOpen && v.trim() !== root.previewInput) {
+                root.dismissPreview()
               }
-
-              Row {
-                width: parent.width
-                spacing: Style.spacing.xs
-
-                Loader {
-                  id: pickerFieldLoader
-                  active: root.pickerOpen
-                  width: parent.width - pickerGoButton.width
-                    - pickerBrowseButton.width - Style.spacing.xs * 2
-                  sourceComponent: pickerFieldComp
-                }
-
-                Button {
-                  id: pickerBrowseButton
-                  text: root.busyPick ? root.strings.pickerBrowsing
-                    : root.strings.pickerBrowse
-                  // Locked with Go/Downloads while a preview runs (#18):
-                  // a fill mid-preview-call could only produce an answer
-                  // the stale-drop has to throw away.
-                  enabled: !root.pickerBusy
-                  anchors.verticalCenter: parent.verticalCenter
-                  foreground: root.foreground
-                  accent: Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.browseForFile()
-                }
-
-                // The row's primary action tracks the flow's step (#18):
-                // Go previews a fresh path, Confirm confirms the shown
-                // preview; both show their in-flight copy while busy.
-                Button {
-                  id: pickerGoButton
-                  text: root.busyIntegrate ? root.strings.integrateWorking
-                    : (root.busyPreview ? root.strings.previewChecking
-                      : (root.previewOpen ? root.strings.previewConfirm
-                        : root.strings.pickerGo))
-                  enabled: !root.pickerBusy && root.pickerPath.trim() !== ""
-                  anchors.verticalCenter: parent.verticalCenter
-                  foreground: root.foreground
-                  accent: Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.previewOpen
-                    ? root.confirmPreview() : root.requestPreview(root.pickerPath)
-                }
-              }
-
-              // ---- Preview card (#18): confirm before anything installs --
-              // Rendered from Model.parsePreviewJson's defensive mapping
-              // (unknown keys tolerated, null app/destination normalize to
-              // empty). The reduced-assurance line is deliberately
-              // prominent — bold and urgent-colored: informing BEFORE the
-              // download is the whole point of the preview. Enter confirms,
-              // Escape goes back (PanelKeyCatcher wiring above).
-              BorderSurface {
-                id: previewCard
-                width: parent.width
-                visible: root.previewOpen
-                implicitHeight: visible ? previewCol.implicitHeight + Style.spacing.sm * 2 : 0
-                color: Util.alpha(Color.accent, 0.09)
-                borderSpec: Border.flat(Util.alpha(Color.accent, 0.45), Math.max(1, Style.normalBorderWidth))
-                radius: Style.cornerRadius
-
-                Column {
-                  id: previewCol
-                  width: parent.width - Style.spacing.sm * 2
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  Text {
-                    text: root.strings.previewTitle
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: true
-                  }
-
-                  Text {
-                    text: root.previewAppLine()
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    elide: Text.ElideRight
-                    width: parent.width
-                  }
-
-                  Text {
-                    visible: root.previewDoc && root.previewDoc.appVersion !== ""
-                    text: root.previewDoc
-                      ? Model.formatCount(root.previewDoc.appVersion,
-                          root.strings.previewVersion) : ""
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
-                  Text {
-                    text: root.previewDestinationLine()
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                  }
-
-                  Text {
-                    visible: root.previewDoc && root.previewDoc.reducedAssurance
-                    text: root.strings.previewReducedAssurance
-                    color: root.urgent
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: true
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                  }
-
-                  // The backend's own sentence, rendered verbatim (the
-                  // contract designates `note` as panel-copy).
-                  Text {
-                    text: root.previewDoc ? root.previewDoc.verificationNote : ""
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                  }
-
-                  Text {
-                    visible: root.previewDoc && root.previewDoc.alreadyIntegrated
-                    text: root.strings.previewAlreadyIntegrated
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                  }
-
-                  Text {
-                    visible: root.previewDoc && root.previewDoc.nameConflict
-                    text: root.strings.previewNameConflict
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                  }
-
-                  Row {
-                    spacing: Style.spacing.xs
-
-                    Button {
-                      text: root.strings.previewConfirm
-                      enabled: !root.busyIntegrate && !root.busyPreview
-                      foreground: root.foreground
-                      accent: Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.bodySmall
-                      implicitHeight: root.controlHeight
-                      onClicked: root.confirmPreview()
-                    }
-
-                    Button {
-                      text: root.strings.pickerCancel
-                      enabled: !root.busyIntegrate && !root.busyPreview
-                      foreground: root.foreground
-                      accent: Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.bodySmall
-                      implicitHeight: root.controlHeight
-                      onClicked: root.dismissPreview()
-                    }
-                  }
-
-                  Text {
-                    text: root.strings.previewKeysHint
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-              }
-
-              Text {
-                visible: root.pickerFiles.length > 0
-                text: root.strings.pickerDownloads
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              Flickable {
-                visible: root.pickerFiles.length > 0
-                width: parent.width
-                height: Math.min(pickCol.implicitHeight, Style.space(132))
-                contentWidth: width
-                contentHeight: pickCol.implicitHeight
-                clip: true
-                boundsBehavior: Flickable.StopAtBounds
-                interactive: contentHeight > height
-
-                Column {
-                  id: pickCol
-                  width: parent.width
-                  spacing: Style.spacing.xxs
-
-                  Repeater {
-                    model: root.pickerFiles
-
-                    Button {
-                      required property var modelData
-                      width: pickCol.width
-                      text: modelData.name
-                      foreground: root.foreground
-                      accent: Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      enabled: !root.pickerBusy
-                      // Quick-picks ride the same confirm flow: seed the
-                      // field so the preview (and a later Confirm) name
-                      // the exact file, then preview — never integrate
-                      // directly.
-                      onClicked: {
-                        root.pickerPath = modelData.path
-                        root.requestPreview(modelData.path)
-                      }
-                    }
-                  }
-                }
-              }
-
-              Text {
-                visible: root.pickerFiles.length === 0
-                text: root.strings.pickerDownloadsEmpty
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
+            }
+            onPreviewRequested: root.requestPreview(root.pickerPath)
+            onBrowseClicked: root.browseForFile()
+            onGoClicked: root.previewOpen
+              ? root.confirmPreview() : root.requestPreview(root.pickerPath)
+            onQuickPicked: function(path) {
+              root.pickerPath = path
+              root.requestPreview(path)
+            }
+            onPreviewConfirmed: root.confirmPreview()
+            onPreviewDismissed: root.dismissPreview()
+            onFieldFocusChanged: function(delta) {
+              root.textFieldFocusCount += delta
             }
           }
 
           // ---- Settings card (F8 cadence only — per-app sources are on each row) -----
-          BorderSurface {
+          // Extracted to SettingsCard.qml (ticket #55): the working-copy
+          // state, the --set-setting save chain and the store re-read stay
+          // here; anyFieldFocused replaces the direct loader read in
+          // formEditing below.
+          SettingsCard {
             id: settingsCard
-            width: parent.width
-            visible: root.settingsOpen
-            implicitHeight: visible ? settingsCol.implicitHeight + Style.spacing.xl * 2 : 0
-            color: Util.alpha(Color.accent, 0.06)
-            borderSpec: Border.flat(Util.alpha(Color.accent, 0.35), Math.max(1, Style.normalBorderWidth))
-            radius: Style.cornerRadius
-
-            Column {
-              id: settingsCol
-              width: parent.width - Style.spacing.xl * 2
-              anchors.centerIn: parent
-              spacing: Style.spacing.xs
-
-              Text {
-                text: root.strings.settingsTitle
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              // ---- update-check cadence (F8) --------------------------------
-              PanelSectionHeader {
-                text: root.strings.settingsUpdateChecks
-                foreground: root.foreground
-                width: parent.width
-              }
-
-              Row {
-                width: parent.width
-                spacing: Style.spacing.sm
-
-                Text {
-                  text: root.editEnabled ? root.strings.enabledLabel : root.strings.disabledLabel
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  elide: Text.ElideRight
-                  width: parent.width - settingsToggle.width - Style.spacing.sm
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-
-                // Caller-owned value: `checked` binds to the working copy
-                // and toggled() flips it (ToggleSwitch's own contract).
-                ToggleSwitch {
-                  id: settingsToggle
-                  checked: root.editEnabled
-                  foreground: root.foreground
-                  accent: Color.accent
-                  enabled: !root.settingsBusy
-                  anchors.verticalCenter: parent.verticalCenter
-                  onToggled: root.editEnabled = !root.editEnabled
-                }
-              }
-
-              Loader {
-                id: settingsNumbersLoader
-                active: root.settingsOpen
-                width: parent.width
-                sourceComponent: settingsNumbersComp
-              }
-
-              Text {
-                text: root.strings.notificationsOnNewUpdates
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
-
-              Button {
-                id: settingsSaveButton
-                text: root.strings.settingsSave
-                enabled: !root.settingsBusy
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                implicitHeight: root.controlHeight
-                onClicked: root.saveSettings()
-              }
-            }
+            settingsOpen: root.settingsOpen
+            settingsBusy: root.settingsBusy
+            editEnabled: root.editEnabled
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            onEnableToggled: root.editEnabled = !root.editEnabled
+            onSaveRequested: root.saveSettings()
           }
 
           // ---- Body: loading / list / empty ------------------------------
@@ -3192,450 +2468,42 @@ Panel {
                 Repeater {
                   model: root.items
 
-                  Column {
-                    id: rowOuter
+                  AppRow {
                     required property var modelData
-                    width: listCol.width
-                    spacing: Style.spacing.xs
-
-                      BorderSurface {
-                        id: itemRow
-                        width: listCol.width
-                        implicitHeight: rowContent.implicitHeight + Style.spacing.sm * 2
-                        radius: Style.cornerRadius
-                        color: Style.normalFillFor(root.foreground, Color.accent, root.urgent)
-                        borderSpec: Border.none()
-
-                        // Clicking anywhere on the card (outside the action
-                        // buttons, which stack above) launches the app (F4).
-                        MouseArea {
-                          anchors.fill: parent
-                          acceptedButtons: Qt.LeftButton
-                          onClicked: root.launchItem(rowOuter.modelData)
-                        }
-
-                        Row {
-                          id: rowContent
-                          anchors.left: parent.left
-                          anchors.right: parent.right
-                          anchors.verticalCenter: parent.verticalCenter
-                          anchors.leftMargin: Style.spacing.sm
-                          anchors.rightMargin: Style.spacing.sm
-                          spacing: Style.spacing.sm
-
-                          // Extracted icon when it exists (png then svg
-                          // next to the AppImage under .icons/, CONTRACT.md
-                          // filesystem layout), tabler cube-unfolded icon otherwise.
-                          Image {
-                            id: appIcon
-                            property int iconIndex: 0
-                            readonly property var iconCandidates: {
-                              var list = []
-                              var base = rowOuter.modelData.iconBase
-                              if (base) {
-                                var exts = [".png", ".svg"]
-                                for (var i = 0; i < exts.length; i++) {
-                                  list.push(Util.fileUrl(base + exts[i]))
-                                }
-                              }
-                              return list
-                            }
-                            anchors.verticalCenter: parent.verticalCenter
-                            visible: iconIndex < iconCandidates.length
-                            source: visible ? iconCandidates[iconIndex] : ""
-                            width: Style.font.body * 1.7
-                            height: width
-                            fillMode: Image.PreserveAspectFit
-                            asynchronous: true
-                            onStatusChanged: function(status) {
-                              if (status === Image.Error) iconIndex++
-                            }
-                          }
-
-                          ThemeIcon {
-                            visible: !appIcon.visible || appIcon.status === Image.Error
-                            anchors.verticalCenter: parent.verticalCenter
-                            name: "cube-unfolded"
-                            size: Style.font.body * 1.7
-                            color: root.dim
-                          }
-
-                          Column {
-                            spacing: Style.spacing.xxs
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - actionsRow.width - Style.space(34) - Style.spacing.sm * 2
-
-                            Text {
-                              text: rowOuter.modelData.name
-                              color: root.foreground
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.body
-                              font.bold: true
-                              elide: Text.ElideRight
-                              width: parent.width
-                            }
-
-                            // The row's IDENTITY line: the version and the
-                            // running dot. ONE bounded, elided Text —
-                            // separate Texts in a Row have no width bound
-                            // and painted over the action buttons as soon
-                            // as the fragments got long (v0.9.1).
-                            Text {
-                              width: parent.width
-                              visible: text !== ""
-                              textFormat: Text.StyledText
-                              elide: Text.ElideRight
-                              color: root.dim
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
-                              text: root.metaText(
-                                Model.rowIdentityMeta(rowOuter.modelData))
-                            }
-
-                            // The row's STATUS line: the pending release
-                            // (or "cannot verify") and the live job
-                            // progress. It has its own line so the update
-                            // status never reads as part of the version
-                            // (issue #51) — and it stays ONE bounded,
-                            // elided Text, never a Row of Texts.
-                            Text {
-                              width: parent.width
-                              visible: text !== ""
-                              textFormat: Text.StyledText
-                              elide: Text.ElideRight
-                              color: root.dim
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
-                              text: root.metaText(Model.rowStatusMeta(
-                                rowOuter.modelData,
-                                root.jobActive(rowOuter.modelData.id)
-                                  ? root.jobProgressLabel(rowOuter.modelData.id)
-                                  : ""))
-                            }
-
-                            // F9: configured update source under the row's meta.
-                            Text {
-                              visible: rowOuter.modelData.manager !== ""
-                              text: rowOuter.modelData.embeddedSource
-                                ? Model.formatCount(rowOuter.modelData.manager, root.strings.sourceEmbedded)
-                                : rowOuter.modelData.manager
-                              color: root.dim
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
-                              elide: Text.ElideRight
-                              width: parent.width
-                            }
-                          }
-
-                          Row {
-                            id: actionsRow
-                            spacing: Style.spacing.xxs
-                            anchors.verticalCenter: parent.verticalCenter
-
-                            // Launch (F4) as an icon-only action with a tooltip:
-                            // the row card itself launches too, so the caption
-                            // was dead weight next to the trash button.
-                            PanelActionButton {
-                              id: launchButton
-                              tooltipText: root.strings.launch
-                              foreground: root.foreground
-                              hoverColor: Color.accent
-                              anchors.verticalCenter: parent.verticalCenter
-
-                              ThemeIcon {
-                                anchors.centerIn: parent
-                                name: "player-play"
-                                size: launchButton.fontSize
-                                strokeWidth: 1.75
-                                color: launchButton.enabled
-                                  ? (launchButton._hot ? launchButton.hoverColor : launchButton.foreground)
-                                  : Qt.darker(launchButton.foreground, 2.0)
-                              }
-
-                              onClicked: root.launchItem(rowOuter.modelData)
-                            }
-
-                            // F7: one-click update, shown only once a
-                            // pending release is known for the row.
-                            // Per-app single flight (ticket #11): only
-                            // THIS row's button dims and loops its arrow
-                            // while its job runs — other rows keep
-                            // launching/updating in parallel, and the
-                            // state behind the flag is the app's job
-                            // document, not a click.
-                            PanelActionButton {
-                              id: updateButton
-                              // The button appears exactly when the row's
-                              // pending verdict says a newer release is
-                              // known (issue #50: the listing's
-                              // pending_update) — the same rule the badge
-                              // counts on, so the marker, the badge and
-                              // this button always agree.
-                              // A source that cannot prove its artifact
-                              // (ticket #39) offers no update action: the
-                              // backend would refuse the install, so the row
-                              // shows "cannot verify" instead.
-                              visible: rowOuter.modelData.hasUpdate === true
-                                && rowOuter.modelData.installable !== false
-                              enabled: !root.jobActive(rowOuter.modelData.id)
-                              tooltipText: root.strings.updateAction
-                              foreground: root.foreground
-                              hoverColor: Color.accent
-                              fontFamily: root.fontFamily
-                              anchors.verticalCenter: parent.verticalCenter
-
-                              ThemeIcon {
-                                id: updateIcon
-                                anchors.centerIn: parent
-                                name: "arrow-up"
-                                size: updateButton.fontSize
-                                strokeWidth: 1.75
-                                color: updateButton.enabled
-                                  ? (updateButton._hot ? updateButton.hoverColor : updateButton.foreground)
-                                  : Qt.darker(updateButton.foreground, 2.0)
-
-                                // Slide+fade loop: the arrow floats out the
-                                // top, reappears below and slides back into
-                                // place — "moving up" without a spin (which
-                                // reads as "loading" rather than direction).
-                                // The icon is anchored, so the shift rides a
-                                // Translate transform instead of y.
-                                transform: Translate {
-                                  id: updateIconShift
-                                  y: 0
-                                }
-
-                                SequentialAnimation {
-                                  running: root.jobActive(rowOuter.modelData.id)
-                                  loops: Animation.Infinite
-
-                                  ParallelAnimation {
-                                    NumberAnimation {
-                                      target: updateIconShift
-                                      property: "y"
-                                      from: 0
-                                      to: -updateIcon.height * 0.6
-                                      duration: 220
-                                      easing.type: Easing.InQuad
-                                    }
-                                    NumberAnimation {
-                                      target: updateIcon
-                                      property: "opacity"
-                                      from: 1
-                                      to: 0
-                                      duration: 220
-                                      easing.type: Easing.InQuad
-                                    }
-                                  }
-
-                                  PropertyAction {
-                                    target: updateIconShift
-                                    property: "y"
-                                    value: updateIcon.height * 0.6
-                                  }
-
-                                  ParallelAnimation {
-                                    NumberAnimation {
-                                      target: updateIconShift
-                                      property: "y"
-                                      from: updateIcon.height * 0.6
-                                      to: 0
-                                      duration: 220
-                                      easing.type: Easing.OutQuad
-                                    }
-                                    NumberAnimation {
-                                      target: updateIcon
-                                      property: "opacity"
-                                      from: 0
-                                      to: 1
-                                      duration: 220
-                                      easing.type: Easing.OutQuad
-                                    }
-                                  }
-
-                                  PauseAnimation { duration: 120 }
-
-                                  // The update can finish mid-loop: park the
-                                  // icon back at rest when the loop stops.
-                                  onRunningChanged: if (!running) {
-                                    updateIconShift.y = 0
-                                    updateIcon.opacity = 1
-                                  }
-                                }
-                              }
-
-                              onClicked: root.requestUpdate(rowOuter.modelData)
-                            }
-
-                            // F9: open this row's inline source editor.
-                            PanelActionButton {
-                              id: sourceRowButton
-                              tooltipText: root.strings.sourceEditTooltip
-                              foreground: root.foreground
-                              hoverColor: Color.accent
-                              anchors.verticalCenter: parent.verticalCenter
-
-                              ThemeIcon {
-                                anchors.centerIn: parent
-                                name: "settings"
-                                size: sourceRowButton.fontSize
-                                strokeWidth: 1.75
-                                color: sourceRowButton.enabled
-                                  ? (sourceRowButton._hot ? sourceRowButton.hoverColor : sourceRowButton.foreground)
-                                  : Qt.darker(sourceRowButton.foreground, 2.0)
-                              }
-
-                              onClicked: root.openSourceEditor(rowOuter.modelData)
-                            }
-
-                            // Two-click inline remove (F3): first click arms
-                            // "Remove?" on this row only, second click runs it.
-                            // Blocked while this row's update job runs: the
-                            // job is installing over the AppImage, so a
-                            // remove would delete the target under it.
-                            Button {
-                              visible: root.confirmRemoveId === rowOuter.modelData.id
-                              text: root.strings.removeConfirm
-                              anchors.verticalCenter: parent.verticalCenter
-                              foreground: root.urgent
-                              accent: root.urgent
-                              fontFamily: root.fontFamily
-                              fontSize: Style.font.caption
-                              implicitHeight: root.controlHeight
-                              enabled: !root.busyRemove && !root.jobActive(rowOuter.modelData.id)
-                              onClicked: root.requestRemove(rowOuter.modelData)
-                            }
-
-                            PanelActionButton {
-                              id: removeButton
-                              visible: root.confirmRemoveId !== rowOuter.modelData.id
-                              // same per-row gate as the update button: only
-                              // THIS row dims while ITS job runs (other rows
-                              // stay removable)
-                              enabled: !root.jobActive(rowOuter.modelData.id)
-                              tooltipText: root.strings.removeTooltip
-                              foreground: root.foreground
-                              hoverColor: root.urgent
-                              fontFamily: root.fontFamily
-                              anchors.verticalCenter: parent.verticalCenter
-
-                              ThemeIcon {
-                                anchors.centerIn: parent
-                                name: "trash"
-                                size: removeButton.fontSize
-                                strokeWidth: 1.75
-                                color: removeButton.enabled
-                                  ? (removeButton._hot ? removeButton.hoverColor : removeButton.foreground)
-                                  : Qt.darker(removeButton.foreground, 2.0)
-                              }
-
-                              onClicked: root.requestRemove(rowOuter.modelData)
-                            }
-                          }
-                        }
-                      }
-
-                    // Inline F9 editor under the row whose gear was
-                    // clicked: the app name fixes context, the manager
-                    // dropdown swaps the field set from Model.MANAGERS.
-                    BorderSurface {
-                      width: listCol.width
-                      visible: root.sourceEditId === rowOuter.modelData.id
-                      implicitHeight: visible ? sourceEditCol.implicitHeight + Style.spacing.xl * 2 : 0
-                      color: Util.alpha(Color.accent, 0.06)
-                      borderSpec: Border.flat(Util.alpha(Color.accent, 0.25), Math.max(1, Style.normalBorderWidth))
-                      radius: Style.cornerRadius
-
-                      Column {
-                        id: sourceEditCol
-                        width: parent.width - Style.spacing.xl * 2
-                        anchors.centerIn: parent
-                        spacing: Style.spacing.xs
-
-                        Text {
-                          text: root.sourceEditName
-                          color: root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.bodySmall
-                          font.bold: true
-                          elide: Text.ElideRight
-                          width: parent.width
-                        }
-
-                        Dropdown {
-                          id: sourceManagerDropdown
-                          label: root.strings.sourceManagerLabel
-                          width: parent.width
-                          options: root.managerOptions
-                          foreground: root.foreground
-                          accent: Color.accent
-                          fontFamily: root.fontFamily
-                          enabled: !root.sourceBusy
-                          onPopupOpenChanged: root.sourceDropdownOpen = sourceManagerDropdown.popupOpen
-                          onChanged: function(value) {
-                            root.sourceEditManager = value
-                            root.rebuildSourceEditValues()
-                          }
-
-                          // selectCurrent() writes `value` directly, which
-                          // would sever a plain value: binding on the
-                          // persisted delegate; a one-way Binding survives.
-                          Binding {
-                            target: sourceManagerDropdown
-                            property: "value"
-                            value: root.sourceEditManager
-                          }
-                        }
-
-                        Repeater {
-                          // The model is global (root.sourceEditManager), so
-                          // without the row-visibility gate every other row's
-                          // hidden editor card would instantiate the same
-                          // editable inputs — no field may exist while its
-                          // card is hidden (see the field templates note).
-                          model: {
-                            if (root.sourceEditId !== rowOuter.modelData.id) return []
-                            var mgr = Model.managersByName()[root.sourceEditManager]
-                            return mgr ? mgr.fields : []
-                          }
-
-                          Loader {
-                            required property var modelData
-                            width: sourceEditCol.width
-                            sourceComponent: modelData.type === "bool"
-                              ? sourceBoolFieldComp : sourceStringFieldComp
-                            onLoaded: item.fieldKey = modelData.key
-                          }
-                        }
-
-                        Row {
-                          spacing: Style.spacing.xs
-
-                          Button {
-                            id: sourceSaveButton
-                            text: root.strings.sourceSave
-                            enabled: !root.sourceBusy && root.sourceEditManager !== ""
-                            foreground: root.foreground
-                            accent: Color.accent
-                            fontFamily: root.fontFamily
-                            fontSize: Style.font.caption
-                            implicitHeight: root.controlHeight
-                            onClicked: root.saveSource()
-                          }
-
-                          Button {
-                            id: sourceUnsetButton
-                            text: root.strings.sourceUnset
-                            enabled: !root.sourceBusy
-                            foreground: root.foreground
-                            accent: Color.accent
-                            fontFamily: root.fontFamily
-                            fontSize: Style.font.caption
-                            implicitHeight: root.controlHeight
-                            onClicked: root.unsetSource()
-                          }
-                        }
-                      }
+                    jobActive: root.jobActive(modelData.id)
+                    progressLabel: root.jobProgressLabel(modelData.id)
+                    confirmRemoveId: root.confirmRemoveId
+                    busyRemove: root.busyRemove
+                    sourceEditId: root.sourceEditId
+                    sourceEditName: root.sourceEditName
+                    sourceEditManager: root.sourceEditManager
+                    sourceEditValues: root.sourceEditValues
+                    sourceBusy: root.sourceBusy
+                    managerOptions: root.managerOptions
+                    strings: root.strings
+                    foreground: root.foreground
+                    dim: root.dim
+                    urgent: root.urgent
+                    fontFamily: root.fontFamily
+                    controlHeight: root.controlHeight
+                    onLaunchRequested: root.launchItem(modelData)
+                    onUpdateRequested: root.requestUpdate(modelData)
+                    onRemoveRequested: root.requestRemove(modelData)
+                    onSourceEditRequested: root.openSourceEditor(modelData)
+                    onSourceSaveRequested: root.saveSource()
+                    onSourceUnsetRequested: root.unsetSource()
+                    onSourceValueChanged: function(key, value) {
+                      root.setSourceValue(key, value)
+                    }
+                    onManagerSelected: function(value) {
+                      root.sourceEditManager = value
+                      root.rebuildSourceEditValues()
+                    }
+                    onPopupOpenChanged: function(open) {
+                      root.sourceDropdownOpen = open
+                    }
+                    onFieldFocusChanged: function(delta) {
+                      root.textFieldFocusCount = Math.max(0, root.textFieldFocusCount + delta)
                     }
                   }
                 }
@@ -3702,173 +2570,6 @@ Panel {
     }
   }
 
-  // Source editor field templates (F9): one Loader per MANAGERS field in
-  // the editor above, keyed by `fieldKey` into root.sourceEditValues.
-  // Bool values are "true"/"false" strings so the Save argv passes them
-  // through verbatim; the focus count tells the key catcher when a field
-  // is typing (see formEditing).
-  //
-  // Text entry goes through SafeTextField (round 3 of review #11415): no
-  // native editable input may exist even while its card is open — the
-  // Qt 6.12 clipboard hook arms on every readOnly: false QQuickTextInput.
-  // `value` mirrors sourceEditValues; `edited` writes it back storage-only
-  // (setSourceValue never reassigns the object, so the value binding never
-  // re-evaluates mid-typing — same contract the old text binding had).
-  Component {
-    id: sourceStringFieldComp
-
-    SafeTextField {
-      property string fieldKey: ""
-      placeholderText: Model.fieldLabel(fieldKey)
-      foreground: root.foreground
-      accent: Color.accent
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
-      implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
-      width: parent ? parent.width : 0
-      enabled: !root.sourceBusy
-      value: root.sourceEditValues[fieldKey] || ""
-      onEdited: function(v) { root.setSourceValue(fieldKey, v) }
-      onActiveFocusChanged: root.textFieldFocusCount = activeFocus ? root.textFieldFocusCount + 1 : Math.max(0, root.textFieldFocusCount - 1)
-    }
-  }
-
-  Component {
-    id: sourceBoolFieldComp
-
-    Row {
-      property string fieldKey: ""
-      width: parent ? parent.width : 0
-      spacing: Style.spacing.sm
-
-      Text {
-        text: Model.fieldLabel(fieldKey)
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        anchors.verticalCenter: parent.verticalCenter
-      }
-
-      ToggleSwitch {
-        checked: root.sourceEditValues[fieldKey] === "true"
-        foreground: root.foreground
-        accent: Color.accent
-        enabled: !root.sourceBusy
-        anchors.verticalCenter: parent.verticalCenter
-        onToggled: root.setSourceValue(fieldKey,
-          root.sourceEditValues[fieldKey] === "true" ? "false" : "true")
-      }
-    }
-  }
-
-  // Integrate-picker URL field (F2) and the settings cadence fields (F8):
-  // Loader-created so no text input exists while its card is hidden
-  // (defense in depth — see the SafeTextField note above for the round-3
-  // rule: no native editable input may exist even while the card is open,
-  // so the field type itself carries the guarantee; the Loader gates keep
-  // dead instances from piling up at all). The picker field is a
-  // SafeTextField: `value` mirrors pickerPath, `edited` writes it back,
-  // Enter previews the current path (#18 confirm-before-integrate).
-  Component {
-    id: pickerFieldComp
-
-    SafeTextField {
-      width: parent ? parent.width : 0
-      placeholderText: root.strings.pickerPlaceholder
-      foreground: root.foreground
-      accent: Color.accent
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
-      implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
-      enabled: !root.busyIntegrate && !root.busyPreview
-      value: root.pickerPath
-      onEdited: function(v) {
-        root.pickerPath = v
-        // A preview computed for the old text is stale the moment the
-        // path changes: drop it so Confirm can never install anything
-        // other than what is on screen (same-trimmed edits keep it).
-        if (root.previewOpen && v.trim() !== root.previewInput) {
-          root.dismissPreview()
-        }
-      }
-      onAccepted: root.requestPreview(root.pickerPath)
-      // Same count as the editor fields: the key catcher stays blocked
-      // while this field types, whatever card is on screen (see
-      // textFieldFocusCount).
-      onActiveFocusChanged: root.textFieldFocusCount = activeFocus ? root.textFieldFocusCount + 1 : Math.max(0, root.textFieldFocusCount - 1)
-    }
-  }
-
-  Component {
-    id: settingsNumbersComp
-
-    Row {
-      width: parent ? parent.width : 0
-      spacing: Style.spacing.sm
-
-      readonly property bool anyFieldFocused:
-        (intervalField.field.contentItem
-         ? intervalField.field.contentItem.activeFocus : false)
-        || (delayField.field.contentItem
-            ? delayField.field.contentItem.activeFocus : false)
-
-      NumberField {
-        id: intervalField
-        label: root.strings.checkIntervalMinutes
-        value: root.editInterval
-        from: 15
-        to: 10080
-        enabled: !root.settingsBusy
-        foreground: root.foreground
-        accent: Color.accent
-        fontFamily: root.fontFamily
-        // Round 3 of review #11415: the SpinBox contentItem is a native
-        // TextInput that arms the Qt 6.12 clipboard hook while editable.
-        // editable: false is the one switch that flips it readOnly —
-        // value changes go through the spin buttons only.
-        Component.onCompleted: field.editable = false
-        onModified: function(v) { root.editInterval = v }
-      }
-
-      NumberField {
-        id: delayField
-        label: root.strings.firstCheckDelayMinutes
-        value: root.editDelay
-        from: 0
-        to: 1440
-        enabled: !root.settingsBusy
-        foreground: root.foreground
-        accent: Color.accent
-        fontFamily: root.fontFamily
-        Component.onCompleted: field.editable = false
-        onModified: function(v) { root.editDelay = v }
-      }
-    }
-  }
-
-  // Downloads quick-pick sources (F2 fallback picker): both spellings
-  // Omarchy users end up with. Merged into root.pickerFiles above.
-  FolderListModel {
-    id: downloadsUpper
-    folder: Util.fileUrl(root.homeDir + "/Downloads")
-    nameFilters: ["*.AppImage", "*.appimage", "*.Appimage"]
-    showDirs: false
-    showDotAndDotDot: false
-    sortField: FolderListModel.Name
-    onCountChanged: root.rebuildPickerFiles()
-    onFolderChanged: root.rebuildPickerFiles()
-  }
-
-  FolderListModel {
-    id: downloadsLower
-    folder: Util.fileUrl(root.homeDir + "/downloads")
-    nameFilters: ["*.AppImage", "*.appimage", "*.Appimage"]
-    showDirs: false
-    showDotAndDotDot: false
-    sortField: FolderListModel.Name
-    onCountChanged: root.rebuildPickerFiles()
-    onFolderChanged: root.rebuildPickerFiles()
-  }
 
   onIntegrateRequested: openPicker()
 

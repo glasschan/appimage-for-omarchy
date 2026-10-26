@@ -267,12 +267,14 @@ export function run() {
 
     // The #52 card renders desktop-entry names, which are attacker-
     // controlled: its Texts must declare PlainText so Text never rich-
-    // detects them (adversarial review, 0.11.0). Pinned on the Panel.qml
-    // source itself — same pattern as case 11's jobs.py parity checks.
-    const panelQml = readFileSync(new URL("../../../Panel.qml", import.meta.url), "utf8")
-    const cardBody = (panelQml.match(/id: updateAllCard[\s\S]*?\n          \}/) || [""])[0]
-    const appsLineStart = cardBody.indexOf("root.updateAllSummary.appsLine")
-    const processLineStart = cardBody.indexOf("root.updateAllSummary.processLine")
+    // detects them (adversarial review, 0.11.0). Pinned on the card's own
+    // source (UpdateAllCard.qml since ticket #55 moved it out of
+    // Panel.qml) — same pattern as case 11's jobs.py parity checks. The
+    // assertions are the original ones, re-pointed at the new file.
+    const cardQml = readFileSync(new URL("../../../UpdateAllCard.qml", import.meta.url), "utf8")
+    const cardBody = (cardQml.match(/id: updateAllCard[\s\S]*?\n\}/) || [""])[0]
+    const appsLineStart = cardBody.indexOf("text: updateAllCard.appsLine")
+    const processLineStart = cardBody.indexOf("text: updateAllCard.processLine")
     const cardEnd = cardBody.indexOf("Row {", processLineStart)
     const declaresPlainText = (from) => {
       const block = cardBody.slice(from, cardEnd > from ? cardEnd : cardBody.length)
