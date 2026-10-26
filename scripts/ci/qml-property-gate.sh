@@ -138,6 +138,7 @@ LOCAL_TYPES = {
     'PythonDependencyCard': ('PythonDependencyCard.qml', BORDER_MEMBERS),
     'ForceQuitCard': ('ForceQuitCard.qml', BORDER_MEMBERS),
     'UpdateAllCard': ('UpdateAllCard.qml', BORDER_MEMBERS),
+    'SettingsCard': ('SettingsCard.qml', BORDER_MEMBERS),
 }
 
 DECL_RE = re.compile(r'^\s*(?:required\s+|default\s+)*(?:readonly\s+)?'

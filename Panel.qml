@@ -399,8 +399,7 @@ Panel {
       ? pickerFieldLoader.item.activeFocus : false)
     || textFieldFocusCount > 0
     || root.sourceDropdownOpen
-    || (settingsNumbersLoader.item
-        ? settingsNumbersLoader.item.anyFieldFocused : false)
+    || settingsCard.anyFieldFocused
 
   // ---- lifecycle -----------------------------------------------------------
 
@@ -2870,91 +2869,22 @@ Panel {
           }
 
           // ---- Settings card (F8 cadence only — per-app sources are on each row) -----
-          BorderSurface {
+          // Extracted to SettingsCard.qml (ticket #55): the working-copy
+          // state, the --set-setting save chain and the store re-read stay
+          // here; anyFieldFocused replaces the direct loader read in
+          // formEditing below.
+          SettingsCard {
             id: settingsCard
-            width: parent.width
-            visible: root.settingsOpen
-            implicitHeight: visible ? settingsCol.implicitHeight + Style.spacing.xl * 2 : 0
-            color: Util.alpha(Color.accent, 0.06)
-            borderSpec: Border.flat(Util.alpha(Color.accent, 0.35), Math.max(1, Style.normalBorderWidth))
-            radius: Style.cornerRadius
-
-            Column {
-              id: settingsCol
-              width: parent.width - Style.spacing.xl * 2
-              anchors.centerIn: parent
-              spacing: Style.spacing.xs
-
-              Text {
-                text: root.strings.settingsTitle
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              // ---- update-check cadence (F8) --------------------------------
-              PanelSectionHeader {
-                text: root.strings.settingsUpdateChecks
-                foreground: root.foreground
-                width: parent.width
-              }
-
-              Row {
-                width: parent.width
-                spacing: Style.spacing.sm
-
-                Text {
-                  text: root.editEnabled ? root.strings.enabledLabel : root.strings.disabledLabel
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  elide: Text.ElideRight
-                  width: parent.width - settingsToggle.width - Style.spacing.sm
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-
-                // Caller-owned value: `checked` binds to the working copy
-                // and toggled() flips it (ToggleSwitch's own contract).
-                ToggleSwitch {
-                  id: settingsToggle
-                  checked: root.editEnabled
-                  foreground: root.foreground
-                  accent: Color.accent
-                  enabled: !root.settingsBusy
-                  anchors.verticalCenter: parent.verticalCenter
-                  onToggled: root.editEnabled = !root.editEnabled
-                }
-              }
-
-              Loader {
-                id: settingsNumbersLoader
-                active: root.settingsOpen
-                width: parent.width
-                sourceComponent: settingsNumbersComp
-              }
-
-              Text {
-                text: root.strings.notificationsOnNewUpdates
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
-
-              Button {
-                id: settingsSaveButton
-                text: root.strings.settingsSave
-                enabled: !root.settingsBusy
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                implicitHeight: root.controlHeight
-                onClicked: root.saveSettings()
-              }
-            }
+            settingsOpen: root.settingsOpen
+            settingsBusy: root.settingsBusy
+            editEnabled: root.editEnabled
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            onEnableToggled: root.editEnabled = !root.editEnabled
+            onSaveRequested: root.saveSettings()
           }
 
           // ---- Body: loading / list / empty ------------------------------
@@ -3638,52 +3568,6 @@ Panel {
     }
   }
 
-  Component {
-    id: settingsNumbersComp
-
-    Row {
-      width: parent ? parent.width : 0
-      spacing: Style.spacing.sm
-
-      readonly property bool anyFieldFocused:
-        (intervalField.field.contentItem
-         ? intervalField.field.contentItem.activeFocus : false)
-        || (delayField.field.contentItem
-            ? delayField.field.contentItem.activeFocus : false)
-
-      NumberField {
-        id: intervalField
-        label: root.strings.checkIntervalMinutes
-        value: root.editInterval
-        from: 15
-        to: 10080
-        enabled: !root.settingsBusy
-        foreground: root.foreground
-        accent: Color.accent
-        fontFamily: root.fontFamily
-        // Round 3 of review #11415: the SpinBox contentItem is a native
-        // TextInput that arms the Qt 6.12 clipboard hook while editable.
-        // editable: false is the one switch that flips it readOnly —
-        // value changes go through the spin buttons only.
-        Component.onCompleted: field.editable = false
-        onModified: function(v) { root.editInterval = v }
-      }
-
-      NumberField {
-        id: delayField
-        label: root.strings.firstCheckDelayMinutes
-        value: root.editDelay
-        from: 0
-        to: 1440
-        enabled: !root.settingsBusy
-        foreground: root.foreground
-        accent: Color.accent
-        fontFamily: root.fontFamily
-        Component.onCompleted: field.editable = false
-        onModified: function(v) { root.editDelay = v }
-      }
-    }
-  }
 
   // Downloads quick-pick sources (F2 fallback picker): both spellings
   // Omarchy users end up with. Merged into root.pickerFiles above.
