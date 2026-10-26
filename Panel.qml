@@ -214,7 +214,6 @@ Panel {
   // AppImages found in ~/Downloads and ~/downloads.
   property bool pickerOpen: false
   property string pickerPath: ""
-  property var pickerFiles: []
 
   // Confirm-before-integrate preview (#18): pressing the integrate action
   // (field Enter, Go button, Downloads row) first runs --preview-integrate
@@ -395,8 +394,7 @@ Panel {
   // the key catcher's shortcuts (see the keyCatcher binding below). The
   // picker and settings fields are Loader-created (see the field templates
   // at the bottom of this file), so guard on the loaded items.
-  readonly property bool formEditing: (pickerFieldLoader.item
-      ? pickerFieldLoader.item.activeFocus : false)
+  readonly property bool formEditing: pickerCard.fieldFocused
     || textFieldFocusCount > 0
     || root.sourceDropdownOpen
     || settingsCard.anyFieldFocused
@@ -1432,7 +1430,8 @@ Panel {
     // picker starts at the plain path field.
     clearPreview()
     pickerOpen = true
-    rebuildPickerFiles()
+    // The Downloads quick-picks rebuild inside IntegratePicker when the
+    // card's open flag flips (the old openPicker/rebuildPickerFiles pair).
   }
 
   function closePicker() {
@@ -1531,9 +1530,7 @@ Panel {
     // Hand focus back to the path field so the user can edit what they
     // typed (formEditing re-blocks the key catcher while it holds focus).
     Qt.callLater(function() {
-      if (root.pickerOpen && pickerFieldLoader.item) {
-        pickerFieldLoader.item.forceActiveFocus()
-      }
+      if (root.pickerOpen) pickerCard.focusField()
     })
   }
 
@@ -1556,32 +1553,6 @@ Panel {
       : strings.previewDestinationLater
   }
 
-  // FolderListModel.filePath comes back as a plain path on some Qt builds
-  // and as a file:// URL on others; normalize to a local path.
-  function pickerUrlToPath(value) {
-    var s = String(value || "")
-    if (s.indexOf("file://") === 0) {
-      s = s.substring("file://".length)
-      s = s.split("/").map(decodeURIComponent).join("/")
-    }
-    return s
-  }
-
-  function rebuildPickerFiles() {
-    var picks = []
-    var models = [downloadsUpper, downloadsLower]
-    for (var m = 0; m < models.length; m++) {
-      var count = models[m].count
-      for (var i = 0; i < count; i++) {
-        try {
-          var path = pickerUrlToPath(models[m].get(i, "filePath"))
-          var name = String(models[m].get(i, "fileName"))
-          if (path !== "") picks.push({ name: name, path: path })
-        } catch (e) { /* unreadable entry — skip it */ }
-      }
-    }
-    pickerFiles = picks
-  }
 
   // F2 browse: run --pick-file through the shared watchdog plumbing. The
   // backend orchestrates a crash-isolated native dialog (portal first,
@@ -1648,13 +1619,12 @@ Panel {
     })
   }
 
-  // Put focus into the picker's path field (Loader-created — it exists
-  // only while the card is open) so a picked path can be integrated with
-  // Enter right away. Defensive: a browse that outlived the card is a
-  // quiet store update.
+  // Put focus into the picker's path field so a picked path can be
+  // integrated with Enter right away (the field and its loader live in
+  // IntegratePicker.qml since ticket #55). Defensive: a browse that
+  // outlived the card is a quiet store update.
   function focusPickerField() {
-    var field = pickerFieldLoader.item
-    if (field) field.forceActiveFocus()
+    pickerCard.focusField()
   }
 
   // ---- drop-to-integrate (#21) ------------------------------------------------
@@ -2600,271 +2570,51 @@ Panel {
           }
 
           // ---- Integrate picker (F2) ------------------------------------
-          BorderSurface {
+          // Extracted to IntegratePicker.qml (ticket #55): the picker
+          // state, the preview flow and every backend call stay here; the
+          // card renders them and reports intent through signals. The
+          // Downloads quick-pick sources and the Loader-gated URL field
+          // moved with it.
+          IntegratePicker {
             id: pickerCard
-            width: parent.width
-            visible: root.pickerOpen
-            implicitHeight: visible ? pickerCol.implicitHeight + Style.spacing.sm * 2 : 0
-            color: Util.alpha(Color.accent, 0.06)
-            borderSpec: Border.flat(Util.alpha(Color.accent, 0.35), Math.max(1, Style.normalBorderWidth))
-            radius: Style.cornerRadius
-
-            Column {
-              id: pickerCol
-              width: parent.width - Style.spacing.sm * 2
-              anchors.centerIn: parent
-              spacing: Style.spacing.xs
-
-              Text {
-                text: root.strings.pickerTitle
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
+            pickerOpen: root.pickerOpen
+            pickerPath: root.pickerPath
+            busyPick: root.busyPick
+            busyIntegrate: root.busyIntegrate
+            busyPreview: root.busyPreview
+            previewOpen: root.previewOpen
+            previewDoc: root.previewDoc
+            pickerBusy: root.pickerBusy
+            previewAppLine: root.previewAppLine()
+            previewDestinationLine: root.previewDestinationLine()
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            homeDir: root.homeDir
+            onPathEdited: function(v) {
+              root.pickerPath = v
+              // A preview computed for the old text is stale the moment
+              // the path changes: drop it so Confirm can never install
+              // anything other than what is on screen (same-trimmed edits
+              // keep it).
+              if (root.previewOpen && v.trim() !== root.previewInput) {
+                root.dismissPreview()
               }
-
-              Row {
-                width: parent.width
-                spacing: Style.spacing.xs
-
-                Loader {
-                  id: pickerFieldLoader
-                  active: root.pickerOpen
-                  width: parent.width - pickerGoButton.width
-                    - pickerBrowseButton.width - Style.spacing.xs * 2
-                  sourceComponent: pickerFieldComp
-                }
-
-                Button {
-                  id: pickerBrowseButton
-                  text: root.busyPick ? root.strings.pickerBrowsing
-                    : root.strings.pickerBrowse
-                  // Locked with Go/Downloads while a preview runs (#18):
-                  // a fill mid-preview-call could only produce an answer
-                  // the stale-drop has to throw away.
-                  enabled: !root.pickerBusy
-                  anchors.verticalCenter: parent.verticalCenter
-                  foreground: root.foreground
-                  accent: Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.browseForFile()
-                }
-
-                // The row's primary action tracks the flow's step (#18):
-                // Go previews a fresh path, Confirm confirms the shown
-                // preview; both show their in-flight copy while busy.
-                Button {
-                  id: pickerGoButton
-                  text: root.busyIntegrate ? root.strings.integrateWorking
-                    : (root.busyPreview ? root.strings.previewChecking
-                      : (root.previewOpen ? root.strings.previewConfirm
-                        : root.strings.pickerGo))
-                  enabled: !root.pickerBusy && root.pickerPath.trim() !== ""
-                  anchors.verticalCenter: parent.verticalCenter
-                  foreground: root.foreground
-                  accent: Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.previewOpen
-                    ? root.confirmPreview() : root.requestPreview(root.pickerPath)
-                }
-              }
-
-              // ---- Preview card (#18): confirm before anything installs --
-              // Rendered from Model.parsePreviewJson's defensive mapping
-              // (unknown keys tolerated, null app/destination normalize to
-              // empty). The reduced-assurance line is deliberately
-              // prominent — bold and urgent-colored: informing BEFORE the
-              // download is the whole point of the preview. Enter confirms,
-              // Escape goes back (PanelKeyCatcher wiring above).
-              BorderSurface {
-                id: previewCard
-                width: parent.width
-                visible: root.previewOpen
-                implicitHeight: visible ? previewCol.implicitHeight + Style.spacing.sm * 2 : 0
-                color: Util.alpha(Color.accent, 0.09)
-                borderSpec: Border.flat(Util.alpha(Color.accent, 0.45), Math.max(1, Style.normalBorderWidth))
-                radius: Style.cornerRadius
-
-                Column {
-                  id: previewCol
-                  width: parent.width - Style.spacing.sm * 2
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  Text {
-                    text: root.strings.previewTitle
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: true
-                  }
-
-                  Text {
-                    text: root.previewAppLine()
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    elide: Text.ElideRight
-                    width: parent.width
-                  }
-
-                  Text {
-                    visible: root.previewDoc && root.previewDoc.appVersion !== ""
-                    text: root.previewDoc
-                      ? Model.formatCount(root.previewDoc.appVersion,
-                          root.strings.previewVersion) : ""
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
-                  Text {
-                    text: root.previewDestinationLine()
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                  }
-
-                  Text {
-                    visible: root.previewDoc && root.previewDoc.reducedAssurance
-                    text: root.strings.previewReducedAssurance
-                    color: root.urgent
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    font.bold: true
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                  }
-
-                  // The backend's own sentence, rendered verbatim (the
-                  // contract designates `note` as panel-copy).
-                  Text {
-                    text: root.previewDoc ? root.previewDoc.verificationNote : ""
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                  }
-
-                  Text {
-                    visible: root.previewDoc && root.previewDoc.alreadyIntegrated
-                    text: root.strings.previewAlreadyIntegrated
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                  }
-
-                  Text {
-                    visible: root.previewDoc && root.previewDoc.nameConflict
-                    text: root.strings.previewNameConflict
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                  }
-
-                  Row {
-                    spacing: Style.spacing.xs
-
-                    Button {
-                      text: root.strings.previewConfirm
-                      enabled: !root.busyIntegrate && !root.busyPreview
-                      foreground: root.foreground
-                      accent: Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.bodySmall
-                      implicitHeight: root.controlHeight
-                      onClicked: root.confirmPreview()
-                    }
-
-                    Button {
-                      text: root.strings.pickerCancel
-                      enabled: !root.busyIntegrate && !root.busyPreview
-                      foreground: root.foreground
-                      accent: Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.bodySmall
-                      implicitHeight: root.controlHeight
-                      onClicked: root.dismissPreview()
-                    }
-                  }
-
-                  Text {
-                    text: root.strings.previewKeysHint
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-              }
-
-              Text {
-                visible: root.pickerFiles.length > 0
-                text: root.strings.pickerDownloads
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              Flickable {
-                visible: root.pickerFiles.length > 0
-                width: parent.width
-                height: Math.min(pickCol.implicitHeight, Style.space(132))
-                contentWidth: width
-                contentHeight: pickCol.implicitHeight
-                clip: true
-                boundsBehavior: Flickable.StopAtBounds
-                interactive: contentHeight > height
-
-                Column {
-                  id: pickCol
-                  width: parent.width
-                  spacing: Style.spacing.xxs
-
-                  Repeater {
-                    model: root.pickerFiles
-
-                    Button {
-                      required property var modelData
-                      width: pickCol.width
-                      text: modelData.name
-                      foreground: root.foreground
-                      accent: Color.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      enabled: !root.pickerBusy
-                      // Quick-picks ride the same confirm flow: seed the
-                      // field so the preview (and a later Confirm) name
-                      // the exact file, then preview — never integrate
-                      // directly.
-                      onClicked: {
-                        root.pickerPath = modelData.path
-                        root.requestPreview(modelData.path)
-                      }
-                    }
-                  }
-                }
-              }
-
-              Text {
-                visible: root.pickerFiles.length === 0
-                text: root.strings.pickerDownloadsEmpty
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
+            }
+            onPreviewRequested: root.requestPreview(root.pickerPath)
+            onBrowseClicked: root.browseForFile()
+            onGoClicked: root.previewOpen
+              ? root.confirmPreview() : root.requestPreview(root.pickerPath)
+            onQuickPicked: function(path) {
+              root.pickerPath = path
+              root.requestPreview(path)
+            }
+            onPreviewConfirmed: root.confirmPreview()
+            onPreviewDismissed: root.dismissPreview()
+            onFieldFocusChanged: function(delta) {
+              root.textFieldFocusCount += delta
             }
           }
 
@@ -3530,68 +3280,6 @@ Panel {
     }
   }
 
-  // Integrate-picker URL field (F2) and the settings cadence fields (F8):
-  // Loader-created so no text input exists while its card is hidden
-  // (defense in depth — see the SafeTextField note above for the round-3
-  // rule: no native editable input may exist even while the card is open,
-  // so the field type itself carries the guarantee; the Loader gates keep
-  // dead instances from piling up at all). The picker field is a
-  // SafeTextField: `value` mirrors pickerPath, `edited` writes it back,
-  // Enter previews the current path (#18 confirm-before-integrate).
-  Component {
-    id: pickerFieldComp
-
-    SafeTextField {
-      width: parent ? parent.width : 0
-      placeholderText: root.strings.pickerPlaceholder
-      foreground: root.foreground
-      accent: Color.accent
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
-      implicitHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
-      enabled: !root.busyIntegrate && !root.busyPreview
-      value: root.pickerPath
-      onEdited: function(v) {
-        root.pickerPath = v
-        // A preview computed for the old text is stale the moment the
-        // path changes: drop it so Confirm can never install anything
-        // other than what is on screen (same-trimmed edits keep it).
-        if (root.previewOpen && v.trim() !== root.previewInput) {
-          root.dismissPreview()
-        }
-      }
-      onAccepted: root.requestPreview(root.pickerPath)
-      // Same count as the editor fields: the key catcher stays blocked
-      // while this field types, whatever card is on screen (see
-      // textFieldFocusCount).
-      onActiveFocusChanged: root.textFieldFocusCount = activeFocus ? root.textFieldFocusCount + 1 : Math.max(0, root.textFieldFocusCount - 1)
-    }
-  }
-
-
-  // Downloads quick-pick sources (F2 fallback picker): both spellings
-  // Omarchy users end up with. Merged into root.pickerFiles above.
-  FolderListModel {
-    id: downloadsUpper
-    folder: Util.fileUrl(root.homeDir + "/Downloads")
-    nameFilters: ["*.AppImage", "*.appimage", "*.Appimage"]
-    showDirs: false
-    showDotAndDotDot: false
-    sortField: FolderListModel.Name
-    onCountChanged: root.rebuildPickerFiles()
-    onFolderChanged: root.rebuildPickerFiles()
-  }
-
-  FolderListModel {
-    id: downloadsLower
-    folder: Util.fileUrl(root.homeDir + "/downloads")
-    nameFilters: ["*.AppImage", "*.appimage", "*.Appimage"]
-    showDirs: false
-    showDotAndDotDot: false
-    sortField: FolderListModel.Name
-    onCountChanged: root.rebuildPickerFiles()
-    onFolderChanged: root.rebuildPickerFiles()
-  }
 
   onIntegrateRequested: openPicker()
 

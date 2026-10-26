@@ -20,7 +20,7 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd -- "$REPO_ROOT"
 
-ENTRY_POINTS=(Panel.qml BarWidget.qml ThemeIcon.qml SafeTextField.qml Service.qml PythonDependencyCard.qml ForceQuitCard.qml UpdateAllCard.qml SettingsCard.qml PreviewCard.qml)
+ENTRY_POINTS=(Panel.qml BarWidget.qml ThemeIcon.qml SafeTextField.qml Service.qml PythonDependencyCard.qml ForceQuitCard.qml UpdateAllCard.qml SettingsCard.qml PreviewCard.qml IntegratePicker.qml)
 
 if ! command -v quickshell >/dev/null 2>&1; then
   echo "SKIP: quickshell is not installed — QML compile check not run"
