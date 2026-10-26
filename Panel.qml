@@ -2709,56 +2709,19 @@ Panel {
           }
 
           // ---- Python dependency card (authorized install) --------------
-          // Shown only after the probe positively confirmed python3 is
-          // absent. The button never installs anything by itself: it opens
-          // omarchy's floating terminal presenting `/usr/bin/omarchy pkg
-          // add python` so the user watches and authorizes every step
-          // (hyprmoncfg's plugin-managed-dependency pattern).
-          BorderSurface {
+          // Extracted to PythonDependencyCard.qml (ticket #55): the probe/
+          // install state and the authorized-install bridge stay here; the
+          // card renders them and reports the button press.
+          PythonDependencyCard {
             id: pythonCard
-            width: parent.width
-            visible: root.pythonStateKnown && root.pythonMissing
-            implicitHeight: visible ? pythonCol.implicitHeight + Style.spacing.sm * 2 : 0
-            color: Util.alpha(Color.urgent, 0.06)
-            borderSpec: Border.flat(Util.alpha(Color.urgent, 0.35), Math.max(1, Style.normalBorderWidth))
-            radius: Style.cornerRadius
-
-            Column {
-              id: pythonCol
-              width: parent.width - Style.spacing.sm * 2
-              anchors.centerIn: parent
-              spacing: Style.spacing.xs
-
-              Text {
-                text: root.strings.pythonMissingTitle
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              Text {
-                text: root.strings.pythonMissingHint
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
-
-              Button {
-                width: parent.width
-                text: root.installingPython
-                  ? root.strings.installingPython : root.strings.installPython
-                enabled: !root.installingPython
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                onClicked: root.installPython()
-              }
-            }
+            pythonVisible: root.pythonStateKnown && root.pythonMissing
+            installingPython: root.installingPython
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            onInstallRequested: root.installPython()
           }
 
           // ---- Integrate picker (F2) ------------------------------------

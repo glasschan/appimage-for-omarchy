@@ -120,10 +120,22 @@ TEXTFIELD_MEMBERS = ITEM_MEMBERS | {
     'onEnabledChanged', 'onWidthChanged', 'onHeightChanged',
 }
 
+# Members the shell's BorderSurface inherits on top of the Item basics —
+# the base type of the panel's card components (ticket #55 extraction).
+BORDER_MEMBERS = ITEM_MEMBERS | {
+    'color', 'radius', 'borderSpec', 'padding',
+}
+
+# Column members the AppRow delegate relies on.
+COLUMN_MEMBERS = ITEM_MEMBERS | {
+    'spacing',
+}
+
 # The plugin's own component types: name -> (file, base type members).
 LOCAL_TYPES = {
     'SafeTextField': ('SafeTextField.qml', TEXTFIELD_MEMBERS),
     'ThemeIcon': ('ThemeIcon.qml', ITEM_MEMBERS),
+    'PythonDependencyCard': ('PythonDependencyCard.qml', BORDER_MEMBERS),
 }
 
 DECL_RE = re.compile(r'^\s*(?:required\s+|default\s+)*(?:readonly\s+)?'
