@@ -142,6 +142,7 @@ LOCAL_TYPES = {
     'PreviewCard': ('PreviewCard.qml', BORDER_MEMBERS),
     'IntegratePicker': ('IntegratePicker.qml', BORDER_MEMBERS),
     'CardHeader': ('CardHeader.qml', ITEM_MEMBERS),
+    'AppRow': ('AppRow.qml', COLUMN_MEMBERS),
 }
 
 DECL_RE = re.compile(r'^\s*(?:required\s+|default\s+)*(?:readonly\s+)?'
