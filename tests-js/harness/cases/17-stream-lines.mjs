@@ -106,4 +106,36 @@ export function run() {
     check("parseActionJson error after progress", e.ok === false
       && e.result === "error" && e.error === "no-space", JSON.stringify(e))
   }
+
+  // Review round (spec #30 wave): "last valid document wins" must mean the
+  // last VALID document — a stray unparseable line, a single-line event
+  // stream and legacy recovery must never produce or erase a verdict.
+  {
+    const result = JSON.stringify({ result: "integrated", app: { name: "Foo" } })
+
+    const stray = Model.parseDocument(result + '\n{broken\n')
+    check("parseDocument result survives stray line", stray.ok === true
+      && stray.doc.result === "integrated", JSON.stringify(stray))
+    const strayB = Backend.parseJson(result + '\n{broken\n')
+    check("parseJson result survives stray line", strayB !== null
+      && strayB.result === "integrated", JSON.stringify(strayB))
+
+    const pretty = Model.parseDocument('[\n 1,\n 2\n]')
+    check("parseDocument multi-line pretty array", pretty.ok === true
+      && Array.isArray(pretty.doc) && pretty.doc[0] === 1 && pretty.doc[1] === 2,
+      JSON.stringify(pretty))
+    const prettyB = Backend.parseJson('[\n 1,\n 2\n]')
+    check("parseJson multi-line pretty array", Array.isArray(prettyB)
+      && prettyB[0] === 1 && prettyB[1] === 2, JSON.stringify(prettyB))
+
+    const singleEvent = Model.parseDocument('{"event":"progress","percent":40}')
+    check("parseDocument single progress line is a failure", singleEvent.ok === false,
+      JSON.stringify(singleEvent))
+    check("parseJson single progress line is null",
+      Backend.parseJson('{"event":"progress","percent":40}') === null)
+
+    const recovered = Model.parseDocument('x\n{"event":"progress"}junk')
+    check("parseDocument recovery skips event doc", recovered.ok === false,
+      JSON.stringify(recovered))
+  }
 }

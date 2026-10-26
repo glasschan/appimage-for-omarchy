@@ -188,7 +188,10 @@ few hundred lines; every line is flushed when written. `total` is `0` when
 the server sends no Content-Length — `bytes` is still reported (every
 32 MiB, since there is no length to divide into percent steps). A caller
 that reads only the last line keeps working, and unknown `event` values
-must be ignored. A plain (non-`--json`) integrate keeps its human output
+must be ignored. The `verifying` event is emitted once the fetch returns
+and covers the post-download processing (extraction/metadata); the digest
+check itself has already completed inside the fetch. A plain (non-`--json`)
+integrate keeps its human output
 exactly, and a failing `--json` run still ends with a well-formed error
 document after any progress lines. A local-file integrate emits no progress
 (there is no transfer); the phases exist only for a URL integrate.

@@ -199,7 +199,12 @@ def cmd_integrate(args: list) -> int:
             file_path = _get_file_from_args(positional)
 
         if progress:
-            progress.emit('verifying')
+            # Disable-on-raise, as net.py treats byte_cb: a broken stdout
+            # pipe must not convert a landed transfer into an error exit.
+            try:
+                progress.emit('verifying')
+            except Exception:
+                progress = None
 
         list_element = appimage_provider.create_list_element_from_file(file_path)
         if appimage_provider.is_installed(list_element):
@@ -260,7 +265,11 @@ def cmd_integrate(args: list) -> int:
                     list_element.updating_from = already_installed
 
         if progress:
-            progress.emit('installing')
+            # Same disable-on-raise guard as the verifying phase above.
+            try:
+                progress.emit('installing')
+            except Exception:
+                progress = None
         appimage_provider.install_file(list_element)
 
         # prepopulate the per-app update source from the install URL
