@@ -123,12 +123,13 @@ def fetch_zsync_control(zsync_url: str) -> tuple:
 
 
 def download_zsync(zsync_url: str, dest_dir: str, policy: str,
-                   is_appimage=None) -> str:
+                   is_appimage=None, byte_cb=None) -> str:
     """Fetch the artifact a .zsync control file points at.
 
     A control file's SHA-1 line is a publisher digest and is always
     verified. Without one, only POLICY_REDUCED proceeds (reduced-assurance
-    checks); POLICY_STRICT refuses before downloading."""
+    checks); POLICY_STRICT refuses before downloading. `byte_cb(done,
+    total)` reports transfer progress (ticket #58)."""
     check_policy(policy)
     target, expected_sha1 = fetch_zsync_control(zsync_url)
     if not target:
@@ -138,7 +139,7 @@ def download_zsync(zsync_url: str, dest_dir: str, policy: str,
         raise UpdateError(f'{zsync_url}: zsync control file has no SHA-1 '
                           'line; refusing to install an unverified artifact')
     dest = os.path.join(dest_dir, 'download.appimage')
-    net.download_to_file(target, dest)
+    net.download_to_file(target, dest, byte_cb=byte_cb)
     if expected_sha1:
         actual = get_file_hash(dest, alg='sha1')
         if actual != expected_sha1:
@@ -153,28 +154,31 @@ def download_zsync(zsync_url: str, dest_dir: str, policy: str,
 
 
 def download_plain(url: str, dest_dir: str, policy: str,
-                   expected_size: int = None, is_appimage=None) -> str:
+                   expected_size: int = None, is_appimage=None,
+                   byte_cb=None) -> str:
     """Fetch `url` verbatim. POLICY_STRICT refuses outright — a plain URL
     carries no digest — so only a pasted-URL integrate reaches the
-    reduced-assurance checks."""
+    reduced-assurance checks. `byte_cb(done, total)` reports transfer
+    progress (ticket #58)."""
     check_policy(policy)
     if policy == POLICY_STRICT:
         raise UpdateError(
             'a plain URL provides no cryptographic digest; refusing to '
             'install an unverified artifact')
     dest = os.path.join(dest_dir, 'download.appimage')
-    net.download_to_file(url, dest)
+    net.download_to_file(url, dest, byte_cb=byte_cb)
     verify_reduced_assurance(dest, expected_size, is_appimage)
     return dest
 
 
 def download_github_asset(src: dict, dest_dir: str, policy: str,
-                          is_appimage=None) -> str:
+                          is_appimage=None, byte_cb=None) -> str:
     """Fetch one release asset, verifying the release's sha256 digest when
     the API publishes one (`src` carries owner/repo/tag/filename/url).
 
     Under POLICY_STRICT a missing digest refuses before any download; under
-    POLICY_REDUCED it falls back to the reduced-assurance checks."""
+    POLICY_REDUCED it falls back to the reduced-assurance checks.
+    `byte_cb(done, total)` reports transfer progress (ticket #58)."""
     check_policy(policy)
     api_url = ('https://api.github.com/repos/'
                f'{src["owner"]}/{src["repo"]}/releases/tags/'
@@ -201,7 +205,7 @@ def download_github_asset(src: dict, dest_dir: str, policy: str,
                           'refusing to install an unverified artifact')
 
     dest = os.path.join(dest_dir, 'download.appimage')
-    net.download_to_file(src['url'], dest)
+    net.download_to_file(src['url'], dest, byte_cb=byte_cb)
     expected = digest[len('sha256:'):]
     actual = get_file_hash(dest, alg='sha256')
     if actual != expected:

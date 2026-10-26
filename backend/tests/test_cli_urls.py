@@ -22,6 +22,13 @@ from omarchy_appimage.ini_config import Config
 from omarchy_appimage.provider import AppImageListElement, InstalledStatus
 
 
+def _last_json(out: str) -> dict:
+    """The result document of an integrate run: the last stdout line.
+    Since ticket #58 a URL --json integrate emits progress documents
+    ahead of it, so callers read the last line, never the whole stream."""
+    return json.loads(out.splitlines()[-1])
+
+
 class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
     """--integrate <github release download URL>: download, verify the
     asset's sha256 digest via the GitHub API (mandatory), integrate, and
@@ -60,7 +67,10 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
         api.start()
         self.addCleanup(api.stop)
 
-        def _fake_download(url, dest):
+        def _fake_download(url, dest, progress_cb=None, **kwargs):
+            # byte_cb (ticket #58 progress stream) is accepted but not
+            # driven here: these tests pin the result document, and a
+            # caller that reads only the last line keeps working
             Path(dest).write_bytes(self.body)
             return len(self.body)
         dl = mock.patch.object(net, 'download_to_file',
@@ -130,7 +140,7 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
         self._patch_download_and_api()
         out, err, code = self._integrate()
         self.assertEqual(code, 0, err)
-        payload = json.loads(out)
+        payload = _last_json(out)
         self.assertEqual(payload['result'], 'integrated')
 
         # the AppImage landed in the managed folder
@@ -160,7 +170,7 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
         self._patch_download_and_api()
         out, err, code = self._integrate()
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)['result'], 'integrated')
+        self.assertEqual(_last_json(out)['result'], 'integrated')
 
         # degrade the install to what an older plugin would have left: no
         # X-AppImage-Version at all, and the md5 hash in the display Name
@@ -176,7 +186,7 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
 
         out, err, code = self._integrate()
         self.assertEqual(code, 0, err)
-        payload = json.loads(out)
+        payload = _last_json(out)
         self.assertEqual(payload['result'], 'already-integrated')
         self.assertEqual(payload['app']['current_version'], 'v4.5.6')
         self.assertEqual(payload['app']['name'], 'Neovim')
@@ -188,7 +198,7 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
         # idempotent: a second repair run changes nothing and still exits 0
         out, err, code = self._integrate()
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)['result'], 'already-integrated')
+        self.assertEqual(_last_json(out)['result'], 'already-integrated')
 
     def test_integrate_from_url_writes_the_release_tag_as_the_version(self):
         # End to end: an AppImage that states no version of its own gets
@@ -211,7 +221,7 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
                                side_effect=_load_versionless):
             out, err, code = self._integrate()
         self.assertEqual(code, 0, err)
-        payload = json.loads(out)
+        payload = _last_json(out)
         self.assertEqual(payload['app']['current_version'], 'v4.5.6')
         self.assertEqual(payload['app']['name'], 'Neovim (v4.5.6)')
 
@@ -235,7 +245,7 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
                                'apply_release_version', side_effect=_spy):
             out, err, code = self._integrate()
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)['result'], 'integrated')
+        self.assertEqual(_last_json(out)['result'], 'integrated')
         self.assertEqual(seen, ['v4.5.6'])
 
     def test_integrate_from_url_refuses_missing_digest(self):
@@ -256,7 +266,7 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
         api.start()
         self.addCleanup(api.stop)
 
-        def _fake_download(u, dest):
+        def _fake_download(u, dest, progress_cb=None, **kwargs):
             Path(dest).write_bytes(self.body)
             return len(self.body)
         dl = mock.patch.object(net, 'download_to_file',
@@ -266,7 +276,7 @@ class UrlIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
 
         out, err, code = self._integrate(url=url)
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)['result'], 'integrated')
+        self.assertEqual(_last_json(out)['result'], 'integrated')
         el = cli.appimage_provider.list_installed()[0]
         cfg = Config.get_app_update_config(el)
         self.assertEqual(cfg['manager'], 'StaticFileUpdater')
@@ -298,7 +308,7 @@ class UrlMultiSourceIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
         self.downloads = []
 
     def _patch_download(self):
-        def _fake_download(url, dest):
+        def _fake_download(url, dest, progress_cb=None, **kwargs):
             self.downloads.append(url)
             Path(dest).write_bytes(self.body)
             return len(self.body)
@@ -312,7 +322,7 @@ class UrlMultiSourceIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
 
     def _assert_installed(self, out, err, code):
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)['result'], 'integrated')
+        self.assertEqual(_last_json(out)['result'], 'integrated')
         self.assertTrue(os.path.isfile(
             os.path.join(self.managed_dir, 'neovim.appimage')))
 
@@ -418,6 +428,150 @@ class UrlMultiSourceIntegrateTests(InProcessCliMixin, FakeXDGTestCase):
         cfg = self._installed_config()
         self.assertEqual(cfg['manager'], 'StaticFileUpdater')
         self.assertEqual(cfg['url'], self.STATIC_URL)
+
+
+class IntegrateProgressTests(InProcessCliMixin, FakeXDGTestCase):
+    """--integrate <url> --json emits `event: progress` lines ahead of the
+    single, unchanged result document (ticket #58). Hermetic like the
+    classes above: the GitHub API and the download are patched at the net
+    seam and the fake download drives the byte_cb the way
+    net.download_to_file does — byte_cb(done, total), total 0 when the
+    server sends no Content-Length."""
+
+    URL = ('https://github.com/neovim/neovim/releases/download/'
+           'v4.5.6/nvim-4.5.6-linux-x86_64.AppImage')
+
+    def setUp(self):
+        super().setUp()
+        self.fixture = download_fixture()
+        if self.fixture is None:
+            self.skipTest('fixture download unavailable')
+        with open(self.fixture, 'rb') as f:
+            self.body = f.read()
+        release = {
+            'tag_name': 'v4.5.6', 'draft': False, 'prerelease': False,
+            'assets': [{
+                'name': 'nvim-4.5.6-linux-x86_64.AppImage',
+                'size': len(self.body),
+                'digest': 'sha256:' + hashlib.sha256(self.body).hexdigest(),
+            }],
+        }
+        api = mock.patch.object(net, 'fetch_json', return_value=release)
+        api.start()
+        self.addCleanup(api.stop)
+
+    def _patch_download(self, drive=None):
+        """Patch the download; `drive(byte_cb)` simulates the transfer's
+        progress callbacks before the bytes are written."""
+
+        def _fake_download(url, dest, progress_cb=None, **kwargs):
+            byte_cb = kwargs.get('byte_cb')
+            if drive and byte_cb:
+                drive(byte_cb)
+            Path(dest).write_bytes(self.body)
+            return len(self.body)
+
+        dl = mock.patch.object(net, 'download_to_file',
+                               side_effect=_fake_download)
+        dl.start()
+        self.addCleanup(dl.stop)
+
+    def _integrate(self, *extra):
+        return self.run_cmd(cli.cmd_integrate,
+                            [self.URL, '--yes', '--json', *extra])
+
+    def _documents(self, out):
+        return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+    def _progress_phases(self, docs):
+        return [d['phase'] for d in docs if d.get('event') == 'progress']
+
+    def test_progress_documents_precede_the_unchanged_result(self):
+        total = len(self.body)
+        self._patch_download(lambda cb: (cb(total // 4, total),
+                                         cb(total, total)))
+        out, err, code = self._integrate()
+        self.assertEqual(code, 0, err)
+        docs = self._documents(out)
+        self.assertEqual(self._progress_phases(docs),
+                         ['downloading', 'downloading', 'verifying',
+                          'installing'])
+        for doc in docs:
+            self.assertEqual(doc['schema_version'], 1)
+        downloading = [d for d in docs if d.get('phase') == 'downloading']
+        self.assertEqual(downloading[0]['bytes'], total // 4)
+        self.assertEqual(downloading[0]['total'], total)
+        self.assertEqual(downloading[1]['bytes'], total)
+        # the result document is unchanged and still last
+        self.assertNotIn('event', docs[-1])
+        self.assertEqual(docs[-1]['result'], 'integrated')
+        self.assertIn('app', docs[-1])
+
+    def test_progress_fires_on_percent_changes_only(self):
+        total = 10_000
+        self._patch_download(lambda cb: (cb(1, total), cb(99, total),
+                                         cb(100, total), cb(150, total),
+                                         cb(199, total), cb(200, total),
+                                         cb(total, total)))
+        out, err, code = self._integrate()
+        self.assertEqual(code, 0, err)
+        downloading = [d for d in self._documents(out)
+                       if d.get('phase') == 'downloading']
+        # percents 0, 1, 2 and 100 changed; everything inside a percent
+        # is swallowed
+        self.assertEqual([d['bytes'] for d in downloading],
+                         [1, 100, 200, total])
+
+    def test_no_content_length_reports_bytes_with_total_zero(self):
+        self._patch_download(lambda cb: (cb(500, 0), cb(600, 0),
+                                         cb(1000, 0)))
+        out, err, code = self._integrate()
+        self.assertEqual(code, 0, err)
+        downloading = [d for d in self._documents(out)
+                       if d.get('phase') == 'downloading']
+        self.assertEqual(len(downloading), 1)
+        self.assertEqual(downloading[0]['bytes'], 500)
+        self.assertEqual(downloading[0]['total'], 0)
+        self.assertEqual(self._progress_phases(self._documents(out)),
+                         ['downloading', 'verifying', 'installing'])
+
+    def test_plain_run_output_is_unchanged(self):
+        self._patch_download()
+        out, err, code = self.run_cmd(cli.cmd_integrate, [self.URL, '--yes'])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(out.endswith('was integrated successfully\n'))
+        for line in out.splitlines():
+            self.assertFalse(line.startswith('{'))
+
+    def test_failing_run_keeps_the_stream_well_formed(self):
+        # a verification failure after progress was emitted: the in-process
+        # runner reports the OperationError on stderr with exit 1; under
+        # the real main() the error document is printed last, so the
+        # progress lines must never corrupt the stream
+        from omarchy_appimage.updaters import UpdateError
+
+        def drive(cb):
+            cb(len(self.body), len(self.body))
+            raise UpdateError('digest mismatch')
+
+        self._patch_download(drive)
+        out, err, code = self._integrate()
+        self.assertEqual(code, 1)
+        self.assertIn('digest mismatch', err)
+        docs = self._documents(out)
+        self.assertEqual(self._progress_phases(docs), ['downloading'])
+        self.assertEqual(docs[-1]['event'], 'progress')
+
+    def test_static_url_progress_threads_through_download_plain(self):
+        url = 'https://dl.example.org/MyApp.AppImage'
+        total = len(self.body)
+        self._patch_download(lambda cb: cb(total, total))
+        out, err, code = self.run_cmd(
+            cli.cmd_integrate, [url, '--yes', '--json'])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self._progress_phases(self._documents(out)),
+                         ['downloading', 'verifying', 'installing'])
+        self.assertEqual(self._documents(out)[-1]['result'], 'integrated')
 
 
 if __name__ == '__main__':
