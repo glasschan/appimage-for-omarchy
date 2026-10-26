@@ -12,7 +12,7 @@ import logging
 import os
 import shlex
 
-from . import elf, settings
+from . import elf, launch, settings
 from .desktop_entry import DesktopEntry
 from .ini_config import Config
 from .provider_types import AppImageListElement, InstalledStatus, InternalError
@@ -203,7 +203,7 @@ class ListingMixin:
         args = shlex.split(default_args) if default_args.strip() else []
         entry.TryExec = appimage
         entry.Exec = shlex.join(
-            ['env', 'DESKTOPINTEGRATION=1', appimage, *args])
+            launch.launch_argv(appimage, args))
         entry.Icon = icon
         entry.write_file(desktop_path)
         self._repaired_desktop_paths.add(desktop_path)

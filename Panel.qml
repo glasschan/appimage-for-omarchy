@@ -679,22 +679,22 @@ Panel {
     })
   }
 
-  // F4: launch the AppImage binary detached. The argv form keeps the path
-  // (which came from the backend's JSON) a single literal argument — no
-  // shell ever sees it. DESKTOPINTEGRATION=1 matches the generated desktop
-  // entry's Exec line so AppImages that bundle their own integration
-  // prompt stay quiet.
+  // F4: launch the AppImage binary detached. The argv comes from the
+  // backend's ONE launch-command builder (the listing's `launch_argv`,
+  // ticket #32) — the same builder that writes the desktop entry's Exec
+  // line, so DESKTOPINTEGRATION=1 and any future launch-environment rule
+  // live in exactly one place. No shell ever sees the path: it arrives as
+  // a single argv token.
   //
-  // The app's own Exec arguments (the backend's exec_arguments, e.g.
-  // "--no-sandbox %U") ride along as extra argv tokens: real flags are
-  // kept, desktop field codes (%f %F %u %U %i %c %k) are dropped because
-  // the panel has no file or URL to hand over. No arguments at all (the
-  // common case) produce exactly the argv of before.
+  // The backend has already dropped the desktop field codes (%f %F %u %U
+  // %i %c %d %k) it knows the panel cannot fill. A backend older than the
+  // key (never in a paired release) still launches the bare path — the
+  // launch assembly is never re-implemented here.
   function launchItem(item) {
     if (!item || item.path === "") return
-    var args = (item.execArguments || "").trim().split(/\s+/)
-      .filter(function(a) { return a && !/^%[fFuUicdk]$/.test(a) })
-    Quickshell.execDetached(["env", "DESKTOPINTEGRATION=1", item.path].concat(args))
+    var argv = (item.launchArgv && item.launchArgv.length > 0)
+      ? item.launchArgv : [item.path]
+    Quickshell.execDetached(argv)
     Model.markRunning(item.id, true)
     // Arm the launch verdict in the STORE (ticket #47): spawn success says
     // nothing about the AppImage runtime, and this click closes the panel,

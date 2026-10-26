@@ -190,6 +190,52 @@ X-AppImage-Version=1.0
         self.assertEqual(self._listed()['exec_arguments'], '--no-sandbox %U')
 
 
+class LaunchArgvCliTests(FakeXDGTestCase):
+    """`launch_argv` (ticket #32): the listing hands the panel its launch
+    command — the argv Quickshell.execDetached spawns — built by the ONE
+    launch builder (omarchy_appimage.launch) instead of the QML. Additive
+    key on the app object; schema_version stays 1."""
+
+    def _install_with_exec(self, args: str) -> str:
+        appimage, desktop, icon = self.install_fake_app()
+        with open(desktop, 'w') as f:
+            f.write(f'''[Desktop Entry]
+Name=Fake App
+Exec=env DESKTOPINTEGRATION=1 {appimage} {args}
+TryExec={appimage}
+Icon={icon}
+Type=Application
+Terminal=false
+X-AppImage-Version=1.0
+''')
+        return appimage
+
+    def _listed(self) -> dict:
+        payload = json.loads(self.run_cli('--list-installed', '--json').stdout)
+        self.assertEqual(len(payload['installed']), 1)
+        return payload['installed'][0]
+
+    def test_launch_argv_prefixes_env_desktopintegration(self):
+        self._install_with_exec('--no-sandbox %U')
+        app = self._listed()
+        self.assertEqual(
+            app['launch_argv'],
+            ['env', 'DESKTOPINTEGRATION=1', app['path'], '--no-sandbox'])
+
+    def test_launch_argv_drops_the_field_codes(self):
+        self._install_with_exec('--flag %U')
+        app = self._listed()
+        self.assertNotIn('%U', app['launch_argv'])
+        self.assertIn('--flag', app['launch_argv'])
+
+    def test_launch_argv_without_arguments_is_just_the_prefix(self):
+        self._install_with_exec('')
+        app = self._listed()
+        self.assertEqual(
+            app['launch_argv'],
+            ['env', 'DESKTOPINTEGRATION=1', app['path']])
+
+
 class StaleRecordCliTests(FakeXDGTestCase):
     """A record whose .desktop file is gone is logged, never removed
     automatically, and can be cleaned up explicitly by its desktop id."""
