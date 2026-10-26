@@ -2213,257 +2213,30 @@ Panel {
           spacing: Style.spacing.md
 
           // ---- Header: title, counts, actions --------------------------
-          Item {
-            width: parent.width
-            implicitHeight: headerRow.implicitHeight
-
-            Row {
-              id: headerRow
-              anchors.left: parent.left
-              anchors.right: parent.right
-              spacing: Style.spacing.controlGap
-
-              Column {
-                id: headerText
-                spacing: Style.spacing.xxs
-                anchors.verticalCenter: parent.verticalCenter
-
-                Text {
-                  text: root.strings.panelTitle
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.heading
-                  font.bold: true
-                }
-
-                Text {
-                  text: root.subtitleText
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
-
-              Item { width: 1; height: 1; anchors.verticalCenter: parent.verticalCenter }
-
-              // The shell Button has no image slot (its iconText is a
-              // Nerd Font glyph), so the row below supplies the tabler
-              // icon while Button keeps owning every state visual (hover,
-              // focus, fills); the width override mirrors Button's own
-              // label-based sizing math over that row. The caption lives
-              // in the tooltip, like the icon-only buttons to the right.
-              Button {
-                id: integrateButton
-                text: ""
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.pickerOpen ? root.strings.pickerCancel : root.strings.integrate
-                implicitWidth: integrateRow.implicitWidth
-                  + integrateButton.horizontalPadding * 2
-                  + integrateButton._reservedBorderLeft
-                  + integrateButton._reservedBorderRight
-
-                Row {
-                  id: integrateRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "plus"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: integrateButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: {
-                  if (root.pickerOpen) root.closePicker()
-                  else root.integrateRequested()
-                }
-              }
-
-              Button {
-                id: refreshButton
-                text: ""
-                enabled: !root.busyList
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.strings.refresh
-                implicitWidth: refreshRow.implicitWidth
-                  + refreshButton.horizontalPadding * 2
-                  + refreshButton._reservedBorderLeft
-                  + refreshButton._reservedBorderRight
-
-                Row {
-                  id: refreshRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "refresh"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: refreshButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: root.refresh()
-              }
-
-              // F6 as an icon-only header button (tooltip carries the
-              // caption the row buttons would show); same Button+ThemeIcon
-              // row pattern as Integrate/Refresh above.
-              Button {
-                id: checkUpdatesButton
-                text: ""
-                enabled: !root.busyUpdates
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.strings.checkUpdates
-                implicitWidth: checkUpdatesRow.implicitWidth
-                  + checkUpdatesButton.horizontalPadding * 2
-                  + checkUpdatesButton._reservedBorderLeft
-                  + checkUpdatesButton._reservedBorderRight
-
-                Row {
-                  id: checkUpdatesRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "cloud-download"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: checkUpdatesButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: root.checkUpdates()
-              }
-
-              // "Update all" (issue #52): one action for every pending
-              // app, next to the check-updates action and reusing the
-              // row's arrow-up icon. The click only OPENS the consent
-              // card — nothing is spawned until the user accepts it. The
-              // button is enabled exactly while at least one app has a
-              // pending release the backend would accept.
-              Button {
-                id: updateAllButton
-                text: ""
-                enabled: root.pendingIds.length > 0
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.strings.updateAllTooltip
-                implicitWidth: updateAllRow.implicitWidth
-                  + updateAllButton.horizontalPadding * 2
-                  + updateAllButton._reservedBorderLeft
-                  + updateAllButton._reservedBorderRight
-
-                Row {
-                  id: updateAllRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "arrow-up"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: updateAllButton.enabled
-                      ? updateAllButton.foreground
-                      : root.dim
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: root.requestUpdateAll()
-              }
-
-              // Pin toggle: flips the overlay into a compact floating
-              // window (session-only) so other apps stay clickable.
-              Button {
-                id: pinButton
-                text: ""
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.pinned ? root.strings.pinTooltipUnpin : root.strings.pinTooltip
-                implicitWidth: pinRow.implicitWidth
-                  + pinButton.horizontalPadding * 2
-                  + pinButton._reservedBorderLeft
-                  + pinButton._reservedBorderRight
-
-                Row {
-                  id: pinRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "pin"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: pinButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: root.pinned = !root.pinned
-              }
-
-              // Settings gear: toggles the settings card below.
-              Button {
-                id: settingsButton
-                text: ""
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.foreground
-                accent: Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                implicitHeight: root.controlHeight
-                tooltipText: root.strings.settingsTitle
-                implicitWidth: settingsRow.implicitWidth
-                  + settingsButton.horizontalPadding * 2
-                  + settingsButton._reservedBorderLeft
-                  + settingsButton._reservedBorderRight
-
-                Row {
-                  id: settingsRow
-                  anchors.centerIn: parent
-                  spacing: Style.spacing.xs
-
-                  ThemeIcon {
-                    name: "settings"
-                    size: Style.font.icon
-                    strokeWidth: 1.75
-                    color: settingsButton.foreground
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-
-                onClicked: root.toggleSettings()
-              }
+          // Extracted to CardHeader.qml (ticket #55): the flags it renders
+          // and every action it reports stay here.
+          CardHeader {
+            id: cardHeader
+            pickerOpen: root.pickerOpen
+            busyList: root.busyList
+            busyUpdates: root.busyUpdates
+            pendingIds: root.pendingIds
+            pinned: root.pinned
+            subtitleText: root.subtitleText
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            onIntegrateClicked: {
+              if (root.pickerOpen) root.closePicker()
+              else root.integrateRequested()
             }
+            onRefreshClicked: root.refresh()
+            onCheckUpdatesClicked: root.checkUpdates()
+            onUpdateAllClicked: root.requestUpdateAll()
+            onPinToggled: root.pinned = !root.pinned
+            onSettingsClicked: root.toggleSettings()
           }
 
           PanelSeparator { foreground: root.foreground }
