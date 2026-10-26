@@ -8,8 +8,11 @@
 # JSON error document in --json mode) instead of being silently ignored.
 # --preview-integrate keeps its own validation and its own suite.
 
+import io
 import json
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 from helpers import FakeXDGTestCase
 
@@ -87,6 +90,53 @@ class UnknownOptionTests(FakeXDGTestCase):
         self.assertEqual(payload['schema_version'],
                          constants.JSON_SCHEMA_VERSION)
         self.assertIn('installed', payload)
+
+
+class ExecWithScaleInterceptTests(FakeXDGTestCase):
+    """The global `--help` / `--json` intercepts in cli.main must never
+    eat an argument that belongs to the APP: for `--exec-with-scale`
+    everything after the image path is the app's own argv (the launch
+    contract), so `--exec-with-scale <image> --help` reaches the verb
+    instead of printing USAGE (review finding, GDK wave)."""
+
+    def _run_main(self, *argv):
+        """cli.main with the exec-with-scale verb replaced by a recorder
+        — no compositor query, no exec, no GUI."""
+        seen = []
+
+        def recorder(verb_args):
+            seen.append(list(verb_args))
+            return 0
+
+        with mock.patch.dict(cli.COMMANDS,
+                             {'exec-with-scale': recorder}):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = cli.main(['main.py', *argv])
+        return code, seen, out.getvalue()
+
+    def test_help_after_the_image_reaches_the_verb(self):
+        code, seen, out = self._run_main(
+            '--exec-with-scale', '/apps/Foo.AppImage', '--help')
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [['/apps/Foo.AppImage', '--help']])
+        self.assertNotIn('Usage:', out)
+
+    def test_app_json_token_is_not_an_intercept(self):
+        # an app argument named --json must not flip plugin JSON mode
+        # either: the verb sees the token, the intercepts do not
+        code, seen, _out = self._run_main(
+            '--exec-with-scale', '/apps/Foo.AppImage', '--json')
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [['/apps/Foo.AppImage', '--json']])
+
+    def test_help_still_intercepts_for_other_verbs(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli.main(
+                ['main.py', '--list-installed', '--help'])
+        self.assertEqual(code, 0)
+        self.assertIn('Usage:', out.getvalue())
 
 
 if __name__ == '__main__':

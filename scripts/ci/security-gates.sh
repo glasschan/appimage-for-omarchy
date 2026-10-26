@@ -281,8 +281,32 @@ for path in sorted(ROOT.glob('lib/*.js')) + QML:
 #     marker is launch.py's `DESKTOPINTEGRATION_ENV` constant and every
 #     other module must import it, so the entry writer, the panel argv
 #     and the verb's stamp cannot drift into different spellings.
-LAUNCH_PATH_FILES = [PKG / 'launch.py', PKG / 'exec_scale.py',
-                     PKG / 'commands' / 'exec_scale.py']
+# The launch path is DERIVED, not hand-maintained (review round, GDK wave):
+# every module that references the launch seam — `import launch` /
+# `from . import launch`, or the same for `exec_scale` — is scanned, so a
+# fourth launch module cannot land outside the rule. launch.py defines the
+# seam (it imports nothing of it), so it is anchored explicitly; the three
+# known modules below are pinned in
+# backend/tests/test_security_coverage.py::GateScriptLaunchPathTests and a
+# rename that slips them out of the derived set fails the gate loudly.
+LAUNCH_SEAM_RE = re.compile(
+    r'^\s*import\s+(?:launch|exec_scale)\b'
+    r'|^\s*from\s+\.*\s*(?:launch|exec_scale)?\s*import\b'
+    r'[^#\n]*\b(?:launch|exec_scale)\b', re.M)
+LAUNCH_PATH_FILES = [PKG / 'launch.py', PKG / 'exec_scale.py']
+LAUNCH_PATH_FILES += [
+    path for path in sorted(PKG.rglob('*.py'))
+    if path not in LAUNCH_PATH_FILES
+    and LAUNCH_SEAM_RE.search(
+        path.read_text(encoding='utf-8'))
+]
+for _expected in [PKG / 'launch.py', PKG / 'exec_scale.py',
+                  PKG / 'commands' / 'exec_scale.py']:
+    if _expected not in LAUNCH_PATH_FILES:
+        err('launch-argv-constancy', _expected, None,
+            'a known launch module dropped out of the derived launch '
+            'path — update the derivation (and the pins in '
+            'test_security_coverage.py) together with the rename')
 LAUNCH_SHELL_RES = [
     (re.compile(r'\bshell\s*=\s*True\b'),
      'shell=True on the launch path — commands are argv lists, never '

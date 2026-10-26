@@ -186,6 +186,20 @@ COMMANDS = {
 }
 
 
+def _intercept_scope(args: list) -> list:
+    """The tokens the global intercepts (`--help`, `--json`) may look at.
+
+    For the `--exec-with-scale` verb only the first token is ours — the
+    image path — and everything after it belongs to the APP (the launch
+    contract). An app argument like `--help` or `--json` must never be
+    eaten by a plugin-level intercept, so for that verb the intercepts
+    see only the tokens before the image path (which can carry neither).
+    """
+    if args and args[0].lstrip('-') == 'exec-with-scale':
+        return args[:1]
+    return args
+
+
 def main(argv: list) -> int:
     args = argv[1:]
 
@@ -199,7 +213,8 @@ def main(argv: list) -> int:
         print(USAGE, file=sys.stderr)
         return EXIT_USAGE
 
-    if '--help' in args[1:]:
+    scoped = _intercept_scope(args)
+    if '--help' in scoped[1:]:
         print(USAGE)
         return EXIT_OK
 
@@ -208,7 +223,7 @@ def main(argv: list) -> int:
     except UsageError as e:
         print(f'Error: {e}', file=sys.stderr)
         print(USAGE, file=sys.stderr)
-        if '--json' in args:
+        if '--json' in scoped:
             # usage errors keep the same error-document shape as any
             # other failure in --json mode
             _print_json({
@@ -221,7 +236,7 @@ def main(argv: list) -> int:
             net.NetworkError) as e:
         message = e.message if isinstance(e, InternalError) else str(e)
         print(f'Error: {message}', file=sys.stderr)
-        if '--json' in args:
+        if '--json' in scoped:
             # in --json mode the caller expects a machine-readable error
             # document on stdout as well (QML shows it in the panel)
             _print_json({
@@ -233,7 +248,7 @@ def main(argv: list) -> int:
     except Exception as e:
         logging.exception('unexpected error')
         print(f'Error: {e}', file=sys.stderr)
-        if '--json' in args:
+        if '--json' in scoped:
             _print_json({
                 'schema_version': constants.JSON_SCHEMA_VERSION,
                 'result': 'error',

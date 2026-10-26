@@ -299,6 +299,26 @@ Type=Application
         mtime_second = os.stat(desktop).st_mtime_ns
         self.assertEqual(mtime_first, mtime_second)
 
+    def test_clobber_repair_converges_across_instances(self):
+        # the clobber repair must persist `launch_backend_dir` into the
+        # app record (full-record get-modify-set): a FRESH provider
+        # instance (empty per-instance repair set) must not rewrite the
+        # already-correct entry on the next listing (review finding,
+        # GDK wave)
+        _appimage, desktop, _icon = self._install_with_record()
+        self._clobber(desktop)
+
+        self.provider.list_installed()
+        record = Config.get_app_config(SimpleNamespace(
+            file_path=_appimage, name='Fake App'))
+        self.assertEqual(record.get('launch_backend_dir'),
+                         constants.backend_dir())
+
+        fresh = AppImageProvider()
+        mtime_first = os.stat(desktop).st_mtime_ns
+        fresh.list_installed()
+        self.assertEqual(os.stat(desktop).st_mtime_ns, mtime_first)
+
     def test_recovery_skipped_when_recorded_appimage_missing(self):
         appimage, desktop, _icon = self._install_with_record()
         os.unlink(appimage)

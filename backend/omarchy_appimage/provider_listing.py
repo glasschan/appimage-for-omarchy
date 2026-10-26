@@ -227,6 +227,18 @@ class ListingMixin:
             constants.backend_dir(), appimage, args))
         entry.Icon = icon
         entry.write_file(desktop_path)
+        # persist the backend directory this Exec was built with (the
+        # same key `_repair_entry_point_dir` reads): otherwise the next
+        # listing's entry-point repair would rewrite an already-correct
+        # entry once more. Full-record get-modify-set — Config
+        # replaces the whole app section.
+        if recorded is not None:
+            updated = dict(recorded)
+            updated['launch_backend_dir'] = constants.backend_dir()
+            Config.set_app_config(
+                SimpleNamespace(file_path=appimage,
+                                name=recorded.get('name', '') or ''),
+                updated)
         self._repaired_desktop_paths.add(desktop_path)
         logging.info('repaired clobbered desktop entry: %s', desktop_path)
 

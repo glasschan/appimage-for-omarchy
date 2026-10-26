@@ -813,7 +813,9 @@ session exports `GDK_SCALE=2` (ticket #33).
   or an option where the image path belongs, is exit 2. The verb takes
   no options of its own: only the first token is ours, everything after
   the path belongs to the app, so `_reject_unknown_options` does not
-  apply.
+  apply — and the CLI's global `--help` / `--json` intercepts do not
+  fire either (they only inspect tokens before the image path, so an
+  app argument shaped like an option is never eaten by the plugin).
 
 **Entry surfaces.** Two surfaces reach the verb; both carry the
 managed-launch marker `DESKTOPINTEGRATION=1` (how the running-app guard
@@ -845,6 +847,22 @@ recognises its own launches):
   `launch.panel_launch_argv`) stays for an older shell pairing and as
   the non-scale fallback; both keys come from the same shared token
   set, so the two surfaces cannot drift.
+
+**Plugin removal** (accepted behaviour, documented): the launcher Exec
+bakes `<python> <backend>/main.py --exec-with-scale <image>`, so after
+the plugin is removed every launcher click fails with python's
+file-not-found error instead of launching — accepted, because the plugin
+is gone and nothing can re-point the entry; the icons keep rendering
+(`TryExec` still names the image), reinstalling the plugin at the same
+path heals every entry with no per-app action (the listing's re-point
+repair fixes moved directories the same way), and the plugin offers no
+raw-image fallback by design. Known accepted tradeoff of the Exec
+format (review round, GDK wave): the arguments after the image are
+joined once at build time and re-parsed verbatim, so a whitespace-only
+token in an app's arguments does not survive parse round-trips; and an
+app's own env variables ride along into the wrapper's interpreter —
+the same trust level as running the app, whose plugin imports are
+shielded by the explicit `sys.path` insert of the backend directory.
 
 ### `--settings [--json]`
 
