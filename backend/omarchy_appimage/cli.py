@@ -1,36 +1,28 @@
-# cli.py — command implementations (stdlib only).
+# cli.py — the CLI facade: usage text, verb dispatch table and main (ticket #56).
+#
+# Every verb lives in commands/ (one concern per module): envelope helpers
+# in commands/envelope.py, the integrate/preview verbs in
+# commands/integrate.py, listing/removal in commands/listing.py, the
+# update checks in commands/checks.py, the update pipeline in
+# commands/update.py, the async job runner in commands/jobs.py and the
+# settings verbs in commands/settings.py. This module stays the PUBLIC
+# import surface: every moved name is re-exported below, so
+# `omarchy_appimage.cli.<name>` keeps working for backend/main.py, the
+# tests and CONTRACT.md — including the monkeypatch seams the suite
+# patches here (cli.run_update, cli.run_command, cli._stdin_is_tty,
+# cli._spawn_update_job, cli._cmd_update_async).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# Ported from src/Cli.py + src/BackgroudUpdatesFetcher.py: the MVP command
-# set (integrate / list-installed / remove) plus the update commands
-# (list-updates / update / set-update-source / list-update-managers /
-# fetch-updates) and the settings commands backing the panel's settings
-# page. The background fetcher is a one-shot CLI command here instead of
-# an in-process loop (the QML service owns the timer).
+# Ported from src/Cli.py + src/BackgroudUpdatesFetcher.py.
 #
 # Contract: with --json, stdout carries ONLY the JSON document; every
 # human-readable line and all logging goes to stderr (PRD §8).
 
-import fnmatch
-import json
 import logging
 import os
-import posixpath
-import re
-import select
-import shutil
 import sys
-import tempfile
-import time
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from . import (constants, extractor, janitor, jobs, net, pick_file, procs,
-               settings, updaters, utils)
-from .extractor import read_desktop_entry_in_place
-from .ini_config import Config
-from .provider import (AppImageListElement, AppImageUpdateLogic, InternalError,
-                       InstalledStatus, resolve_install_names)
-from .updaters import UpdateError, UpdateManagerChecker
+from . import constants, net
 from .commands.envelope import (EXIT_ERROR, EXIT_OK, EXIT_USAGE,
                                 MAX_PERSISTED_VERSION_CHARS, OperationError,
                                 UsageError, VERIFICATIONS, _ask,
@@ -40,28 +32,22 @@ from .commands.envelope import (EXIT_ERROR, EXIT_OK, EXIT_USAGE,
                                 _reject_unknown_options, _remove_flag_value,
                                 _resolve_target, _running_app_prompt,
                                 _running_pid_count, _runtime_block,
-                                _stdin_is_tty,
-                                _update_state_installable,
+                                _stdin_is_tty, _update_state_installable,
                                 _update_state_version, _updates_state_key,
                                 _verification_of, appimage_provider)
-
-# public import surface (ticket #56): every moved name stays importable —
-# and patchable — as omarchy_appimage.cli.<name>
 from .utils import run_command  # facade re-export: the tests' patch seam
-from .commands.integrate import (_as_url, _auto_set_codeberg_source,
-                                 _auto_set_forgejo_source,
-                                 _auto_set_github_source,
-                                 _auto_set_gitlab_source, _auto_set_source,
-                                 _auto_set_static_source,
-                                 _classify_integrate_url,
-                                 _fetch_integrate_artifact,
+from .commands.urls import (_as_url, _auto_set_codeberg_source,
+                            _auto_set_forgejo_source, _auto_set_github_source,
+                            _auto_set_gitlab_source, _auto_set_source,
+                            _auto_set_static_source,
+                            _classify_integrate_url, _glob_for_version,
+                            _github_release_url_data, _is_url,
+                            _lookup_release_asset, _release_api_url,
+                            _release_download_url_data, _update_source_chosen)
+from .commands.integrate import (_fetch_integrate_artifact,
                                  _fetch_integrate_artifact_through_source,
                                  _find_name_conflict, _get_file_from_args,
-                                 _glob_for_version, _github_release_url_data,
-                                 _is_url, _lookup_release_asset,
-                                 _preview_destination, _release_api_url,
-                                 _release_download_url_data,
-                                 _update_source_chosen, _verification_preview,
+                                 _preview_destination, _verification_preview,
                                  cmd_integrate, cmd_preview_integrate)
 from .commands.listing import cmd_list_installed, cmd_remove
 from .commands.jobs import (_JOB_HANDSHAKE_TIMEOUT_SECONDS,
@@ -77,11 +63,15 @@ from .commands.checks import (_check_updates, _merge_updates_state,
                               _update_signature, _update_state_entry,
                               _update_state_signature, cmd_fetch_updates,
                               cmd_list_updates)
+from .commands.settings import (FALSE_WORDS, TRUE_WORDS, _parse_bool_word,
+                                cmd_get_update_source, cmd_list_update_managers,
+                                cmd_pick_file, cmd_set_setting,
+                                cmd_set_update_source, cmd_settings)
+# shared singletons the tests reach through this facade
+from . import janitor
+from .provider import InternalError
+from .updaters import UpdateManagerChecker  # facade re-export
 
-# words accepted for boolean settings / update-manager config values
-# (move with the settings verbs, ticket #56)
-TRUE_WORDS = ('1', 'true', 'yes', 'on')
-FALSE_WORDS = ('0', 'false', 'no', 'off')
 
 USAGE = f"""Usage: python3 main.py [OPTION...]
 
@@ -164,283 +154,6 @@ Exit codes:
 Managed folder: {constants.DEFAULT_APPIMAGES_FOLDER} (configurable via
 {os.path.relpath(constants.settings_path(), constants.xdg_config_home())}).
 XDG_DATA_HOME / XDG_CONFIG_HOME are honoured."""
-
-
-# ------------------------------------------------------------ not-yet-moved
-# (temporary: these travel to commands/integrate.py, commands/checks.py and
-# commands/settings.py in the following commits of ticket #56)
-
-def _parse_bool_word(raw: str, what: str) -> bool:
-    word = str(raw).strip().lower()
-    if word in TRUE_WORDS:
-        return True
-    if word in FALSE_WORDS:
-        return False
-    raise UsageError(f'{what} is not a boolean value, allowed values: '
-                     f'{"/".join(TRUE_WORDS + FALSE_WORDS)}')
-
-
-# ----------------------------------------------------------------- commands
-
-def cmd_set_update_source(args: list) -> int:
-    _reject_unknown_options(args, {'--json', '--unset', '--manager'})
-    json_output = '--json' in args
-    do_unset = '--unset' in args
-
-    positional = _remove_flag_value(args, ['--json', '--unset'])
-    manager_name = None
-    rest = []
-    i = 0
-    while i < len(positional):
-        if positional[i] == '--manager':
-            if i + 1 >= len(positional):
-                raise UsageError('--manager requires a manager name')
-            manager_name = positional[i + 1]
-            i += 2
-            continue
-        rest.append(positional[i])
-        i += 1
-
-    targets = [t for t in rest if '=' not in t]
-    pairs = [t for t in rest if '=' in t]
-    if not targets:
-        raise UsageError('missing argument: --set-update-source <target> '
-                         '--manager <name> [key=value ...]')
-    if len(targets) > 1:
-        raise UsageError(f'unexpected argument: {targets[1]!r}')
-
-    el = _resolve_target(targets[0])
-
-    if do_unset:
-        Config.delete_app_update_config(el)
-        if json_output:
-            _print_json({
-                'schema_version': constants.JSON_SCHEMA_VERSION,
-                'result': 'unset',
-                'app': _make_app_json(el),
-            })
-        else:
-            print(f'Update source removed for {el.file_path}')
-        return EXIT_OK
-
-    names = ', '.join(m.name for m in UpdateManagerChecker.get_models())
-    if not manager_name:
-        raise UsageError(f'missing --manager <name> (one of: {names})')
-
-    model = next((m for m in UpdateManagerChecker.get_models()
-                  if m.name == manager_name), None)
-    if model is None:
-        raise UsageError(f'"{manager_name}" is not a valid update manager '
-                         f'(one of: {names})')
-
-    manager = model(el=el)
-    template = manager.config_template()
-
-    data = {}
-    for pair in pairs:
-        key, sep, value = pair.partition('=')
-        if not sep or not key:
-            raise UsageError(f'invalid argument {pair!r} (expected key=value)')
-        if key in data:
-            raise UsageError(f'duplicate key: {key}')
-        data[key] = value
-
-    if set(data.keys()) != set(template.keys()):
-        raise UsageError('Missing or invalid update configuration, required '
-                         'keys: ' + ', '.join(template.keys()))
-
-    for key, default in template.items():
-        if isinstance(default, bool):
-            data[key] = _parse_bool_word(data[key], key)
-
-    try:
-        manager.validate_config(data)
-    except UpdateError as e:
-        raise UsageError(str(e))
-
-    Config.set_app_update_config(el, manager.name, data)
-
-    if json_output:
-        _print_json({
-            'schema_version': constants.JSON_SCHEMA_VERSION,
-            'result': 'set',
-            'app': _make_app_json(el, manager=manager),
-            'manager': manager.name,
-            'config': data,
-        })
-    else:
-        print(f'Update source for {el.file_path} set to {manager.name}')
-    return EXIT_OK
-
-
-def cmd_get_update_source(args: list) -> int:
-    _reject_unknown_options(args, {'--json'})
-    json_output = '--json' in args
-
-    positional = _remove_flag_value(args, ['--json'])
-    if not positional:
-        raise UsageError('missing argument: --get-update-source <target>')
-    if len(positional) > 1:
-        raise UsageError(f'unexpected argument: {positional[1]!r}')
-
-    el = _resolve_target(positional[0])
-
-    # The raw section contents: `manager` names the UpdateManager class,
-    # everything else is the stored key=value config (bools already
-    # normalized to "true"/"false" strings by set_app_update_config).
-    cfg = Config.get_app_update_config(el)
-    if not cfg:
-        if json_output:
-            _print_json({
-                'schema_version': constants.JSON_SCHEMA_VERSION,
-                'result': 'no-source',
-                'app': _make_app_json(el),
-            })
-        else:
-            print(f'No update source configured for {el.file_path}')
-        return EXIT_OK
-
-    manager = cfg.get('manager', '')
-    config = {key: value for key, value in cfg.items() if key != 'manager'}
-    if json_output:
-        _print_json({
-            'schema_version': constants.JSON_SCHEMA_VERSION,
-            'result': 'ok',
-            'manager': manager,
-            'config': config,
-            'app': _make_app_json(el),
-        })
-    else:
-        pairs = ', '.join(f'{key}={value}' for key, value in sorted(config.items()))
-        print(f'Update source for {el.file_path}: {manager}'
-              + (f' ({pairs})' if pairs else ''))
-    return EXIT_OK
-
-
-def cmd_list_update_managers(args: list) -> int:
-    _reject_unknown_options(args, {'--json'})
-    json_output = '--json' in args
-    managers = UpdateManagerChecker.manager_metadata()
-
-    if json_output:
-        _print_json({
-            'schema_version': constants.JSON_SCHEMA_VERSION,
-            'managers': managers,
-        })
-        return EXIT_OK
-
-    _print_table([[m['label'], m['name']] for m in managers])
-    return EXIT_OK
-
-
-# ------------------------------------------------------- settings commands
-
-def cmd_pick_file(args: list) -> int:
-    """Open a native single-file AppImage dialog in a child process
-    (crash-isolated): the desktop portal first, zenity as fallback. The
-    heavy lifting (probe order, deadline, URI validation, typed results)
-    lives in pick_file.py; this wrapper only maps the payload to the
-    output contract."""
-    _reject_unknown_options(args, {'--json'})
-    json_output = '--json' in args
-    payload = pick_file.run_pick()
-    result = payload.get('result')
-
-    if result == 'picked':
-        if json_output:
-            _print_json(payload)
-        else:
-            print(payload['path'])
-        return EXIT_OK
-
-    if result in ('cancelled', 'unavailable'):
-        # not errors: cancelled is the user's choice, unavailable means
-        # the panel keeps today's path-field UX
-        if json_output:
-            _print_json(payload)
-        else:
-            print(payload.get('message') or 'File selection cancelled')
-        return EXIT_OK
-
-    message = payload.get('error') or 'file selection failed'
-    print(f'Error: {message}', file=sys.stderr)
-    if json_output:
-        _print_json(payload)
-    return EXIT_ERROR
-
-
-def cmd_settings(args: list) -> int:
-    _reject_unknown_options(args, {'--json'})
-    json_output = '--json' in args
-    data = settings.load_settings()
-
-    if json_output:
-        _print_json({
-            'schema_version': constants.JSON_SCHEMA_VERSION,
-            'settings': data,
-        })
-        return EXIT_OK
-
-    for key in sorted(data):
-        print(f'{key}: {data[key]}')
-    return EXIT_OK
-
-
-def cmd_set_setting(args: list) -> int:
-    _reject_unknown_options(args, {'--json'})
-    json_output = '--json' in args
-
-    tokens = [a for a in args if a != '--json']
-    if len(tokens) != 1 or '=' not in tokens[0] \
-            or tokens[0].startswith('-'):
-        raise UsageError('missing argument: --set-setting <key>=<value> '
-                         '(see --settings for valid keys)')
-
-    key, sep, raw_value = tokens[0].partition('=')
-    valid_keys = ', '.join(sorted(settings._DEFAULTS))
-    if key not in settings._DEFAULTS:
-        raise UsageError(f'unknown setting {key!r} (valid keys: {valid_keys})')
-    if not sep or not raw_value.strip():
-        raise UsageError(f'missing value for setting {key!r}')
-
-    if key in ('manage_files_outside_default_folder',
-               'move_appimage_on_integration',
-               'update_check_enabled'):
-        value = _parse_bool_word(raw_value, key)
-    elif key == 'update_check_interval_minutes':
-        try:
-            value = int(raw_value)
-        except ValueError:
-            raise UsageError(f'{key} must be an integer (minutes)')
-        if value < constants.MIN_UPDATE_CHECK_INTERVAL:
-            raise UsageError(f'{key} must be >= '
-                             f'{constants.MIN_UPDATE_CHECK_INTERVAL} minutes')
-    elif key == 'update_check_delay_minutes':
-        try:
-            value = int(raw_value)
-        except ValueError:
-            raise UsageError(f'{key} must be an integer (minutes)')
-        if value < 0:
-            raise UsageError(f'{key} must be >= 0 minutes')
-    else:  # appimages_default_folder
-        value = raw_value.strip()
-        if not value.startswith(('/', '~')):
-            raise UsageError(f'{key} must be an absolute path '
-                             '(starting with / or ~)')
-
-    data = settings.load_settings()
-    data[key] = value
-    settings.save_settings(data)
-
-    if json_output:
-        _print_json({
-            'schema_version': constants.JSON_SCHEMA_VERSION,
-            'result': 'set',
-            'settings': settings.load_settings(),
-        })
-    else:
-        print(f'{key} set to {value}')
-    return EXIT_OK
 
 
 # -------------------------------------------------------------------- entry
