@@ -417,10 +417,15 @@ def cmd_update(args: list) -> int:
                                  json_output=json_output,
                                  assume_yes=assume_yes)
 
-    result = run_update(positional[0], keep_both=keep_both, force=force,
-                        kill_running=kill_running,
-                        confirm_close=_running_app_prompt(json_output,
-                                                          assume_yes))
+    # `run_update` is resolved through the cli facade at CALL time: it is
+    # the tests' patch seam (mock.patch.object(cli, 'run_update')), and
+    # the facade re-export must stay the name the verb dispatches to
+    # (ticket #56).
+    from .. import cli
+    result = cli.run_update(positional[0], keep_both=keep_both, force=force,
+                            kill_running=kill_running,
+                            confirm_close=_running_app_prompt(json_output,
+                                                              assume_yes))
 
     # the record owns the pending verdict (issue #53): the document
     # reports what it says about this app, so it never contradicts the

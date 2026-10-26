@@ -2371,7 +2371,9 @@ Panel {
             onPreviewConfirmed: root.confirmPreview()
             onPreviewDismissed: root.dismissPreview()
             onFieldFocusChanged: function(delta) {
-              root.textFieldFocusCount += delta
+              root.textFieldFocusCount = delta > 0
+                ? root.textFieldFocusCount + delta
+                : Math.max(0, root.textFieldFocusCount + delta)
             }
           }
 
@@ -2503,7 +2505,9 @@ Panel {
                       root.sourceDropdownOpen = open
                     }
                     onFieldFocusChanged: function(delta) {
-                      root.textFieldFocusCount = Math.max(0, root.textFieldFocusCount + delta)
+                      root.textFieldFocusCount = delta > 0
+                        ? root.textFieldFocusCount + delta
+                        : Math.max(0, root.textFieldFocusCount + delta)
                     }
                   }
                 }
