@@ -64,6 +64,7 @@ from .commands.checks import (_check_updates, _merge_updates_state,
                               _update_signature, _update_state_entry,
                               _update_state_signature, cmd_fetch_updates,
                               cmd_list_updates)
+from .commands.exec_scale import cmd_exec_with_scale
 from .commands.settings import (FALSE_WORDS, TRUE_WORDS, _parse_bool_word,
                                 cmd_get_update_source, cmd_list_update_managers,
                                 cmd_pick_file, cmd_set_setting,
@@ -129,6 +130,14 @@ Commands:
                            error, never a hang; with no dialog backend
                            available the result is "unavailable" and the
                            panel keeps the path field
+  --exec-with-scale <i>    Launch the AppImage at <i> with GDK_SCALE set
+                           to the focused monitor's scale factor (a
+                           bounded, best-effort compositor query: when
+                           it cannot answer, the child inherits the
+                           caller's environment unchanged). The image's
+                           arguments follow the path verbatim and never
+                           pass through a shell; the process is replaced
+                           by os.execve, so no wrapper outlives the app
   --settings               Show the current settings
   --set-setting <k>=<v>    Change one setting (e.g.
                            --set-setting update_check_enabled=false)
@@ -171,6 +180,7 @@ COMMANDS = {
     'list-update-managers': cmd_list_update_managers,
     'fetch-updates': cmd_fetch_updates,
     'pick-file': cmd_pick_file,
+    'exec-with-scale': cmd_exec_with_scale,
     'settings': cmd_settings,
     'set-setting': cmd_set_setting,
 }

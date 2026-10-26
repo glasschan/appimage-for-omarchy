@@ -68,6 +68,17 @@ def xdg_state_home() -> str:
     return os.path.join(home_dir(), '.local', 'state')
 
 
+def process_environment() -> dict:
+    """The caller's process environment (`os.environ`) — the launch
+    handover's base map (`--exec-with-scale`, ticket #33): the image is
+    exec'd with the caller's variables, plus GDK_SCALE only when the
+    compositor query proved a different focused-monitor factor. This is
+    a hand-over, never a trust boundary; the gate's env rule stays
+    intact because behaviour is never gated on a read here. Tests patch
+    this seam."""
+    return os.environ
+
+
 def user_applications_dir() -> str:
     return os.path.join(xdg_data_home(), 'applications')
 
