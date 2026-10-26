@@ -137,6 +137,20 @@ Panel {
   property string forceQuitName: ""
   property int forceQuitPids: 0
 
+  // "Update all" consent card (issue #52): one action for every pending
+  // app. The click only OPENS this card — the batch is spawned after the
+  // user accepts it, and dismissing the card starts nothing. The apps are
+  // pinned at open time (id, name, running, running_pids), so a refresh
+  // cannot rewrite what the user is consenting to.
+  property bool updateAllOpen: false
+  property var updateAllApps: []
+  // The card's wording, derived from the pinned app list (the apps it
+  // names and the processes it would close).
+  readonly property var updateAllSummary: Model.updateAllSummary(root.updateAllApps)
+  // The ids whose background job still has to be spawned. The spawn pair
+  // is one-at-a-time, so the queue advances when each spawn answers.
+  property var updateAllQueue: []
+
   // Current Backend.run context (null while idle); the Process and Timer
   // signal handlers feed it back into lib/Backend.js.
   property var runCtx: null
@@ -188,6 +202,10 @@ Panel {
   property string lastError: ""
   property string statusText: ""
   property var unsubscribe: null
+  // The ids of the apps a batch update would touch (mirrored from the
+  // store: the "Update all" action is enabled exactly while at least one
+  // app has a pending release the backend would accept).
+  property var pendingIds: []
 
   // Integrate picker (F2): Quickshell has no FileDialog type (checked
   // against /usr/lib/qt6/qml/Quickshell — no dialog types ship with it),
@@ -325,6 +343,23 @@ Panel {
     return shell || null
   }
 
+  // Assemble one row line's segments into a single StyledText: every
+  // dynamic fragment is escaped (Model.escapeHtml) and the accent
+  // segments carry the accent colour. One bounded, elided Text per line
+  // — a Row of separate Texts has no width bound and painted over the
+  // row's action buttons (v0.9.1).
+  function metaText(segs) {
+    var parts = []
+    for (var i = 0; i < segs.length; i++) {
+      parts.push('<span style="color:'
+        + (segs[i].accent ? Color.accent : root.dim)
+        + '">'
+        + Model.escapeHtml(segs[i].text)
+        + "</span>")
+    }
+    return parts.join(" ")
+  }
+
   function syncFromModel() {
     items = Model.state.items.slice()
     // One snapshot of the operation state (ticket #42): the panel and the
@@ -346,6 +381,9 @@ Panel {
     jobsBusy = Model.anyJobActive()
     lastError = Model.state.lastError
     statusText = Model.state.status
+    // The pending apps a batch update would touch (issue #52): the header
+    // action is enabled exactly while this list is not empty.
+    pendingIds = Model.pendingUpdateIds()
     // A bar-widget drop waits here for an idle store (see
     // tryConsumePendingDrop): every busy flag flip announces itself
     // through changed(), so the sync after the last in-flight call lands
@@ -837,6 +875,10 @@ Panel {
     if (!item || item.id === "") return
     if (root.jobActive(item.id)) return
     if (item.running === true) {
+      // Only one consent card at a time: the row's force-quit card
+      // replaces the batch card (and the other way round), so the
+      // keyboard and the eye never face two asks at once.
+      root.dismissUpdateAll()
       root.forceQuitId = item.id
       root.forceQuitName = item.name !== "" ? item.name : item.id
       root.forceQuitPids = item.runningPids > 0 ? item.runningPids : 0
@@ -862,22 +904,101 @@ Panel {
     root.updateItem({ id: id, name: name }, true)
   }
 
+  // ---- "Update all" (issue #52) --------------------------------------------
+  //
+  // One action for every pending app. The click OPENS the consent card
+  // and starts nothing: the card names the apps it would update and the
+  // processes it would close, and only the explicit accept spawns the
+  // jobs. An app with no pending release is never named and never
+  // closed; an app whose verdict is false (the backend would refuse the
+  // install) is never offered either — Model.pendingUpdateIds applies
+  // the badge's own rule.
+  function requestUpdateAll() {
+    var ids = Model.pendingUpdateIds()
+    if (ids.length === 0) return
+    // Only one consent card at a time (see requestUpdate).
+    root.dismissForceQuit()
+    var apps = []
+    for (var i = 0; i < ids.length; i++) {
+      var item = Model.findItem(ids[i])
+      if (!item) continue
+      apps.push({ id: item.id, name: item.name,
+                  running: item.running === true,
+                  runningPids: item.runningPids > 0 ? item.runningPids : 0 })
+    }
+    if (apps.length === 0) return
+    root.updateAllApps = apps
+    root.updateAllOpen = true
+  }
+
+  // Dismiss: nothing is spawned, nothing is closed.
+  function dismissUpdateAll() {
+    root.updateAllOpen = false
+    root.updateAllApps = []
+    root.updateAllQueue = []
+  }
+
+  // Accept: one background job per app, in the same single-flight spawn
+  // the row's Update button uses (--update --async). The consent card is
+  // the --kill-running grant: the user accepted that running apps are
+  // closed. Each app gets its OWN job, so the backend's per-app claim
+  // still refuses a second update of the same app.
+  function confirmUpdateAll() {
+    if (!root.updateAllOpen) return
+    var apps = root.updateAllApps
+    root.updateAllOpen = false
+    root.updateAllApps = []
+    var queue = []
+    for (var i = 0; i < apps.length; i++) queue.push(apps[i].id)
+    root.updateAllQueue = queue
+    root.pumpUpdateAll()
+  }
+
+  // The spawn pair is one-at-a-time, so the queue advances when a spawn
+  // finishes (updateItem pumps the queue on every exit path). An app that
+  // left the store in the meantime is skipped — the backend refuses an
+  // update that does not exist anyway.
+  function pumpUpdateAll() {
+    if (root.updateAllQueue.length === 0) return
+    if (root.updateSpawnCtx && root.updateSpawnCtx.active === true) return
+    var id = String(root.updateAllQueue.shift())
+    var item = Model.findItem(id)
+    if (!item) {
+      root.pumpUpdateAll()
+      return
+    }
+    root.updateItem(item, true)
+  }
+
   function updateItem(item, killRunning) {
-    if (!item || item.id === "") return
+    // Every exit path pumps the "Update all" queue: the batch advances
+    // one app per finished spawn, and a refused spawn must not stall the
+    // apps behind it.
+    if (!item || item.id === "") {
+      root.pumpUpdateAll()
+      return
+    }
     // Per-app single flight: a row with an active job refuses here (the
     // button is disabled too; the backend refuses a second job for the
     // same app regardless). Other rows are never blocked — different
     // apps update in parallel.
-    if (root.jobActive(item.id)) return
+    if (root.jobActive(item.id)) {
+      root.pumpUpdateAll()
+      return
+    }
     if (backendCommand.length === 0) {
       Model.setError(strings.backendMissing)
       syncFromModel()
+      root.pumpUpdateAll()
       return
     }
     // Single flight on the spawn pair itself: a second --update --async
     // while one spawn is still answering would overwrite updateSpawnCtx
     // and misroute the first reply (same guard as callBackend's).
-    if (root.updateSpawnCtx && root.updateSpawnCtx.active === true) return
+    if (root.updateSpawnCtx && root.updateSpawnCtx.active === true) {
+      root.pumpUpdateAll()
+      return
+    }
     Model.clearError()
     Model.setStatus(Model.formatCount(item.name, strings.updating))
     syncFromModel()
@@ -916,6 +1037,9 @@ Panel {
       // exactly what the row should show.
       root.queueJobRead(item.id)
       root.pumpJobReads()
+      // The spawn pair is free again: the next pending app of an
+      // "Update all" batch may start.
+      root.pumpUpdateAll()
     })
     // A synchronous onDone (no-backend-command) has already finished by
     // the time this line runs; ctx.active is false then, the ctx stays
@@ -2081,8 +2205,11 @@ Panel {
         // back to the picker with zero side effects; a second Esc (no
         // preview showing) closes the panel as before. The force-quit
         // card (ticket #27) outranks both: Esc cancels it, nothing runs.
+        // The "Update all" card (issue #52) is modal in the same way:
+        // Esc dismisses it and no job is spawned.
         onCloseRequested: {
           if (root.forceQuitId !== "") root.dismissForceQuit()
+          else if (root.updateAllOpen) root.dismissUpdateAll()
           else if (root.previewOpen) root.dismissPreview()
           else root.requestClose()
         }
@@ -2090,8 +2217,11 @@ Panel {
         // field holds focus, its own Enter reaches requestPreview through
         // SafeTextField.accepted instead). Confirm on the force-quit card
         // wins over a preview: that card is the later, blocking decision.
+        // The "Update all" card is blocking in the same way: Enter starts
+        // the batch the card names.
         onActivateRequested: {
           if (root.forceQuitId !== "") root.confirmForceQuit()
+          else if (root.updateAllOpen) root.confirmUpdateAll()
           else if (root.previewOpen) root.confirmPreview()
         }
         onTextKey: function(t) {
@@ -2100,8 +2230,9 @@ Panel {
           // keyboard from the moment its call starts until it is confirmed
           // or dismissed (a refresh racing the fetch would only earn the
           // shared-process "busy" banner). The force-quit card is modal in
-          // the same way while it asks.
-          if (root.forceQuitId !== "" || root.previewOpen || root.busyPreview) return
+          // the same way while it asks — and so is the "Update all" card.
+          if (root.forceQuitId !== "" || root.updateAllOpen
+              || root.previewOpen || root.busyPreview) return
           if (t === "r" || t === "R") root.refresh()
           else if (t === "i" || t === "I") root.integrateRequested()
           else if (t === "u" || t === "U") root.checkUpdates()
@@ -2254,6 +2385,47 @@ Panel {
                 }
 
                 onClicked: root.checkUpdates()
+              }
+
+              // "Update all" (issue #52): one action for every pending
+              // app, next to the check-updates action and reusing the
+              // row's arrow-up icon. The click only OPENS the consent
+              // card — nothing is spawned until the user accepts it. The
+              // button is enabled exactly while at least one app has a
+              // pending release the backend would accept.
+              Button {
+                id: updateAllButton
+                text: ""
+                enabled: root.pendingIds.length > 0
+                anchors.verticalCenter: parent.verticalCenter
+                foreground: root.foreground
+                accent: Color.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                implicitHeight: root.controlHeight
+                tooltipText: root.strings.updateAllTooltip
+                implicitWidth: updateAllRow.implicitWidth
+                  + updateAllButton.horizontalPadding * 2
+                  + updateAllButton._reservedBorderLeft
+                  + updateAllButton._reservedBorderRight
+
+                Row {
+                  id: updateAllRow
+                  anchors.centerIn: parent
+                  spacing: Style.spacing.xs
+
+                  ThemeIcon {
+                    name: "arrow-up"
+                    size: Style.font.icon
+                    strokeWidth: 1.75
+                    color: updateAllButton.enabled
+                      ? updateAllButton.foreground
+                      : root.dim
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                onClicked: root.requestUpdateAll()
               }
 
               // Pin toggle: flips the overlay into a compact floating
@@ -2441,6 +2613,90 @@ Panel {
 
               Text {
                 text: root.strings.forceQuitKeysHint
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          // ---- "Update all" consent card (issue #52) -------------------
+          // Opened by the header's Update-all action; it starts NOTHING
+          // by itself. The card names the apps the batch would update and
+          // the processes it would close (the listing's `running_pids`;
+          // a count that is not determinable keeps the count-free
+          // sentence). Enter confirms, Esc cancels (PanelKeyCatcher
+          // wiring above); Cancel spawns nothing and closes no app.
+          BorderSurface {
+            id: updateAllCard
+            width: parent.width
+            visible: root.updateAllOpen
+            implicitHeight: visible ? updateAllCol.implicitHeight + Style.spacing.sm * 2 : 0
+            color: Util.alpha(root.urgent, 0.09)
+            borderSpec: Border.flat(Util.alpha(root.urgent, 0.45), Math.max(1, Style.normalBorderWidth))
+            radius: Style.cornerRadius
+
+            Column {
+              id: updateAllCol
+              width: parent.width - Style.spacing.sm * 2
+              anchors.centerIn: parent
+              spacing: Style.spacing.xs
+
+              Text {
+                text: root.strings.updateAllTitle
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+
+              Text {
+                text: root.updateAllSummary.appsLine
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+                width: parent.width
+              }
+
+              Text {
+                text: root.updateAllSummary.processLine
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+                width: parent.width
+              }
+
+              Row {
+                spacing: Style.spacing.xs
+
+                Button {
+                  text: root.strings.updateAllConfirm
+                  // The card can outlive a slow spawn: never stack a
+                  // second job for an app that is already updating.
+                  enabled: root.pendingIds.length > 0
+                  foreground: root.foreground
+                  accent: root.urgent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  implicitHeight: root.controlHeight
+                  onClicked: root.confirmUpdateAll()
+                }
+
+                Button {
+                  text: root.strings.pickerCancel
+                  foreground: root.foreground
+                  accent: Color.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  implicitHeight: root.controlHeight
+                  onClicked: root.dismissUpdateAll()
+                }
+              }
+
+              Text {
+                text: root.strings.updateAllKeysHint
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -3015,14 +3271,11 @@ Panel {
                               width: parent.width
                             }
 
-                            // Row meta as ONE bounded line: version ·
-                            // running · pending release · live progress.
-                            // Separate Texts in a Row painted over the
-                            // action buttons as soon as the fragments got
-                            // long (a version plus a pending release plus
-                            // a byte-pair progress label), so the segments
-                            // are colour-spanned into a single elided
-                            // StyledText instead.
+                            // The row's IDENTITY line: the version and the
+                            // running dot. ONE bounded, elided Text —
+                            // separate Texts in a Row have no width bound
+                            // and painted over the action buttons as soon
+                            // as the fragments got long (v0.9.1).
                             Text {
                               width: parent.width
                               visible: text !== ""
@@ -3031,22 +3284,29 @@ Panel {
                               color: root.dim
                               font.family: root.fontFamily
                               font.pixelSize: Style.font.caption
-                              text: {
-                                var segs = Model.rowMeta(
-                                  rowOuter.modelData,
-                                  root.jobActive(rowOuter.modelData.id)
-                                    ? root.jobProgressLabel(rowOuter.modelData.id)
-                                    : "")
-                                var parts = []
-                                for (var i = 0; i < segs.length; i++) {
-                                  parts.push('<span style="color:'
-                                    + (segs[i].accent ? Color.accent : root.dim)
-                                    + '">'
-                                    + Model.escapeHtml(segs[i].text)
-                                    + "</span>")
-                                }
-                                return parts.join(" ")
-                              }
+                              text: root.metaText(
+                                Model.rowIdentityMeta(rowOuter.modelData))
+                            }
+
+                            // The row's STATUS line: the pending release
+                            // (or "cannot verify") and the live job
+                            // progress. It has its own line so the update
+                            // status never reads as part of the version
+                            // (issue #51) — and it stays ONE bounded,
+                            // elided Text, never a Row of Texts.
+                            Text {
+                              width: parent.width
+                              visible: text !== ""
+                              textFormat: Text.StyledText
+                              elide: Text.ElideRight
+                              color: root.dim
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                              text: root.metaText(Model.rowStatusMeta(
+                                rowOuter.modelData,
+                                root.jobActive(rowOuter.modelData.id)
+                                  ? root.jobProgressLabel(rowOuter.modelData.id)
+                                  : ""))
                             }
 
                             // F9: configured update source under the row's meta.
@@ -3101,11 +3361,17 @@ Panel {
                             // document, not a click.
                             PanelActionButton {
                               id: updateButton
+                              // The button appears exactly when the row's
+                              // pending verdict says a newer release is
+                              // known (issue #50: the listing's
+                              // pending_update) — the same rule the badge
+                              // counts on, so the marker, the badge and
+                              // this button always agree.
                               // A source that cannot prove its artifact
                               // (ticket #39) offers no update action: the
                               // backend would refuse the install, so the row
                               // shows "cannot verify" instead.
-                              visible: rowOuter.modelData.updateVersion !== ""
+                              visible: rowOuter.modelData.hasUpdate === true
                                 && rowOuter.modelData.installable !== false
                               enabled: !root.jobActive(rowOuter.modelData.id)
                               tooltipText: root.strings.updateAction

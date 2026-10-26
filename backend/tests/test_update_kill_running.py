@@ -642,8 +642,13 @@ class RunningGuardCliTests(_RunningAppTestCase):
     def _install(manager, el, keep_both=False, progress_cb=None,
                  before_replace=None):
         # the seam is not exercised here (RunUpdateKillTests owns it): the
-        # job-start guard is what these tests are about
-        return mock.Mock(version='v2.0', size=11)
+        # job-start guard is what these tests are about. The returned
+        # element is read for its identity by the state record (issue
+        # #53), so it carries the real attributes a real install element
+        # has — a Mock's auto-created ones are truthy non-paths.
+        return mock.Mock(version='v2.0', size=11,
+                         file_path='/tmp/fakeapp.appimage',
+                         desktop_file_path='/tmp/fakeapp.desktop')
 
     def _run(self, args, tty, answer=None, runner=None):
         runner = runner or (lambda: self.run_cmd(cli.cmd_update, args))

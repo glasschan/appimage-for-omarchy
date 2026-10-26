@@ -349,3 +349,46 @@ class SvgEncodingTests(unittest.TestCase):
                 b'height="16"><rect width="16" height="16" fill="#000"/>'
                 b'</svg>')
         self.assertIsNotNone(icon.sanitize_icon(data, 'image/svg+xml'))
+
+
+class InstalledIconFormatTests(unittest.TestCase):
+    """The format of a retained icon: the file name decides, because the
+    shell probes the extension; the content decides when the name says
+    nothing."""
+
+    def test_the_extension_decides_the_format(self):
+        self.assertEqual(icon.installed_icon_format('app.png', b''),
+                         'image/png')
+        self.assertEqual(icon.installed_icon_format('app.svg', b''),
+                         'image/svg+xml')
+        self.assertEqual(icon.installed_icon_format('app.PNG', b''),
+                         'image/png')
+
+    def test_the_content_decides_when_the_name_says_nothing(self):
+        self.assertEqual(icon.installed_icon_format('app', build_png(8, 8)),
+                         'image/png')
+        self.assertIsNone(icon.installed_icon_format('app', b'not an image'))
+        self.assertIsNone(icon.installed_icon_format('app.txt', b'x' * 16))
+
+    def test_a_named_file_is_judged_as_its_name_claims(self):
+        # the shell decodes <stem>.png as a PNG whatever the bytes say,
+        # so the name decides and a mismatch is refused, never re-typed
+        svg = (b'<svg xmlns="http://www.w3.org/2000/svg" width="16" '
+               b'height="16"/>')
+        self.assertIsNone(icon.sanitize_icon(svg, 'image/png'))
+
+
+class SanitizeFixedPointTests(unittest.TestCase):
+    """The sanitiser is a fixed point: sanitising an already-sanitised
+    file returns it unchanged. That is what lets the sweep compare the
+    bytes and leave a clean icon alone instead of rewriting it."""
+
+    def test_png_is_unchanged_by_a_second_pass(self):
+        once = icon.sanitize_icon(build_png(8, 8), 'image/png')
+        self.assertIsNotNone(once)
+        self.assertEqual(icon.sanitize_icon(once, 'image/png'), once)
+
+    def test_svg_is_unchanged_by_a_second_pass(self):
+        svg = (b'<svg xmlns="http://www.w3.org/2000/svg" width="16" '
+               b'height="16"/>')
+        self.assertEqual(icon.sanitize_icon(svg, 'image/svg+xml'), svg)

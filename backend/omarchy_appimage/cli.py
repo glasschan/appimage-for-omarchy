@@ -191,7 +191,8 @@ def _running_pid_count(el, probe=None) -> int:
         return 0
 
 
-def _make_app_json(el, manager=None, running=None, probe=None) -> dict:
+def _make_app_json(el, manager=None, running=None, probe=None,
+                   pending=None) -> dict:
     if running is None:
         try:
             # `probe` is the listing's ONE cached scan: asking the question
@@ -227,6 +228,17 @@ def _make_app_json(el, manager=None, running=None, probe=None) -> dict:
         # the desktop entry's Exec arguments (field codes stay VERBATIM —
         # the UI strips them), "" when the app has none
         'exec_arguments': getattr(el, 'exec_arguments', '') or '',
+        # additive (schema_version stays 1), issue #53: the verdict the
+        # last check recorded for this app. `pending` is the record's own
+        # entry for this app (None when the record has none): an entry
+        # means a pending release is known, and it carries the version
+        # that check found and whether that release could be installed.
+        # The record is the backend's memory, so the listing reports the
+        # same verdict on every poll without checking the network again.
+        'pending_update': pending is not None,
+        'pending_version': (_update_state_version(pending) or None)
+        if pending is not None else None,
+        'pending_installable': _update_state_installable(pending),
     }
 
 
@@ -350,20 +362,24 @@ def _update_signature(manager) -> str:
 
 
 def _update_state_entry(manager) -> dict:
-    """One app's remembered check result (issue #39/#43): the signature
+    """One app's remembered check result (issue #39/#43/#53): the signature
     that drives notifications, the installability verdict so a later
-    listing can warn about an update that cannot be installed, and the
+    listing can warn about an update that cannot be installed, the
     AppImage path so a later sweep can tell "this app is gone" from "this
     sweep could not list it" — the listing silently skips an app whose
     desktop entry is momentarily unreadable (VS Code forks rewrite their
     own entry on first launch), and forgetting its signature would
-    re-notify for a release already seen."""
+    re-notify for a release already seen — and the pending release version
+    so the listing can name what it waits for."""
     entry = {'signature': _update_signature(manager),
              'installable': manager.installable()}
     el = getattr(manager, 'el', None)
     path = getattr(el, 'file_path', '') or ''
     if path:
         entry['path'] = path
+    # the version the source named ('' when it names none): the record
+    # says a release is pending, and this says which one
+    entry['version'] = str(manager.available_version or '')
     return entry
 
 
@@ -375,6 +391,32 @@ def _update_state_signature(entry):
     if isinstance(entry, dict):
         return str(entry.get('signature', ''))
     return str(entry or '')
+
+
+def _update_state_version(entry) -> str:
+    """The pending release version out of a stored entry ('' if unknown).
+
+    A legacy plain-signature entry names no version at all, so it reads as
+    '' — the same as a source that offers a release without naming it."""
+    if isinstance(entry, dict):
+        return str(entry.get('version') or '')
+    return ''
+
+
+def _update_state_installable(entry):
+    """The installability verdict out of a stored entry (None if it has none).
+
+    A legacy plain-signature entry carries no verdict, so it reads as None:
+    "unknown", never a promise that the pending release can be installed.
+    Only a real boolean passes through — the same normalisation the app
+    object's own `installable` gets, so a hand-edited or corrupt record
+    (a string like "false", a number, a list) can never reach the panel as
+    "this can be installed"."""
+    if isinstance(entry, dict):
+        value = entry.get('installable')
+        if isinstance(value, bool):
+            return value
+    return None
 
 
 # ----------------------------------------------------------------- commands
@@ -1024,6 +1066,10 @@ def cmd_list_installed(args: list) -> int:
     scan = procs._cached_probe()
 
     if json_output:
+        # The remembered verdict of the last check (issue #53): read ONCE
+        # for the whole listing (the panel polls this every 10 s) and
+        # matched per app by the record's own key.
+        state = settings.load_updates_state()
         table = []
         for a in apps:
             # check_url_for_app is local-only (apps.ini config + the
@@ -1032,7 +1078,7 @@ def cmd_list_installed(args: list) -> int:
             # stay null until an actual check runs (--list-updates).
             table.append(_make_app_json(
                 a, manager=UpdateManagerChecker.check_url_for_app(a),
-                probe=scan))
+                probe=scan, pending=state.get(_updates_state_key(a))))
         _print_json({
             'schema_version': constants.JSON_SCHEMA_VERSION,
             'installed': table,
@@ -1127,21 +1173,56 @@ def cmd_remove(args: list) -> int:
 
 # ------------------------------------------------------- update commands
 
-def _check_updates():
-    """All installed apps that have an update source and report an update
-    (manager.is_update_available() is True), as (element, manager) pairs,
-    plus the state keys of every installed app the walk saw.
+def _source_was_consulted(manager) -> bool:
+    """Did the check actually reach the source?
 
-    Ported from the check loop of upstream Cli.list_updates: apps without
-    a source are skipped and per-app errors are logged and skipped so one
-    broken source cannot hide the others. Callers decide on connectivity
-    first (net.check_internet)."""
-    updates = []
+    A False verdict means "no newer release" only when the source could
+    be consulted. A plain-URL static source answers False when its remote
+    size is unknown — the source could not be reached — and that is not
+    the same answer as "the installed file is the newest one". Reading
+    such a False as a definite verdict would retire a pending release
+    nobody ever looked at, and the pending state would keep appearing
+    and disappearing (issue #43).
+
+    The evidence is what the source told us: the release it offers
+    (available_version) or that release's size (download_size), or a
+    digest-backed comparison (a zsync source compares the publisher's
+    control file with the installed file before it answers False)."""
+    try:
+        if manager.available_version is not None:
+            return True
+        if manager.download_size is not None:
+            return True
+        return manager.verification_method() == 'zsync-sha1'
+    except Exception:
+        logging.exception('could not read the update source state')
+        return False
+
+
+def _check_updates():
+    """Every installed app's update verdict, plus the state keys of every
+    installed app the walk saw.
+
+    Each app's outcome is one of:
+      'update'  — the source reported a newer release;
+      'current' — the source reported that there is no newer release
+                  (an app with no update source at all is current: there
+                  is nothing to wait for);
+      'unknown' — the verdict is not determinable (the check raised, it
+                  answered None, or the source could not be consulted).
+
+    Returned as (element, manager, outcome) triples; `manager` is None
+    for an app without an update source. Ported from the check loop of
+    upstream Cli.list_updates: per-app errors are logged and skipped so
+    one broken source cannot hide the others. Callers decide on
+    connectivity first (net.check_internet)."""
+    outcomes = []
     installed_keys = set()
     for el in appimage_provider.list_installed():
         installed_keys.add(_updates_state_key(el))
         manager = UpdateManagerChecker.check_url_for_app(el)
         if not manager:
+            outcomes.append((el, None, 'current'))
             continue
 
         logging.debug('checking app %s with %s', el.file_path, manager.name)
@@ -1149,14 +1230,82 @@ def _check_updates():
             status = manager.is_update_available()
         except Exception:
             logging.exception('update check failed for %s', el.file_path)
+            outcomes.append((el, manager, 'unknown'))
             continue
 
         # tri-state: only a definite True counts (None = not determinable)
         if status is True:
             # a verdict exists, so installability is reportable (#39)
             manager.checked = True
-            updates.append((el, manager))
-    return updates, installed_keys
+            outcomes.append((el, manager, 'update'))
+        elif status is False and _source_was_consulted(manager):
+            outcomes.append((el, manager, 'current'))
+        else:
+            outcomes.append((el, manager, 'unknown'))
+    return outcomes, installed_keys
+
+
+def _merge_updates_state(state: dict, outcomes: list,
+                          installed_keys: set) -> dict:
+    """The record after a check walk (issue #43/#53).
+
+    MERGE, never replace: an app the walk did not see keeps its entry
+    while the file it names still exists (the listing silently skips an
+    app whose desktop entry is momentarily unreadable — an invisible app
+    is not an uninstalled one), and an app whose verdict was not
+    determinable keeps what the last successful check learned. Only a
+    definite verdict changes the record: a newer release writes a fresh
+    entry, "no newer release" retires it."""
+    remembered = {}
+    for key, value in state.items():
+        if key in installed_keys:
+            continue
+        # Not listed: keep the entry while the file it names still exists
+        path = value.get('path', '') if isinstance(value, dict) else ''
+        if path and os.path.exists(path):
+            remembered[key] = value
+    for el, manager, outcome in outcomes:
+        key = _updates_state_key(el)
+        if outcome == 'update':
+            remembered[key] = _update_state_entry(manager)
+        elif outcome == 'current':
+            remembered.pop(key, None)
+        elif key in state:
+            # the verdict was not determinable: keep what the last
+            # successful check learned (issue #43)
+            remembered[key] = state[key]
+    return remembered
+
+
+def _save_updates_state(state: dict) -> bool:
+    """Write the update record. Never fatal: a failed write is logged and
+    the caller decides what a stale record means (a sweep still exits 0)."""
+    try:
+        settings.save_updates_state(state)
+        return True
+    except Exception as e:
+        logging.warning('saving updates state failed: %s', e)
+        return False
+
+
+def _retire_update_verdict(el):
+    """Drop this app's pending verdict from the record (issue #50).
+
+    The record owns the notification marker, the badge count and the
+    Update button, so deleting the entry is what makes the pending state
+    settle. Called when the truth moved: the update was applied, or the
+    update pipeline's own availability check found nothing newer to
+    install. Best-effort — a failed write only leaves a stale marker for
+    the next check to clear."""
+    try:
+        state = settings.load_updates_state()
+        key = _updates_state_key(el)
+        if key not in state:
+            return
+        del state[key]
+        settings.save_updates_state(state)
+    except Exception as e:
+        logging.warning('could not retire the pending verdict: %s', e)
 
 
 def cmd_list_updates(args: list) -> int:
@@ -1174,14 +1323,26 @@ def cmd_list_updates(args: list) -> int:
             print('Internet connection not available', file=sys.stderr)
         return EXIT_ERROR
 
-    updates, _ = _check_updates()
+    outcomes, installed_keys = _check_updates()
+    updates = [(el, manager) for el, manager, outcome in outcomes
+               if outcome == 'update']
+
+    # The record is the backend's memory of the last verdict (issue
+    # #53): both check verbs write it, so a later listing reports the
+    # pending release without asking the network again. A failed write
+    # is logged, never fatal — this verb keeps its exit codes.
+    state = settings.load_updates_state()
+    remembered = _merge_updates_state(state, outcomes, installed_keys)
+    _save_updates_state(remembered)
 
     if json_output:
         scan = procs._cached_probe()
         _print_json({
             'schema_version': constants.JSON_SCHEMA_VERSION,
-            'updates': [_make_app_json(el, manager=manager, probe=scan)
-                        for el, manager in updates],
+            'updates': [_make_app_json(
+                el, manager=manager, probe=scan,
+                pending=remembered.get(_updates_state_key(el)))
+                for el, manager in updates],
         })
         return EXIT_OK
 
@@ -1497,6 +1658,11 @@ def _run_update_body(target: str, keep_both: bool = False,
                          'place'))
         raise
     if available is False:
+        # the pipeline's own availability check just proved there is
+        # nothing newer to install, so the pinned pending verdict is
+        # stale: retire it here rather than waiting for the next sweep
+        # (issue #50 — a definite verdict changes the record)
+        _retire_update_verdict(el)
         return UpdateResult(status='up-to-date', el=el, manager=manager)
 
     if running:
@@ -1556,13 +1722,12 @@ def _run_update_body(target: str, keep_both: bool = False,
             if path not in temp_dirs_before:
                 extractor.remove_temp_dir(path)
 
-    # the update was applied: drop the pending-notification marker so the
-    # next --fetch-updates does not re-notify for the (now installed) release
-    state = settings.load_updates_state()
-    key = _updates_state_key(el)
-    if key in state:
-        del state[key]
-        settings.save_updates_state(state)
+    # the update was applied: retire the app's pending verdict (issue
+    # #50). The one record owns the notification marker, the badge count
+    # and the Update button, so dropping the entry is what makes the
+    # pending state settle — and it keeps the next --fetch-updates from
+    # re-notifying for the (now installed) release
+    _retire_update_verdict(el)
 
     return UpdateResult(
         status='updated', el=new_el, manager=manager,
@@ -1610,13 +1775,21 @@ def cmd_update(args: list) -> int:
                         confirm_close=_running_app_prompt(json_output,
                                                           assume_yes))
 
+    # the record owns the pending verdict (issue #53): the document
+    # reports what it says about this app, so it never contradicts the
+    # listing (a successful update retired the entry, so it reads as no
+    # pending release)
+    pending = settings.load_updates_state().get(
+        _updates_state_key(result.el))
+
     if result.status == 'skipped-running':
         if json_output:
             _print_json({
                 'schema_version': constants.JSON_SCHEMA_VERSION,
                 'result': 'skipped-running',
                 'message': result.message,
-                'app': _make_app_json(result.el, manager=result.manager),
+                'app': _make_app_json(result.el, manager=result.manager,
+                                     pending=pending),
             })
         else:
             print(result.message)
@@ -1627,7 +1800,8 @@ def cmd_update(args: list) -> int:
             _print_json({
                 'schema_version': constants.JSON_SCHEMA_VERSION,
                 'result': 'up-to-date',
-                'app': _make_app_json(result.el, manager=result.manager),
+                'app': _make_app_json(result.el, manager=result.manager,
+                                     pending=pending),
             })
         else:
             print(f'{result.el.file_path} is up to date')
@@ -1644,7 +1818,8 @@ def cmd_update(args: list) -> int:
             'schema_version': constants.JSON_SCHEMA_VERSION,
             'result': 'updated',
             'message': result.message,
-            'app': _make_app_json(result.el, manager=result.manager),
+            'app': _make_app_json(result.el, manager=result.manager,
+                                     pending=pending),
             'downloaded_bytes': result.downloaded_bytes,
         })
     else:
@@ -2139,57 +2314,51 @@ def cmd_fetch_updates(args: list) -> int:
             print('Internet connection not available', file=sys.stderr)
         return EXIT_OK
 
-    updates, installed_keys = _check_updates()
+    outcomes, installed_keys = _check_updates()
+    updates = [(el, manager) for el, manager, outcome in outcomes
+               if outcome == 'update']
 
     state = settings.load_updates_state()
     new_updates = [(el, manager) for el, manager in updates
                    if _update_signature(manager)
                    != _update_state_signature(state.get(_updates_state_key(el)))]
 
+    # The record is written BEFORE the announcement (issue #53): the
+    # announcement says "this release is new to you", and it can only be
+    # said once the release has been recorded. A failed write means this
+    # sweep learned nothing durable, so nothing is announced — until now
+    # the announcement came first and the failed write left the old
+    # record behind, so the NEXT sweep announced the same release again.
+    # A state-file failure must not turn a successful sweep into a failed
+    # exit (CONTRACT.md: --fetch-updates always exits 0).
+    remembered = _merge_updates_state(state, outcomes, installed_keys)
+    written = _save_updates_state(remembered)
+
     notified = False
     if new_updates:
-        body = (f'{len(new_updates)} update(s) available — click the '
-                'AppImage icon in the bar.')
-        try:
-            result = run_command(
-                ['notify-send', '-a', constants.APP_NAME,
-                 '--expire-time=5000', 'AppImage updates available', body],
-                check=False)
-            notified = result.returncode == 0
-        except Exception as e:
-            logging.warning('notify-send failed: %s', e)
-
-    # Remember every currently-available signature (new or not) so
-    # unchanged updates do not re-notify on the next run. MERGE, do not
-    # replace (issue #43): a sweep that cannot see an app — network error,
-    # source temporarily unreachable, a check that raised — must not erase
-    # what the previous run learned about it. Entries for apps that are no
-    # longer installed are dropped, so the map cannot grow forever. A
-    # state-file failure must not turn a successful sweep into a failed exit
-    # (CONTRACT.md: --fetch-updates always exits 0).
-    remembered = {}
-    for key, value in state.items():
-        if key in installed_keys:
-            remembered[key] = value
-            continue
-        # Not listed: keep the entry while the file it names still exists —
-        # an invisible app is not an uninstalled one, and dropping it would
-        # re-notify for a release this plugin already saw.
-        path = value.get('path', '') if isinstance(value, dict) else ''
-        if path and os.path.exists(path):
-            remembered[key] = value
-    for el, manager in updates:
-        remembered[_updates_state_key(el)] = _update_state_entry(manager)
-    try:
-        settings.save_updates_state(remembered)
-    except OSError as e:
-        logging.warning('saving updates state failed: %s', e)
+        if not written:
+            logging.warning('not announcing the updates: the update record '
+                            'could not be written')
+        else:
+            body = (f'{len(new_updates)} update(s) available — click the '
+                    'AppImage icon in the bar.')
+            try:
+                result = run_command(
+                    ['notify-send', '-a', constants.APP_NAME,
+                     '--expire-time=5000', 'AppImage updates available',
+                     body],
+                    check=False)
+                notified = result.returncode == 0
+            except Exception as e:
+                logging.warning('notify-send failed: %s', e)
 
     if json_output:
         _print_json({
             'schema_version': constants.JSON_SCHEMA_VERSION,
-            'updates': [_make_app_json(el, manager=manager)
-                        for el, manager in updates],
+            'updates': [_make_app_json(
+                el, manager=manager,
+                pending=remembered.get(_updates_state_key(el)))
+                for el, manager in updates],
             'notified': notified,
             'offline': False,
         })

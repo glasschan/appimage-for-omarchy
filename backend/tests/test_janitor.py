@@ -12,7 +12,6 @@
 import json
 import os
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
@@ -25,8 +24,9 @@ from unittest import mock
 import helpers
 from helpers import FakeXDGTestCase
 from test_cli import InProcessCliMixin
+from test_icon import build_png, chunk_types
 
-from omarchy_appimage import cli, icon, janitor, jobs
+from omarchy_appimage import cli, extractor, icon, janitor, jobs
 
 WINDOW = janitor.JOB_ACK_WINDOW_SECONDS
 GRACE = janitor.UPDATE_TEMP_GRACE_SECONDS
@@ -448,9 +448,12 @@ class IconSweepTests(unittest.TestCase):
     """The on-disk backstop for icons installed before the sanitiser.
 
     sanitize_icon() runs at extract time only, so a `.icons/<stem>.png`
-    written by an older plugin version is otherwise decoded by Panel.qml on
-    every panel open with no bound at all. The sweep is header-only: a PNG
-    is judged from its IHDR, an SVG from its size.
+    written by an older plugin version is otherwise decoded by Panel.qml
+    on every panel open with no bound at all. The sweep therefore runs the
+    FULL sanitiser over the retained icons: what the sanitiser rewrites is
+    rewritten, what it refuses is removed. The header-only backstop it
+    replaced could only read the IHDR, so a small-dimension icon full of
+    inflated metadata passed it and was decoded unbounded.
     """
 
     def setUp(self):
@@ -463,16 +466,52 @@ class IconSweepTests(unittest.TestCase):
             handle.write(data)
         return path
 
-    def _png(self, width, height):
-        ihdr = struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)
-        return (b'\x89PNG\r\n\x1a\n'
-                + struct.pack('>I', 13) + b'IHDR' + ihdr
-                + struct.pack('>I', zlib.crc32(b'IHDR' + ihdr) & 0xFFFFFFFF))
+    def _read(self, path):
+        with open(path, 'rb') as handle:
+            return handle.read()
 
-    def test_oversized_png_is_removed(self):
-        bomb = self._write('bomb.png', self._png(60000, 60000))
+    def _hostile_svg(self):
+        return (b'<svg xmlns="http://www.w3.org/2000/svg" '
+                b'xmlns:xlink="http://www.w3.org/1999/xlink" '
+                b'width="16" height="16">'
+                b'<image width="16" height="16" '
+                b'xlink:href="data:image/png;base64,AAAA"/></svg>')
+
+    def _png_with_metadata(self):
+        # a small frame whose metadata chunk inflates to a megabyte: the
+        # amplification a header-only check cannot see
+        bomb = zlib.compress(b'A' * (1024 * 1024), 9)
+        return build_png(8, 8, extra=[(b'zTXt', b'Comment\x00\x00' + bomb)])
+
+    def test_retained_png_with_metadata_is_rewritten(self):
+        path = self._write('retained.png', self._png_with_metadata())
+
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 0)
+
+        self.assertTrue(os.path.exists(path))
+        rewritten = self._read(path)
+        self.assertNotIn(b'zTXt', rewritten)
+        self.assertEqual(chunk_types(rewritten), [b'IHDR', b'IDAT', b'IEND'])
+        # the rewritten file is still a PNG the sanitiser accepts
+        self.assertTrue(rewritten.startswith(b'\x89PNG\r\n\x1a\n'))
+        self.assertEqual(icon.sanitize_icon(rewritten, 'image/png'),
+                         rewritten)
+
+    def test_retained_hostile_svg_is_removed(self):
+        path = self._write('hostile.svg', self._hostile_svg())
+
         self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 1)
-        self.assertFalse(os.path.exists(bomb))
+
+        self.assertFalse(os.path.exists(path))
+
+    def test_oversized_icon_is_removed(self):
+        # past the extractor's stored-byte cap: not worth sanitising
+        path = self._write('big.png',
+                           b'\x00' * (extractor.MAX_ICON_BYTES + 1))
+
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 1)
+
+        self.assertFalse(os.path.exists(path))
 
     def test_oversized_svg_is_removed(self):
         big = self._write('big.svg',
@@ -480,21 +519,79 @@ class IconSweepTests(unittest.TestCase):
         self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 1)
         self.assertFalse(os.path.exists(big))
 
-    def test_bounded_icons_survive(self):
-        small = self._write('ok.png', self._png(512, 512))
-        svg = self._write('ok.svg', b'<svg width="16" height="16"/>')
-        other = self._write('notes.txt', b'x' * 4096)
-        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 0)
-        for path in (small, svg, other):
-            self.assertTrue(os.path.exists(path))
-
     def test_symlink_is_never_followed_or_removed(self):
-        target = self._write('real.png', self._png(60000, 60000))
+        outside = tempfile.mkdtemp(prefix='icons-outside-')
+        self.addCleanup(shutil.rmtree, outside, True)
+        target = os.path.join(outside, 'target.png')
+        with open(target, 'wb') as handle:
+            handle.write(b'not an icon')
         link = os.path.join(self.icons, 'link.png')
         os.symlink(target, link)
-        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 1)
-        self.assertFalse(os.path.exists(target))
+
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 0)
+
         self.assertTrue(os.path.islink(link))
+        # the target is outside the folder: it is neither read nor removed
+        self.assertEqual(self._read(target), b'not an icon')
+
+    def test_garbage_file_is_removed_and_the_sweep_survives(self):
+        junk = self._write('junk.png', b'not an icon at all')
+        fifo = os.path.join(self.icons, 'pipe.png')
+        os.mkfifo(fifo)
+
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 1)
+
+        self.assertFalse(os.path.exists(junk))
+        self.assertTrue(os.path.exists(fifo))
+
+    @unittest.skipIf(os.geteuid() == 0, 'root reads every file')
+    def test_unreadable_icon_is_removed_and_the_sweep_survives(self):
+        path = self._write('secret.png', build_png(8, 8))
+        os.chmod(path, 0o000)
+        self.addCleanup(
+            lambda: os.path.exists(path) and os.chmod(path, 0o644))
+
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 1)
+
+        self.assertFalse(os.path.exists(path))
+
+    def test_already_sanitised_icon_is_left_unchanged(self):
+        data = build_png(8, 8)
+        path = self._write('clean.png', data)
+        before = os.stat(path)
+
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 0)
+
+        after = os.stat(path)
+        self.assertEqual(self._read(path), data)
+        # the same inode and the same mtime: the file was not rewritten
+        self.assertEqual(after.st_ino, before.st_ino)
+        self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+
+    def test_valid_svg_survives_unchanged(self):
+        svg = (b'<svg xmlns="http://www.w3.org/2000/svg" width="16" '
+               b'height="16"><rect width="16" height="16"/></svg>')
+        path = self._write('ok.svg', svg)
+        before = os.stat(path)
+
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 0)
+
+        self.assertEqual(self._read(path), svg)
+        self.assertEqual(os.stat(path).st_ino, before.st_ino)
+
+    def test_extensionless_png_is_detected_by_its_content(self):
+        path = self._write('noext', self._png_with_metadata())
+
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 0)
+
+        self.assertNotIn(b'zTXt', self._read(path))
+
+    def test_unknown_file_type_is_removed(self):
+        # nothing decodes it, and the sanitiser has no format to work
+        # with: it cannot be made safe, so it goes
+        other = self._write('notes.txt', b'x' * 4096)
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons), 1)
+        self.assertFalse(os.path.exists(other))
 
     def test_missing_directory_is_a_no_op(self):
         self.assertEqual(janitor.sweep_icons(

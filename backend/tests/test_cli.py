@@ -101,7 +101,8 @@ class OfflineCliTests(FakeXDGTestCase):
             'name', 'path', 'desktop_id', 'current_version',
             'available_version', 'download_size', 'manager',
             'embedded_source', 'running', 'running_pids', 'exec_arguments',
-            'verification', 'installable'})
+            'verification', 'installable',
+            'pending_update', 'pending_version', 'pending_installable'})
         self.assertEqual(app['name'], 'Fake App')
         self.assertEqual(app['path'], appimage)
         self.assertEqual(app['desktop_id'], 'fakeapp.desktop')

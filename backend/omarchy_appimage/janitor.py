@@ -16,6 +16,7 @@
 # removals are capped per sweep, and the entrypoints never raise — a
 # sweep failure must never fail --list-installed or a job start.
 
+import errno
 import json
 import logging
 import os
@@ -24,7 +25,7 @@ import stat
 import tempfile
 import time
 
-from . import constants, icon, jobs, utils
+from . import constants, extractor, icon, jobs, utils
 
 # A terminal (done|error) or interrupted document is removed — together
 # with its per-job log — once this window has passed since its last
@@ -71,6 +72,12 @@ UPDATE_TEMP_PREFIXES = ('appimage-update-', INTEGRATE_TEMP_PREFIX)
 # Hard bounds per sweep: the scans stop after this many removals, so a
 # pathological state/temp dir cannot make --list-installed slow.
 MAX_REMOVALS_PER_SWEEP = 200
+
+# The prefix of the temporary file the icon sweep writes before it
+# renames the sanitised bytes over the old icon. It is hidden (the
+# sweep skips hidden names) and lives in the icons folder itself,
+# because os.replace is only atomic within one filesystem.
+ICON_TMP_PREFIX = '.icon-sweep-'
 
 
 def sweep_job_documents(now: float = None) -> int:
@@ -175,16 +182,32 @@ def sweep_update_temp_dirs(now: float = None,
 
 
 def sweep_icons(icons_dir: str = None) -> int:
-    """Remove installed icons the shell's decoder must not be handed.
+    """Make the retained icons safe to decode: sanitise them or remove them.
 
     The v0.9.9 sanitiser gates the EXTRACT path only, and provider.py
-    unlinks the icons of the stem it replaces; an icon written by an older
-    plugin version (an 8000x8000 PNG, say) is otherwise decoded by
-    Panel.qml on every panel open. Header-only check per file (see
-    icon.installed_icon_is_unsafe) — never a full re-sanitise, so this
-    stays cheap enough for the throttled listing hook. Symlinks and
-    non-regular files are skipped; returns the number removed; never
-    raises.
+    unlinks the icons of the stem it replaces; an icon written by an
+    older plugin version is otherwise decoded by Panel.qml on every panel
+    open. The first backstop for that store was a header-only check
+    (icon.installed_icon_is_unsafe): it could read the IHDR dimensions
+    and the file size, but not the ancillary chunks — a small-dimension
+    PNG carrying inflated text/ICC metadata passed it and was decoded
+    unbounded. That function is gone; this sweep now runs the FULL
+    sanitiser (icon.sanitize_icon) over every retained icon:
+
+    * a file larger than extractor.MAX_ICON_BYTES is removed — it is
+      not worth sanitising, and its stored bytes alone are past the cap;
+    * the format comes from the file name, and from the content when the
+      name says nothing (icon.installed_icon_format);
+    * the sanitised bytes REPLACE the file atomically, or the file is
+      left byte-identical when it is already sanitised;
+    * a file the sanitiser refuses — or cannot read — is REMOVED: an
+      icon that cannot be sanitised must not be handed to the decoder.
+
+    The folder is the plugin's own (one icon per integrated app) and the
+    sweep is throttled (janitor.sweep_throttled), so a full pass stays
+    affordable; the removal cap bounds the destructive part of it.
+    Symlinks and non-regular files are skipped; returns the number of
+    files removed; never raises.
     """
     if not icons_dir or os.path.islink(icons_dir) \
             or not os.path.isdir(icons_dir):
@@ -195,31 +218,119 @@ def sweep_icons(icons_dir: str = None) -> int:
         logging.debug('janitor: cannot list icons dir %s: %s', icons_dir, e)
         return 0
     removed = 0
+    changed = 0
     for name in entries:
-        if removed >= MAX_REMOVALS_PER_SWEEP:
+        if changed >= MAX_REMOVALS_PER_SWEEP:
             break
+        if name.startswith('.'):
+            # The panel loads `<stem>.png`/`<stem>.svg`, and a stem is a
+            # visible file name; a hidden name is what the plugin's own
+            # atomic writers leave behind while an install is in flight
+            # (provider._replace_destination, utils.atomic_write):
+            # reading a half-written one would refuse it and delete it,
+            # which would break the install that owns it.
+            continue
         path = os.path.join(icons_dir, name)
         try:
             if not _is_regular_file(path):
                 continue
-            if not icon.installed_icon_is_unsafe(path):
-                continue
-            os.unlink(path)
-            removed += 1
-            logging.debug('janitor: removed unbounded installed icon %s',
-                          path)
+            outcome = _sanitize_installed_icon(path)
         except Exception as e:
             logging.debug('janitor: skipped icon %s: %s', path, e)
+            continue
+        if outcome == 'removed':
+            removed += 1
+            changed += 1
+        elif outcome == 'rewritten':
+            changed += 1
     return removed
+
+
+def _sanitize_installed_icon(path: str) -> str:
+    """Sanitise one retained icon in place.
+
+    Returns 'kept' (the file was already sanitised), 'rewritten' (the
+    sanitised bytes replaced it), 'removed' (it could not be made safe)
+    or 'skipped' (it is not a regular file after all). Never raises:
+    every failure ends in a removal or in the file being left alone.
+    """
+    st = os.lstat(path)
+    if st.st_size > extractor.MAX_ICON_BYTES:
+        os.unlink(path)
+        logging.debug('janitor: removed oversized installed icon %s', path)
+        return 'removed'
+    try:
+        # O_NOFOLLOW: the name was a regular file a moment ago, and a
+        # symlink planted in its place must not be followed (nor removed)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as handle:
+            data = handle.read(extractor.MAX_ICON_BYTES + 1)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            return 'skipped'
+        # An icon we cannot read cannot be sanitised, and the shell
+        # decodes whatever sits in the folder: it goes.
+        logging.debug('janitor: cannot read installed icon %s: %s', path, e)
+        _unlink_quietly(path)
+        return 'removed'
+    fmt = icon.installed_icon_format(os.path.basename(path), data)
+    safe = icon.sanitize_icon(data, fmt) if fmt else None
+    if safe is None:
+        os.unlink(path)
+        logging.debug('janitor: removed unsanitisable installed icon %s',
+                      path)
+        return 'removed'
+    if safe == data:
+        return 'kept'
+    _replace_icon(path, safe, stat.S_IMODE(st.st_mode))
+    logging.debug('janitor: sanitised installed icon %s', path)
+    return 'rewritten'
+
+
+def _unlink_quietly(path: str):
+    """Remove a file, ignoring the case where it is already gone."""
+    try:
+        os.unlink(path)
+    except OSError as e:
+        logging.debug('janitor: cannot remove installed icon %s: %s',
+                      path, e)
+
+
+def _replace_icon(path: str, data: bytes, mode: int):
+    """Replace an icon with `data` atomically.
+
+    The new bytes land in a temporary file in the SAME directory
+    (os.replace is only atomic within one filesystem) and are renamed
+    over the old file, so a crash never leaves a half-written icon for
+    the shell to decode. The temporary name is hidden and carries this
+    module's own prefix, so a concurrent sweep never mistakes it for an
+    icon.
+    """
+    directory = os.path.dirname(path) or '.'
+    fd, tmp_path = tempfile.mkstemp(prefix=ICON_TMP_PREFIX, dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def sweep(now: float = None, temp_area: str = None,
           icons_dir: str = None) -> dict:
     """All three sweeps, best-effort: job documents past the
     acknowledgement window, orphan download temp dirs (UPDATE_TEMP_PREFIXES)
-    past the grace window, then installed icons beyond the decoder's bounds
-    in `icons_dir` (the managed folder's `.icons`). Returns per-surface
-    removal counts; never raises."""
+    past the grace window, then the retained icons in `icons_dir` (the
+    managed folder's `.icons`), each sanitised before the shell may
+    decode it and removed when it cannot be sanitised. Returns
+    per-surface removal counts; never raises."""
     counts = {'documents_removed': 0, 'temp_dirs_removed': 0,
               'icons_removed': 0}
     try:

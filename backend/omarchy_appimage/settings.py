@@ -61,18 +61,29 @@ def appimages_folder() -> str:
 
 # ------------------------------------------------------- update-check state
 #
-# updates-state.json remembers the signature (available_version +
-# download_size) of the last update --fetch-updates saw for each app, so
-# the desktop notification only fires for NEWLY available updates
-# (upstream BackgroudUpdatesFetcher notifies on every run instead; the
-# dedupe is a deviation asked for by this project's spec).
+# updates-state.json is the plugin's durable record of the last update
+# check, one entry per app (issue #50). An entry PRESENT means a pending
+# release is known for that app: it carries the signature that drives the
+# desktop notification (available_version + download_size, so the
+# notification only fires for NEWLY available updates — upstream
+# BackgroudUpdatesFetcher notifies on every run instead; the dedupe is a
+# deviation asked for by this project's spec), the installability verdict,
+# the AppImage path, and the pending release version. Both check verbs
+# write it, the installed-app listing reports it, and a successful update
+# deletes the app's entry. A legacy plain-signature entry is still read as
+# "pending, version and verdict unknown".
 
 def updates_state_path() -> str:
     return os.path.join(constants.plugin_config_dir(), 'updates-state.json')
 
 
 def load_updates_state() -> dict:
-    """The stored {desktop_id: signature} map ({} on any read problem)."""
+    """The stored per-app record map ({} on any read problem).
+
+    Keys are desktop ids (falling back to the AppImage basename); values
+    are the check record — `{signature, installable, path, version}` — or,
+    in a file written by an older plugin version, the legacy plain
+    signature string."""
     path = updates_state_path()
     try:
         with open(path, 'r', encoding='utf-8') as f:

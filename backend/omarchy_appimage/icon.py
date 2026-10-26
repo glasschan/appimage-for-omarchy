@@ -29,6 +29,12 @@ refused because Qt renders an embedded raster at its own natural size, and
 only same-document `href="#id"` references are allowed. Anything that
 cannot be bounded is refused: the panel then falls back to the plugin's
 own Tabler glyph, so a refusal costs an icon, never a feature.
+
+The same gate covers the icons that are ALREADY on disk: an icon
+installed by an older plugin version never went through it, and the
+shell decodes whatever sits in the icons folder on every panel open.
+janitor.sweep_icons runs this sanitiser over those retained icons and
+removes the ones it refuses.
 """
 
 from __future__ import annotations
@@ -303,31 +309,27 @@ def _dim(value: Optional[str]) -> Optional[float]:
     return number or None
 
 
-def installed_icon_is_unsafe(path: str) -> bool:
-    """True when an icon already on disk is certainly beyond the bounds.
+def installed_icon_format(name: str, data: bytes) -> Optional[str]:
+    """The format of an icon already on disk, or None when it is unknown.
 
-    The sanitiser runs at extract time, so an icon installed by an older
-    plugin version would otherwise be decoded by the shell on every panel
-    open with no bound at all. This is the header-only backstop for that
-    store: a PNG is judged from its IHDR (libpng takes the frame size from
-    those bytes, so an oversized frame is refused before any inflation),
-    an SVG from its size, and anything else is left alone. Unreadable
-    files report False — a sweep must never delete on an I/O error.
+    The file name is the primary signal, because the shell probes the
+    extension (Panel.qml tries `.png`, then `.svg`): the panel decodes
+    whatever sits at `<stem>.png`, so that name decides how the bytes
+    must be judged. A name that says nothing is decided by the content
+    (the PNG magic). Anything else is unsanitisable — the sanitiser has
+    no format to work with, and the shell would not decode it either.
+
+    `installed_icon_is_unsafe` used to live here: a header-only backstop
+    that judged a retained icon from its IHDR alone. It is gone because
+    the sweep now runs the FULL sanitiser over the retained icons
+    (janitor.sweep_icons), and a header check cannot see the metadata
+    chunks that made a retained icon unbounded. Nothing else used it.
     """
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in ('.png', '.svg'):
-        return False
-    try:
-        with open(path, 'rb') as handle:
-            head = handle.read(24)
-            size = os.fstat(handle.fileno()).st_size
-    except OSError:
-        return False
+    ext = os.path.splitext(name)[1].lower()
+    if ext == '.png':
+        return 'image/png'
     if ext == '.svg':
-        return size > MAX_SVG_BYTES
-    if len(head) < 24 or head[12:16] != b'IHDR':
-        # no readable IHDR: libpng refuses the file outright, no allocation
-        return False
-    width, height = struct.unpack('>II', head[16:24])
-    return not (0 < width <= MAX_SIDE and 0 < height <= MAX_SIDE
-                and width * height <= MAX_PIXELS)
+        return 'image/svg+xml'
+    if data[:8] == _PNG_SIG:
+        return 'image/png'
+    return None

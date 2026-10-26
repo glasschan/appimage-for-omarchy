@@ -286,9 +286,15 @@ compatible INI); global settings in `…/settings.json` —
 a pending release; the row's Update button starts the update as a
 **detached background job** (the `--update --async` form above) — the
 panel stays responsive, several apps
-can update at once, and a running job never blocks anything else. While
-a job runs, its row shows live progress (percent, plus a byte pair when
-the source declares a real download size). A job's state lives in a
+can update at once, and a running job never blocks anything else. A row
+shows its version (with the running dot) on one line and its update
+status on the next: the pending release, `cannot verify` for a source
+that cannot prove its artifact, or the live job progress. That pending
+state comes from the last real check and is remembered — every listing
+re-reads the backend's durable record — so it does not appear and vanish
+as the panel refreshes, and it goes away when the update is applied.
+While a job runs, its row shows live progress (percent, plus a byte pair
+when the source declares a real download size). A job's state lives in a
 small document on disk (`$XDG_STATE_HOME/io.github.glasschan.appimage/
 jobs/`), so closing the panel — or restarting the shell mid-download —
 loses nothing: reopening shows the job still running, and a job whose
@@ -300,6 +306,15 @@ documents (and their logs) after 24 h. While a row's job is still
 running its Remove button stays disabled — the job installs over that
 AppImage, so removing it mid-flight would leave the new release with no
 target (the armed "Remove?" confirm honours the same block).
+
+**Update all** is the header's batch action, enabled while any row has a
+pending release the backend would accept. The click opens one consent
+card naming every pending app and how many processes the batch would
+close, and spawns nothing until you accept (`Enter`; `Esc` cancels).
+Accepting starts one background job per app — each with the same per-app
+claim as the row's Update button — so a running app is closed only after
+that confirmation, and an app whose source cannot prove its artifact is
+never offered.
 
 A running app is the one exception to that one-click flow: **Update**
 asks first, naming the app and how many processes the confirm will
@@ -353,6 +368,46 @@ named after the plugin id), and publishes a GitHub Release with
 auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
+
+### 0.11.0
+
+- **The update verdict has one owner.** Every completed check — the
+  manual `--list-updates` and the background `--fetch-updates` — writes
+  one durable per-app record
+  (`$XDG_CONFIG_HOME/io.github.glasschan.appimage/updates-state.json`):
+  an entry present means a pending release is known, and it carries the
+  release version and whether that release can be installed.
+  `--list-installed --json` reports it per app as `pending_update` /
+  `pending_version` / `pending_installable`, so the row marker, the bar
+  badge and the Update button all read the same value on every 10 s poll
+  and across a shell restart; an applied update — or one whose own
+  availability check proves there is nothing newer — retires the entry,
+  and a check that could not reach an app keeps its last verdict (issue
+  #43's rule). Additive: `schema_version` stays 1. (#49 spec, #50)
+- **A row's update status gets its own line.** The identity line carries
+  the version and the running dot; the status line carries the pending
+  release, `cannot verify` or the live job progress. Each is one bounded,
+  elided `Text` assembled by `Model.rowIdentityMeta` /
+  `Model.rowStatusMeta` through the panel's `root.metaText`, so the
+  v0.9.1 rule — never a `Row` of separate texts — now applies to both
+  lines. (#51)
+- **Update all.** A header action applies every pending update after one
+  consent card naming the apps and how many processes it would close:
+  nothing is spawned until you accept, then each app gets its own
+  background job with the same per-app claim the row button uses. An app
+  with no pending release, or one whose source cannot prove its
+  artifact, is never offered. (#52)
+- **Retained icons are re-sanitised, not header-checked.** The janitor's
+  throttled `<managed>/.icons` sweep now runs the full
+  `icon.sanitize_icon` over every retained icon, atomically rewriting the
+  sanitised bytes or removing the file, so an icon cached by a pre-v0.9.9
+  install can no longer be decoded unbounded. The header-only
+  `installed_icon_is_unsafe` check is gone. Security follow-up to the
+  marketplace's Medium finding on #12226.
+- **The announcement follows the record write.** `--fetch-updates` now
+  writes the durable record before `notify-send`; a sweep whose write
+  fails announces nothing and still exits 0, instead of repeating the
+  same announcement on every cycle. (#53)
 
 ### 0.10.0
 
@@ -448,7 +503,8 @@ published.
   forever: the throttled janitor pass now also sweeps `<managed>/.icons`
   and removes any PNG whose IHDR exceeds the bounds or any SVG larger
   than 512 KiB (`icon.installed_icon_is_unsafe`, a header-only read —
-  never a full re-sanitise). `provider.py` additionally unlinks the
+  never a full re-sanitise; v0.11.0 replaced that check with the full
+  sanitiser). `provider.py` additionally unlinks the
   previous extension's icon when an update installs a different format.
 - A refused candidate falls through to the next one, so an image that
   embeds only a hostile icon installs without an icon instead of failing.

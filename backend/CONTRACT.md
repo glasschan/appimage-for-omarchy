@@ -51,6 +51,16 @@ the routed manager name (e.g. `GithubUpdater` for a `gh-releases-zsync|...`
 string). `available_version` / `download_size` stay `null` here; only
 `--list-updates` populates them.
 
+The pending verdict is the backend's durable record of the last check
+(`updates-state.json`, see *Filesystem layout*), not something this call
+recomputes: the listing reads the record once per invocation and reports
+`pending_update` / `pending_version` / `pending_installable` per app. That
+record is the single owner of the row's marker, the bar badge count and
+the Update button, so all three agree with the last real check instead of
+disappearing with the next 10 s poll, and they survive a shell restart.
+An app the last check found up to date reports `pending_update: false`; an
+app whose check failed keeps its last known verdict (issue #43's rule).
+
 The listing is desktop-driven: a record in `apps.ini` whose `.desktop` file
 is gone is **not** listed as installed. It is logged on stderr instead
 (`stale integration record: the desktop file <path> is gone; orphaned
@@ -264,6 +274,13 @@ per-app errors are logged (stderr) and skipped.
 {"schema_version": 1, "updates": [{"name": "Neovim (v0.11.3)", "path": "/home/user/AppImages/neovim.appimage", "desktop_id": "neovim.desktop", "current_version": "v0.11.3", "available_version": null, "download_size": 10996237, "manager": "StaticFileUpdater", "embedded_source": false, "running": false, "running_pids": 0, "exec_arguments": "%F"}]}
 ```
 
+Like `--fetch-updates`, a completed sweep writes the durable check
+record (see *Filesystem layout*): an app whose check found a newer
+release gets an entry, an app found up to date has its entry retired, and
+an app whose verdict was not determinable keeps its previous entry. This
+verb never announces anything — the notification belongs to
+`--fetch-updates`.
+
 ### `--update <target> [--yes] [--keep-both] [--force] [--kill-running] [--json]`
 
 Downloads the new release through the app's update source and installs it.
@@ -338,6 +355,10 @@ byte is downloaded.
 - Availability check says "definitely up to date": exit 0, result
   `up-to-date`. An indeterminate state (network error, no matching asset —
   tri-state `None`) still attempts the download, like a `True` result.
+  A definite `up-to-date` also retires the app's entry in
+  `updates-state.json` (see the last bullet): the pinned pending verdict
+  is stale, so the row marker, the badge count and the Update button go
+  away instead of waiting for the next sweep.
 - Authenticity policy (v0.4.2): installation only proceeds for sources
   that expose a cryptographic digest (GitHub asset digest, zsync SHA-1
   control-file line). A source without one (plain static URL, GitLab,
@@ -354,8 +375,12 @@ byte is downloaded.
   itself is skipped too — no question, no `skipped-running` — because
   nothing is replaced under the running app; without `--keep-both` the
   guard applies exactly as documented above.
-- On success the app's entry in `updates-state.json` is cleared so the next
-  `--fetch-updates` does not re-notify for the now-installed release.
+- On success the app's entry in `updates-state.json` is retired (deleted),
+  so its pending verdict — and with it the row marker, the badge count and
+  the Update button — goes away at once, and the next `--fetch-updates`
+  does not re-notify for the now-installed release. The same retirement
+  runs on the definite `up-to-date` path above, because both are truths
+  the pipeline proved about that app (`cli._retire_update_verdict`).
 
 Real example output (success):
 
@@ -619,14 +644,21 @@ Behaviour:
    entry on first launch), and that is not an uninstall. A failed sweep
    therefore learns nothing and forgets nothing, instead of re-notifying
    every app it could not see. Each entry is an object
-   `{"signature": "<available_version>|<download_size>", "installable": true | false | null, "path": "<absolute AppImage path>"}`
-   — a legacy plain-string entry is still read as its signature, and an
-   entry without `path` is pruned as before.
-5. `--update` clears the updated app's entry, which re-arms the
-   notification for the next genuinely new release.
+   `{"signature": "<available_version>|<download_size>", "installable": true | false | null, "path": "<absolute AppImage path>", "version": "<release version the source named, "" when it names none>"}`
+   — an entry present means a pending release is known for that app, a
+   legacy plain-string entry is still read as pending (with no version and
+   no verdict), and an entry without `path` is pruned as before.
+5. `--update` retires the updated app's entry (its pending verdict), which
+   re-arms the notification for the next genuinely new release.
 6. The state lives at `<plugin config dir>/updates-state.json`; a save
    failure is logged and never turns the sweep into a failure (this verb
    always exits 0).
+
+**Ordering (v0.11.0).** The record is written **before** the
+announcement: a sweep whose record write fails sends no notification at
+all (the failure is logged) and still exits 0. Writing first is what stops
+a failed write from leaving the old record behind, which would make the
+next sweep announce the same release again.
 
 Real example output (update available, first run, notification delivered):
 
@@ -867,12 +899,16 @@ No arguments prints usage and exits **2**.
 | `manager` | string or null | Update manager name (`StaticFileUpdater`, `GithubUpdater`, `GitlabUpdater`, `CodebergUpdater`, `ForgejoUpdater`) or `null` when no source exists |
 | `verification` | string | How this app's source would prove an artifact: `sha256` (a published digest), `zsync-sha1` (the zsync control file's `SHA-1:` line), `size` (a byte count only) or `none` (no source, or a source that publishes nothing). Only the two digest methods are accepted by a fetch, so `size`/`none` describe an update that can be **reported** but not installed. A zsync control file the last check read without a `SHA-1:` line reports `size`: that source cannot install, so the report must not promise a digest |
 | `installable` | boolean or null | `true` when a fetch under the strict verification policy would be attempted, `false` when the source must refuse it, `null` when nothing has decided yet (no check has run, or the app has no source). Derived from `verification` plus the check's verdict, so the two keys can never disagree. Reporting only: the verification policy is not relaxed, and a source that cannot prove its artifact still refuses the install |
+| `pending_update` | boolean | True when the plugin's durable check record holds an entry for this app — the last successful check found a newer release. Read from that record (never recomputed by a listing), so it survives the 10 s listing poll and a shell restart; `false` when there is no entry (no check has run, or the last check found the app up to date) |
+| `pending_version` | string or null | The release version that check found; `null` when there is no record, or when the source named no version (a plain-URL/zsync source). A pending release can therefore be reported without a version |
+| `pending_installable` | boolean or null | Whether that pending release could be installed (`true` / `false`); `null` when there is no record — including a legacy plain-signature entry written before this version. A verdict here never promises the fetch will succeed: the strict policy still decides at install time |
 | `embedded_source` | boolean | True when the source comes from the AppImage's embedded `.upd_info` string (false for custom configs and for no source) |
 | `running` | boolean | True when the AppImage is currently running. Computed by **one rule shared with `running_pids`** (`utils._running_by_ps` → `procs.pids_for`'s `parent` list, plus the `fuse.*` mount signal for the runtime that has no attributable exe): a process whose `/proc/<pid>/exe` is the AppImage path (compared through `os.path.realpath`, so a symlinked install directory matches either way round), or a `fuse.*` mount in `/proc/mounts` attributed to it (matched on the mount source's basename — see Process identity under Security model). Because the mount signal can outlive the processes, `running: true` with `running_pids: 0` is possible: the mount is still there, no process of ours is |
 | `running_pids` | int | How many processes belong to this AppImage: the runtime parent (its `exe` is the AppImage path) **plus** the helpers running out of the `fuse.*` mount attributed to it — the set `--kill-running` would close (`procs.pids_for`). `0` when the app is not running (a non-running row is never scanned) and `0` when the count cannot be determined (a failed scan is a warning, never an error, and never flips `running`). **Display-only**: the panel's prompt names it; no command reads it back. A listing builds one process table (and one `/proc/mounts` read) and reuses it for every running row, because the panel polls the listing every 10 s |
 | `exec_arguments` | string | The desktop entry's `Exec=` arguments, e.g. `"--no-sandbox %U"` or `"%U"`; `""` when the app has none. The desktop field codes (`%f %F %u %U %i %c %k`) stay **verbatim** — stripping them is the UI's job. The current desktop entry wins; when it carries no arguments, the install-time `default_exec_arguments` from `apps.ini` is used instead |
 
-> `verification`, `installable`, `exec_arguments` and `running_pids` are
+> `verification`, `installable`, `pending_update`, `pending_version`,
+> `pending_installable`, `exec_arguments` and `running_pids` are
 > **additive** keys: every other key keeps its meaning, and a reader that
 > ignores unknown keys (the QML layer does) is unaffected — the same way
 > `manager` / `embedded_source` / `download_size` were added.
@@ -965,7 +1001,7 @@ meaning, so readers that ignore unknown keys are unaffected
 | `~/AppImages/.icons` | Extracted icons (referenced by absolute path in the desktop entry) |
 | `$XDG_CONFIG_HOME/io.github.glasschan.appimage/settings.json` | User settings |
 | `$XDG_CONFIG_HOME/io.github.glasschan.appimage/apps.ini` | Per-app metadata (`[app.<md5>]`) and update sources (`[app.<md5>.update_manager]`, `manager` + config keys, booleans stored as `true`/`false`), INI format compatible with GearLever |
-| `$XDG_CONFIG_HOME/io.github.glasschan.appimage/updates-state.json` | Last background-check signatures, `{desktop_id: "available_version|download_size"}` (desktop id falls back to the AppImage basename) |
+| `$XDG_CONFIG_HOME/io.github.glasschan.appimage/updates-state.json` | Per-app pending-update record (desktop id falls back to the AppImage basename), one entry per app: `{"signature": "<available_version>|<download_size>", "installable": true \| false \| null, "path": "<absolute AppImage path>", "version": "<release version the source named, "" when it names none>"}`. An entry present means a pending release is known for that app; a legacy plain-signature entry is still read as pending, with no version and no verdict. Written by `--list-updates` and `--fetch-updates` (merged per app, never rebuilt wholesale) and retired by a successful `--update` |
 | `$XDG_STATE_HOME/io.github.glasschan.appimage/jobs/` | Background job documents (`<desktop id stem>.json`) and their size-capped logs (`<stem>.log`) written by `--update --async` |
 
 ### XDG override behaviour (required for tests/sandboxes)
@@ -1038,7 +1074,7 @@ X-AppImage-Name=Neovim
   app; it is written only when `X-AppImage-Version` is present. **No md5
   hash is ever substituted for a missing version** (v0.9.3): the panel
   strips a trailing ` (<version>)` from a row's title because the row's
-  meta line already prints the version.
+  identity line already prints the version.
 
 - `Exec` keeps the original arguments/field codes (`%F` etc.); the
   `DESKTOPINTEGRATION=1` env var is appended like GearLever does.
@@ -1048,4 +1084,4 @@ X-AppImage-Name=Neovim
 - Writes are atomic (`tempfile` + `os.replace`), mode 0644.
 - A REPLACE update rewrites the same files in place (same AppImage filename
   and desktop id), so the app-menu entry stays valid — verified by
-  `UpdateFlowTests` in `backend/tests/test_cli.py`.
+  `UpdateFlowTests` in `backend/tests/test_cli_flows.py`.
