@@ -743,6 +743,44 @@ gone) or `not-local` (non-`file://` or remote selection):
 Plain text (no `--json`): `picked` prints the path, `cancelled` /
 `unavailable` print their message, errors go to stderr.
 
+### `--exec-with-scale <image> [args...]`
+
+Launches the AppImage at `<image>` with `GDK_SCALE` set to the **focused
+monitor's** scale factor, so an XWayland client started into a scale-1
+focused monitor renders at 1x even when the session exports
+`GDK_SCALE=2` (ticket #33). Mechanism in `omarchy_appimage/exec_scale.py`,
+the verb wrapper in `omarchy_appimage/commands/exec_scale.py`.
+
+- **Compositor query** — one bounded `hyprctl -j monitors` (constant
+  argv, no shell, through `utils.run_command`: 10 MiB/stream output cap,
+  own process group, killpg reap) with a **5 s timeout**
+  (`QUERY_TIMEOUT_SECONDS`). The focused monitor's `scale` is read from
+  the JSON array; a non-focused monitor is never used.
+- **Rounding** — `GDK_SCALE` takes whole factors: the scale rounds to
+  the nearest whole number (1.0→1, 2.0→2, 1.49→1, 1.5→2;
+  `floor(x+0.5)`, not banker's rounding). A scale outside (0, 8] is
+  compositor noise and treated as "could not determine".
+- **Never-fail rule** — a launch never fails because the scale could
+  not be determined. Every unusable answer (binary missing, non-zero
+  exit, timeout, malformed JSON, no focused monitor, non-numeric or
+  out-of-range scale) execs the image with the **caller's environment
+  unchanged**. When the caller's own `GDK_SCALE` already rounds to the
+  focused factor, the environment is also handed over byte-identical.
+- **Handover** — `os.execve(image, [image, *args], env)`: the process
+  image is REPLACED, so nothing outlives the app. The image's arguments
+  — including `%f`/`%F`/`%u`/`%U` expansions the caller already
+  resolved and option-shaped tokens — are forwarded verbatim as argv
+  and never pass through a shell. The caller's environment map comes
+  from `constants.process_environment()` (the module that owns every
+  env read).
+- **Output** — none on success (the process becomes the app); a missing
+  image or a failed exec raises into the normal error path (stderr +
+  JSON error document with `--json`, exit 1). A missing image argument,
+  or an option where the image path belongs, is exit 2. The verb takes
+  no options of its own: only the first token is ours, everything after
+  the path belongs to the app, so `_reject_unknown_options` does not
+  apply.
+
 ### `--settings [--json]`
 
 Current settings (defaults merged with `settings.json`).
