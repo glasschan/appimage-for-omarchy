@@ -5,7 +5,7 @@
 #
 # Everything is FAKED: no real gdbus/zenity process is ever spawned. The
 # one-shot commands go through a fake `pick_file.run_command` (same seam
-# as the notify-send tests in test_cli.py); the long-running
+# as the notify-send tests in test_cli_update.py); the long-running
 # `gdbus monitor` goes through a fake process whose stdout is a REAL
 # os.pipe, so the monitor session's select/deadline machinery runs for
 # real against canned gdbus output.

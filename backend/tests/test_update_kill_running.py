@@ -588,7 +588,7 @@ class RunningGuardCliTests(_RunningAppTestCase):
     nothing downloads."""
 
     def run_cmd(self, func, args: list):
-        """Run a cmd_* function in-process (same shape as test_cli's
+        """Run a cmd_* function in-process (same shape as cli_support's
         InProcessCliMixin, so argv handling is covered, not just the
         core)."""
         out, err = io.StringIO(), io.StringIO()

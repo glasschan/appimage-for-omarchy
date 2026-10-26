@@ -21,7 +21,7 @@ from unittest import mock
 
 import helpers
 from helpers import FakeXDGTestCase, FixtureHTTPServer, download_fixture
-from test_cli import InProcessCliMixin
+from cli_support import InProcessCliMixin
 
 from omarchy_appimage import cli, extractor, jobs, net, updaters, utils
 from omarchy_appimage.ini_config import Config

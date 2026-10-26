@@ -18,7 +18,7 @@ from unittest import mock
 
 from helpers import (FakeXDGTestCase, download_fixture, make_minimal_elf)
 
-from test_cli import InProcessCliMixin
+from cli_support import InProcessCliMixin
 
 from omarchy_appimage import cli, net
 from omarchy_appimage.provider import AppImageListElement, InstalledStatus

@@ -102,7 +102,11 @@ def _backend_test_names() -> set:
 
 
 def _harness_text() -> str:
-    return PARSE_HARNESS.read_text(encoding='utf-8').lower()
+    """The entry point plus every case/shared module it imports: a check's
+    text lives in its case module, not in the runner."""
+    paths = [PARSE_HARNESS]
+    paths += sorted((REPO_ROOT / 'tests-js' / 'harness').rglob('*.mjs'))
+    return '\n'.join(p.read_text(encoding='utf-8') for p in paths).lower()
 
 
 def _covers(slug_set: set, names: set, harness) -> bool:

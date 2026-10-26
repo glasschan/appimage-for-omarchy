@@ -23,7 +23,7 @@ from unittest import mock
 
 import helpers
 from helpers import FakeXDGTestCase
-from test_cli import InProcessCliMixin
+from cli_support import InProcessCliMixin
 from test_icon import build_png, chunk_types
 
 from omarchy_appimage import cli, extractor, icon, janitor, jobs
