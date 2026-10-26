@@ -806,6 +806,17 @@ the verb wrapper in `omarchy_appimage/commands/exec_scale.py`.
   the path belongs to the app, so `_reject_unknown_options` does not
   apply.
 
+- **Desktop-entry wiring (ticket #34)** — a freshly integrated (or
+  updated) app's `Exec=` invokes this verb instead of the raw image, so
+  a launcher click gets the scale too: `Exec=env DESKTOPINTEGRATION=1
+  <python> <backend>/main.py --exec-with-scale <image> [args]`, built by
+  `launch.entry_point_exec_text` / `entry_point_argv` (the ONE launch
+  builder). The backend directory is recorded per app at integrate time
+  (`launch_backend_dir` in `apps.ini`) and every install/repair rebuilds
+  the Exec from the CURRENT directory (`constants.backend_dir()`); the
+  listing re-points an entry whose recorded directory no longer matches.
+  `TryExec` stays the raw image.
+
 ### `--settings [--json]`
 
 Current settings (defaults merged with `settings.json`).
@@ -1133,7 +1144,7 @@ Generated entries look like (real output for the neovim AppImage):
 Name=Neovim (v0.11.3)
 ...
 TryExec=/home/user/AppImages/neovim.appimage
-Exec=env DESKTOPINTEGRATION=1 /home/user/AppImages/neovim.appimage %F
+Exec=env DESKTOPINTEGRATION=1 /usr/bin/python3 /path/to/plugin/backend/main.py --exec-with-scale /home/user/AppImages/neovim.appimage %F
 Icon=/home/user/AppImages/.icons/neovim.png
 X-AppImage-Version=v0.11.3
 X-AppImage-Name=Neovim
@@ -1145,10 +1156,31 @@ X-AppImage-Name=Neovim
   strips a trailing ` (<version>)` from a row's title because the row's
   identity line already prints the version.
 
-- `Exec` keeps the original arguments/field codes (`%F` etc.); the
-  `DESKTOPINTEGRATION=1` env var is appended like GearLever does.
-- `[Desktop Action ...]` groups are preserved and rewritten to the managed
-  path.
+- `Exec` launches through the **scale-aware entry point** (ticket #34):
+  `<python> <backend>/main.py --exec-with-scale <image>`, so a launcher
+  click gets the focused monitor's scale exactly like the terminal verb.
+  The builder is `launch.entry_point_exec_text` / `entry_point_argv`;
+  nothing passes through a shell. It keeps the original
+  arguments/field codes (`%F` etc.) verbatim, and the
+  `DESKTOPINTEGRATION=1` env var (plus any app env vars) rides in the
+  `env` prefix — `exec_scale` forwards the wrapper's environment to the
+  image. `TryExec` stays the raw image: the listing uses it to locate
+  the installed file.
+- **The plugin directory is recorded once** at integrate time
+  (`launch_backend_dir` in the app's `apps.ini` record). Every install
+  rebuilds Exec from the CURRENT directory (`constants.backend_dir()`),
+  and the listing re-points an entry whose recorded directory stopped
+  matching (a plugin update that moved the install) — once, persisting
+  the new directory in the record. Entries recorded before ticket #34
+  carry no key: the listing leaves them alone, and they adopt the entry
+  point on their next update or re-integrate. A clobbered entry repaired
+  from its apps.ini record is rebuilt with the current directory too
+  (`_repair_clobbered_desktop`). The entry point adds **no new file**:
+  Remove's existing three-artifact removal (AppImage + .desktop + icon)
+  covers everything the integrate created.
+- `[Desktop Action ...]` groups are preserved and rewritten to the
+  managed path through the same entry point (no env prefix — actions
+  never carried one).
 - Locale keys (`Name[xx]`, `Comment[xx]`, ...) are preserved verbatim.
 - Writes are atomic (`tempfile` + `os.replace`), mode 0644.
 - A REPLACE update rewrites the same files in place (same AppImage filename

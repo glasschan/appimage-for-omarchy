@@ -9,15 +9,17 @@
 
 import json
 import os
+import shlex
 import shutil
 import stat
+import sys
 from pathlib import Path
 from unittest import mock
 
 from cli_support import InProcessCliMixin
 from helpers import (FakeXDGTestCase, FixtureHTTPServer, download_fixture)
 
-from omarchy_appimage import cli, net, utils
+from omarchy_appimage import cli, constants, launch, net, utils
 from omarchy_appimage import settings as appimage_settings
 from omarchy_appimage.ini_config import Config
 
@@ -266,7 +268,12 @@ class FixtureCliTests(FakeXDGTestCase):
             content = f.read()
         self.assertIn('Name=Neovim (v0.11.3)', content)
         self.assertIn(f'TryExec={appimage}', content)
-        self.assertIn(f'Exec=env DESKTOPINTEGRATION=1 {appimage} %F',
+        # the scale-aware entry point (ticket #34): the launch command is
+        # `<python> <backend>/main.py --exec-with-scale <image> %F`
+        self.assertIn(f'Exec=env DESKTOPINTEGRATION=1 '
+                      f'{shlex.quote(sys.executable)} '
+                      f'{shlex.quote(launch.entry_point_script(constants.backend_dir()))} '  # noqa: E501
+                      f'--exec-with-scale {appimage} %F',
                       content)
         self.assertIn(f'Icon={self.managed_dir}/.icons/neovim.png', content)
         self.assertIn('X-AppImage-Version=v0.11.3', content)

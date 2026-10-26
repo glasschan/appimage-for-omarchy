@@ -7,8 +7,10 @@
 
 import inspect
 import os
+import shlex
 import shutil
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +18,7 @@ from types import SimpleNamespace
 
 from helpers import FakeXDGTestCase
 
+from omarchy_appimage import constants, launch
 from omarchy_appimage import provider as provider_module
 from omarchy_appimage.desktop_entry import DesktopEntry
 from omarchy_appimage.ini_config import Config
@@ -258,7 +261,11 @@ Terminal=false
         entry = DesktopEntry(path=desktop)
         self.assertEqual(entry.getTryExec(), _appimage)
         self.assertTrue(entry.getExec().startswith(
-            f'env DESKTOPINTEGRATION=1 {_appimage}'))
+            'env DESKTOPINTEGRATION=1 '
+            + shlex.quote(sys.executable) + ' '
+            + shlex.quote(launch.entry_point_script(
+                constants.backend_dir()))
+            + f' {launch.EXEC_SCALE_FLAG} {_appimage}'))
         self.assertEqual(entry.getIcon(), icon)
 
     def test_repair_preserves_user_metadata(self):
@@ -360,6 +367,104 @@ X-AppImage-Version=1.0
         listed = self.provider.list_installed()
 
         self.assertEqual(listed[0].exec_arguments, '--no-sandbox %U')
+
+
+class EntryPointDirRepairTests(FakeXDGTestCase):
+    """Ticket #34: the desktop entry's Exec points at the plugin backend
+    directory recorded at integrate time; when that directory stops
+    matching the CURRENT one (a plugin update that moved the install),
+    the next listing re-points the entry instead of leaving a dead Exec.
+    Entries recorded before ticket #34 carry no key and are left alone:
+    they adopt the entry point on their next update or re-integrate."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider = AppImageProvider()
+
+    def _install_entry_point_app(self, backend_dir: str) -> tuple:
+        appimage, desktop, icon = self.install_fake_app()
+        with open(desktop, 'w') as f:
+            f.write(f'''[Desktop Entry]
+Name=Fake App
+Exec={launch.entry_point_exec_text(backend_dir, appimage, ['--no-sandbox'], python_executable=sys.executable)}
+TryExec={appimage}
+Icon={icon}
+Type=Application
+Terminal=false
+X-AppImage-Version=1.0
+''')
+        el = _make_el(appimage, desktop_path=desktop)
+        Config.set_app_config(el, {
+            'appimage_path': appimage,
+            'desktop_file_path': desktop,
+            'icon_path': icon,
+            'default_exec_arguments': '--no-sandbox',
+            'launch_backend_dir': backend_dir,
+        })
+        return appimage, desktop, icon
+
+    def _exec_of(self, desktop: str) -> str:
+        with open(desktop) as f:
+            for line in f:
+                if line.startswith('Exec='):
+                    return line[5:].strip()
+        self.fail('no Exec line')
+
+    def test_moved_directory_is_repointed_on_the_next_listing(self):
+        gone = os.path.join(self.sandbox, 'old-plugin-install', 'backend')
+        appimage, desktop, _icon = self._install_entry_point_app(gone)
+
+        listed = self.provider.list_installed()
+
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0].exec_arguments, '--no-sandbox')
+        current = constants.backend_dir()
+        self.assertEqual(
+            self._exec_of(desktop),
+            launch.entry_point_exec_text(current, appimage,
+                                         ['--no-sandbox'],
+                                         python_executable=sys.executable))
+        record = Config.get_app_config(_make_el(appimage,
+                                                desktop_path=desktop))
+        self.assertEqual(record['launch_backend_dir'], current)
+
+    def test_repoint_happens_once(self):
+        gone = os.path.join(self.sandbox, 'old-plugin-install', 'backend')
+        _appimage, desktop, _icon = self._install_entry_point_app(gone)
+
+        self.provider.list_installed()
+        mtime_first = os.stat(desktop).st_mtime_ns
+        self.provider.list_installed()
+        mtime_second = os.stat(desktop).st_mtime_ns
+        self.assertEqual(mtime_first, mtime_second)
+
+    def test_current_directory_is_left_alone(self):
+        current = constants.backend_dir()
+        appimage, desktop, _icon = self._install_entry_point_app(current)
+        before = self._exec_of(desktop)
+
+        self.provider.list_installed()
+
+        self.assertEqual(self._exec_of(desktop), before)
+        self.assertTrue(os.path.isfile(desktop))
+
+    def test_legacy_entry_without_recorded_directory_is_untouched(self):
+        # a pre-#34 install: raw-image Exec, no launch_backend_dir key.
+        # The listing must NOT mass-rewrite it — the entry point arrives
+        # with the app's next update or re-integrate.
+        appimage, desktop, icon = self.install_fake_app()
+        el = _make_el(appimage, desktop_path=desktop)
+        Config.set_app_config(el, {
+            'appimage_path': appimage,
+            'desktop_file_path': desktop,
+            'icon_path': icon,
+        })
+        before = self._exec_of(desktop)
+
+        listed = self.provider.list_installed()
+
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(self._exec_of(desktop), before)
 
 
 class StaleRecordTests(FakeXDGTestCase):

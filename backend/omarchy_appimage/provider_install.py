@@ -10,11 +10,12 @@
 import logging
 import os
 import shlex
+import sys
 from types import SimpleNamespace
 
 from .install_writes import _atomic_install, _atomic_write_bytes
 from .desktop_entry import DesktopEntry
-from . import launch, settings
+from . import constants, launch, settings
 from .ini_config import Config
 from .install_writes import _resolve_install_names
 from .provider_types import (AppImageListElement, AppImageUpdateLogic,
@@ -166,9 +167,25 @@ class InstallMixin:
                         'Could not parse the recorded Exec arguments for '
                         f'this app: {e}') from e
 
+        # The launch path is the scale-aware entry point (ticket #34):
+        # Exec invokes `<python> <backend>/main.py --exec-with-scale
+        # <image> [args]` through the ONE launch builder, so a launcher
+        # click gets the focused monitor's scale. The plugin backend
+        # directory is recorded in apps.ini and rebuilt from the CURRENT
+        # directory on every install/repair, so a plugin update that
+        # moves the directory re-points the entry instead of breaking it.
+        # TryExec stays the raw image: the listing uses it to locate the
+        # installed file.
+        launch_backend_dir = constants.backend_dir()
+        env_variables, _ = launch.merge_env_variables(
+            el.env_variables,
+            el.updating_from.env_variables if el.updating_from else None)
+
         jd_desktop_entry.TryExec = dest_appimage_file
-        jd_desktop_entry.Exec = shlex.join([dest_appimage_file,
-                                            *exec_arguments])
+        jd_desktop_entry.Exec = launch.entry_point_exec_text(
+            launch_backend_dir, dest_appimage_file, exec_arguments,
+            env_variables=env_variables,
+            python_executable=sys.executable)
 
         if el.update_logic is AppImageUpdateLogic.KEEP:
             # The display suffix carries the REAL version only — an image
@@ -189,8 +206,13 @@ class InstallMixin:
             for _action_id, action in jd_desktop_entry.Actions.items():
                 a_exec_args = extract_terminal_arguments(action.Exec)
                 action.Icon = desktop_icon
-                action.Exec = shlex.join([dest_appimage_file,
-                                          *a_exec_args['arguments']])
+                # Desktop actions launch the app too: the same
+                # scale-aware entry point, with no env prefix (actions
+                # never carried one).
+                action.Exec = launch.entry_point_exec_text(
+                    launch_backend_dir, dest_appimage_file,
+                    a_exec_args['arguments'], env_variables=[],
+                    python_executable=sys.executable)
         except ValueError as e:
             raise InternalError(
                 'Could not parse a desktop action in the .desktop file '
@@ -202,18 +224,11 @@ class InstallMixin:
             'X-AppImage-Name', extracted_appimage.desktop_entry.getName())
 
         # install_file used to rewrite the entry once more through
-        # update_desktop_file() so it runs with `env VAR=...`. Compute
-        # that FINAL text here instead of writing the file twice —
-        # through the ONE launch-command builder (ticket #32), which
-        # owns both the DESKTOPINTEGRATION precedence and the Exec
-        # serialization; tests/test_launch.py pins its bytes.
-        env_variables, rewrite_exec = launch.merge_env_variables(
-            el.env_variables,
-            el.updating_from.env_variables if el.updating_from else None)
-
-        if rewrite_exec:
-            jd_desktop_entry.Exec = launch.launch_exec_text(
-                dest_appimage_file, exec_arguments, env_variables)
+        # update_desktop_file() so it runs with `env VAR=...`; the final
+        # Exec text is computed above through the ONE launch-command
+        # builder (tickets #32/#34). merge_env_variables still owns the
+        # DESKTOPINTEGRATION precedence for the recorded env list
+        # (tests/test_launch.py pins its behaviour).
 
         desktop_content = jd_desktop_entry.get_text().encode('utf-8')
 
@@ -230,6 +245,11 @@ class InstallMixin:
         app_config['appimage_path'] = dest_appimage_file
         app_config['desktop_file_path'] = dest_desktop_file_path
         app_config['icon_path'] = dest_appimage_icon_file or ''
+        # where the entry-point Exec points (ticket #34): recorded once
+        # here, re-checked against constants.backend_dir() on every
+        # listing so a plugin update that moves the directory repairs
+        # the entry instead of breaking it
+        app_config['launch_backend_dir'] = launch_backend_dir
 
         remove_original = (
             settings.load_settings()['move_appimage_on_integration']
@@ -347,22 +367,20 @@ class InstallMixin:
         jd_desktop_file = DesktopEntry(path=el.desktop_file_path)
 
         tryexec_command = jd_desktop_file.TryExec
-        exec_arguments = el.exec_arguments
-        env_vars = ' '.join(el.env_variables)
+        exec_arguments = el.exec_arguments or ''
+        try:
+            exec_argument_tokens = shlex.split(exec_arguments)
+        except ValueError as e:
+            raise InternalError(
+                f'Could not parse the recorded Exec arguments for this '
+                f'app: {e}') from e
 
-        if exec_arguments:
-            exec_arguments = f' {exec_arguments}'
-
-        if env_vars:
-            env_vars = f'env {env_vars} '
-
-        exec_command = ''.join([
-            env_vars,
-            shlex.quote(tryexec_command),
-            exec_arguments
-        ])
-
-        jd_desktop_file.Exec = exec_command
+        # the scale-aware entry point (ticket #34), built by the ONE
+        # launch builder with the CURRENT backend directory
+        jd_desktop_file.Exec = launch.entry_point_exec_text(
+            constants.backend_dir(), tryexec_command,
+            exec_argument_tokens, env_variables=list(el.env_variables or []),
+            python_executable=sys.executable)
         jd_desktop_file.write_file(el.desktop_file_path)
 
         el.desktop_entry = DesktopEntry(path=el.desktop_file_path)

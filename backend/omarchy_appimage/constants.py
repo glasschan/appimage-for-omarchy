@@ -34,6 +34,16 @@ BACKEND_VERSION = '0.4.2'
 JSON_SCHEMA_VERSION = 1
 
 
+def backend_dir() -> str:
+    """The absolute path of the running plugin's backend directory (the
+    one holding main.py) — the CURRENT install's own location, derived
+    from this module's __file__, never from a recorded value. Desktop
+    entries launched through the scale-aware entry point
+    (launch.entry_point_exec_text) are re-pointed here whenever the
+    directory recorded at integrate time stops matching."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def home_dir() -> str:
     return os.path.expanduser('~')
 
