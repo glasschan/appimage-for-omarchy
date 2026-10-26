@@ -2652,6 +2652,9 @@ Panel {
 
               Text {
                 text: root.updateAllSummary.appsLine
+                // desktop-entry names are attacker-controlled: never let
+                // Text rich-detect them (adversarial review, 0.11.0)
+                textFormat: Text.PlainText
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -2661,6 +2664,7 @@ Panel {
 
               Text {
                 text: root.updateAllSummary.processLine
+                textFormat: Text.PlainText
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall

@@ -235,9 +235,12 @@ def _make_app_json(el, manager=None, running=None, probe=None,
         # that check found and whether that release could be installed.
         # The record is the backend's memory, so the listing reports the
         # same verdict on every poll without checking the network again.
-        'pending_update': pending is not None,
+        # Only a record (dict) or a legacy signature (str) counts as
+        # pending — a corrupt scalar/container entry is not a verdict,
+        # matching the normalisers below (adversarial review, 0.11.0).
+        'pending_update': isinstance(pending, (dict, str)),
         'pending_version': (_update_state_version(pending) or None)
-        if pending is not None else None,
+        if isinstance(pending, (dict, str)) else None,
         'pending_installable': _update_state_installable(pending),
     }
 
@@ -378,9 +381,21 @@ def _update_state_entry(manager) -> dict:
     if path:
         entry['path'] = path
     # the version the source named ('' when it names none): the record
-    # says a release is pending, and this says which one
-    entry['version'] = str(manager.available_version or '')
+    # says a release is pending, and this says which one. Capped at
+    # MAX_PERSISTED_VERSION_CHARS so the durable record itself stays
+    # bounded — --list-installed echoes it on every poll.
+    entry['version'] = _capped_version(manager.available_version)
     return entry
+
+
+# A real release tag is far shorter than this; the cap only bounds a
+# pathological or hostile `available_version` (adversarial review, 0.11.0).
+MAX_PERSISTED_VERSION_CHARS = 200
+
+
+def _capped_version(value) -> str:
+    """The version string for the record, truncated to the persisted cap."""
+    return str(value or '')[:MAX_PERSISTED_VERSION_CHARS]
 
 
 def _update_state_signature(entry):
@@ -397,9 +412,11 @@ def _update_state_version(entry) -> str:
     """The pending release version out of a stored entry ('' if unknown).
 
     A legacy plain-signature entry names no version at all, so it reads as
-    '' — the same as a source that offers a release without naming it."""
+    '' — the same as a source that offers a release without naming it. A
+    legacy or hand-edited record is also capped here, so the listing never
+    echoes an unbounded version even if the file predates the write cap."""
     if isinstance(entry, dict):
-        return str(entry.get('version') or '')
+        return _capped_version(entry.get('version'))
     return ''
 
 

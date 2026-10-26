@@ -1,6 +1,8 @@
 // ---- #39 installability: the row never offers a refused install -------------
 // Distinct desktop ids: applyUpdates merges by id, so two rows must not share one.
 
+import { readFileSync } from "node:fs"
+
 import { Model, check } from "../core.mjs"
 
 export function run() {
@@ -262,5 +264,23 @@ export function run() {
           forceQuit: null })
         return Model.findItem("pending.desktop").hasUpdate === true
       })())
+
+    // The #52 card renders desktop-entry names, which are attacker-
+    // controlled: its Texts must declare PlainText so Text never rich-
+    // detects them (adversarial review, 0.11.0). Pinned on the Panel.qml
+    // source itself — same pattern as case 11's jobs.py parity checks.
+    const panelQml = readFileSync(new URL("../../../Panel.qml", import.meta.url), "utf8")
+    const cardBody = (panelQml.match(/id: updateAllCard[\s\S]*?\n          \}/) || [""])[0]
+    const appsLineStart = cardBody.indexOf("root.updateAllSummary.appsLine")
+    const processLineStart = cardBody.indexOf("root.updateAllSummary.processLine")
+    const cardEnd = cardBody.indexOf("Row {", processLineStart)
+    const declaresPlainText = (from) => {
+      const block = cardBody.slice(from, cardEnd > from ? cardEnd : cardBody.length)
+      return /textFormat:\s*Text\.PlainText/.test(block)
+    }
+    check("#52 the card's appsLine Text is PlainText",
+      appsLineStart !== -1 && declaresPlainText(appsLineStart))
+    check("#52 the card's processLine Text is PlainText",
+      processLineStart !== -1 && declaresPlainText(processLineStart))
   }
 }

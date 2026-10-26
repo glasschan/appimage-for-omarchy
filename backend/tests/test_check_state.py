@@ -154,6 +154,48 @@ class VerdictRecordTests(CliTestCase):
         self.assertTrue(app['pending_update'])
         self.assertIsNone(app['pending_installable'])
 
+    def test_a_corrupt_entry_shape_is_not_a_pending_verdict(self):
+        # only a record (dict) or a legacy signature (str) means "a
+        # release is pending". A hand-edited or damaged scalar/container
+        # entry is not a verdict — the normalisers read it as empty, so
+        # the pending flag must agree with them instead of firing on
+        # any non-None value (adversarial review, 0.11.0).
+        for junk in (42, 3.14, ['v2.0'], ('v2.0',), True):
+            with self.subTest(junk=junk):
+                settings.save_updates_state({'fakeapp.desktop': junk})
+                app = self._listing()
+                self.assertFalse(app['pending_update'])
+                self.assertIsNone(app['pending_version'])
+                self.assertIsNone(app['pending_installable'])
+
+    def test_a_hostile_version_is_capped_in_the_record(self):
+        # the record is durable and --list-installed echoes its version
+        # on every poll, so the persisted version is bounded at write
+        # time — a source naming a pathological "release tag" cannot
+        # bloat the state file or the listing (adversarial review, 0.11.0).
+        self._with_manager(self._manager(version='v' * 10_000))
+        _out, err, code = self._check(cli.cmd_list_updates)
+        self.assertEqual(code, 0, err)
+
+        stored = settings.load_updates_state()['fakeapp.desktop']
+        self.assertEqual(stored['version'], 'v' * cli.MAX_PERSISTED_VERSION_CHARS)
+
+        app = self._listing()
+        self.assertTrue(app['pending_update'])
+        self.assertEqual(app['pending_version'],
+                         'v' * cli.MAX_PERSISTED_VERSION_CHARS)
+
+    def test_a_legacy_record_with_a_long_version_is_capped_on_read(self):
+        # a record written before the cap (or hand-edited) is bounded at
+        # the read boundary too, so the listing can never echo an
+        # unbounded version
+        settings.save_updates_state({'fakeapp.desktop': {
+            'signature': 'v2.0|5000', 'installable': True,
+            'version': 'v' * 10_000, 'path': self.el.file_path}})
+        app = self._listing()
+        self.assertEqual(app['pending_version'],
+                         'v' * cli.MAX_PERSISTED_VERSION_CHARS)
+
 
 class VerdictRetirementTests(CliTestCase):
     """A verdict is retired by the truth, never by a silence."""
