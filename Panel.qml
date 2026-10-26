@@ -2546,78 +2546,22 @@ Panel {
           }
 
           // ---- Force-quit confirm card (ticket #27) ---------------------
-          // Shown instead of spawning when Update lands on a row the last
-          // listing said runs. It names the app and how many processes the
-          // confirm will close (the listing's `running_pids`; a count of 0
-          // — unknown — keeps the count-free sentence). Enter confirms, Esc
-          // cancels (PanelKeyCatcher wiring above); Cancel spawns nothing
-          // and leaves the row as it was.
-          BorderSurface {
+          // Extracted to ForceQuitCard.qml (ticket #55): the pinned trio
+          // and the confirm handler (the --kill-running grant) stay here.
+          ForceQuitCard {
             id: forceQuitCard
-            width: parent.width
-            visible: root.forceQuitId !== ""
-            implicitHeight: visible ? forceQuitCol.implicitHeight + Style.spacing.sm * 2 : 0
-            color: Util.alpha(root.urgent, 0.09)
-            borderSpec: Border.flat(Util.alpha(root.urgent, 0.45), Math.max(1, Style.normalBorderWidth))
-            radius: Style.cornerRadius
-
-            Column {
-              id: forceQuitCol
-              width: parent.width - Style.spacing.sm * 2
-              anchors.centerIn: parent
-              spacing: Style.spacing.xs
-
-              Text {
-                text: root.strings.forceQuitTitle
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-              }
-
-              Text {
-                text: Model.forceQuitBody(root.forceQuitName, root.forceQuitPids)
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.WordWrap
-                width: parent.width
-              }
-
-              Row {
-                spacing: Style.spacing.xs
-
-                Button {
-                  text: root.strings.forceQuitConfirm
-                  // The confirm card can outlive its row's job-start reply
-                  // (a slow backend): never stack a second job by hand.
-                  enabled: !root.jobActive(root.forceQuitId)
-                  foreground: root.foreground
-                  accent: root.urgent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.confirmForceQuit()
-                }
-
-                Button {
-                  text: root.strings.pickerCancel
-                  foreground: root.foreground
-                  accent: Color.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.bodySmall
-                  implicitHeight: root.controlHeight
-                  onClicked: root.dismissForceQuit()
-                }
-              }
-
-              Text {
-                text: root.strings.forceQuitKeysHint
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
+            forceQuitId: root.forceQuitId
+            forceQuitName: root.forceQuitName
+            forceQuitPids: root.forceQuitPids
+            jobActive: root.jobActive(root.forceQuitId)
+            strings: root.strings
+            foreground: root.foreground
+            dim: root.dim
+            urgent: root.urgent
+            fontFamily: root.fontFamily
+            controlHeight: root.controlHeight
+            onConfirmed: root.confirmForceQuit()
+            onDismissed: root.dismissForceQuit()
           }
 
           // ---- "Update all" consent card (issue #52) -------------------

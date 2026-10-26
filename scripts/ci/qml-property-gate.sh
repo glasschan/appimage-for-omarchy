@@ -136,6 +136,7 @@ LOCAL_TYPES = {
     'SafeTextField': ('SafeTextField.qml', TEXTFIELD_MEMBERS),
     'ThemeIcon': ('ThemeIcon.qml', ITEM_MEMBERS),
     'PythonDependencyCard': ('PythonDependencyCard.qml', BORDER_MEMBERS),
+    'ForceQuitCard': ('ForceQuitCard.qml', BORDER_MEMBERS),
 }
 
 DECL_RE = re.compile(r'^\s*(?:required\s+|default\s+)*(?:readonly\s+)?'
