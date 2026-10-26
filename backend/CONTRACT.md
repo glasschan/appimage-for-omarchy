@@ -171,6 +171,28 @@ static source instead of erroring. **`--update` and the update managers are
 unaffected**: they keep the strict mandatory-digest policy below, and the
 auto-populated cases 3–5 sources therefore still refuse to install updates.
 
+**Progress stream (`--integrate <url> --json`, ticket #58).** The command
+is no longer silent for the whole transfer: it emits one JSON object per
+line on stdout **ahead of** the single result document, which is unchanged
+and still last. The stream shape is additive:
+
+    {"schema_version": 1, "event": "progress", "phase": "downloading",
+     "bytes": <n>, "total": <n|0>}   while the transfer runs
+    {"event": "progress", "phase": "verifying"}   once the bytes land
+    {"event": "progress", "phase": "installing"}  before the install
+    <the existing result document>   unchanged, last
+
+Downloading documents fire only on percent changes of the declared
+Content-Length (plus the phase transitions), so a ten-minute transfer is a
+few hundred lines; every line is flushed when written. `total` is `0` when
+the server sends no Content-Length — `bytes` is still reported (every
+32 MiB, since there is no length to divide into percent steps). A caller
+that reads only the last line keeps working, and unknown `event` values
+must be ignored. A plain (non-`--json`) integrate keeps its human output
+exactly, and a failing `--json` run still ends with a well-formed error
+document after any progress lines. A local-file integrate emits no progress
+(there is no transfer); the phases exist only for a URL integrate.
+
 ### `--preview-integrate <path-or-url> [--json]`
 
 The offline pre-install preview document: what `--integrate` would do,
