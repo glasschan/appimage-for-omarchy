@@ -12,7 +12,7 @@ import stat
 from . import trash
 from .ini_config import Config
 from .install_writes import _user_applications_dir
-from .provider_types import InstalledStatus
+from .provider_types import AppImageListElement, InstalledStatus
 
 
 class UninstallMixin:

@@ -16,8 +16,8 @@ from .desktop_entry import DesktopEntry
 from . import settings
 from .ini_config import Config
 from .install_writes import _resolve_install_names
-from .provider_types import (AppImageUpdateLogic, InstallPlan, InstalledStatus,
-                             InternalError)
+from .provider_types import (AppImageListElement, AppImageUpdateLogic,
+                             InstallPlan, InstalledStatus, InternalError)
 from .utils import atomic_write, extract_terminal_arguments, run_command
 
 
