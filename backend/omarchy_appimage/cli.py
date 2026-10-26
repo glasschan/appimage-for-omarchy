@@ -1,4 +1,5 @@
 # cli.py — the CLI facade: usage text, verb dispatch table and main (ticket #56).
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # Every verb lives in commands/ (one concern per module): envelope helpers
 # in commands/envelope.py, the integrate/preview verbs in

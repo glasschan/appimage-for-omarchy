@@ -1,4 +1,5 @@
 # provider_listing.py — listing, stale records, running-process
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 # bookkeeping and ELF/type probes (ticket 57).
 #
 # Split out of provider.py as a mixin: `AppImageProvider` composes it, so

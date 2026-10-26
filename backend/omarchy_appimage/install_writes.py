@@ -1,4 +1,5 @@
 # install_writes.py — install name resolution + atomic file writes.
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # Split out of provider.py (ticket 57): the security-relevant write
 # primitives (temp-file + fsync + os.replace contract, the O_NOFOLLOW

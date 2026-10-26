@@ -1,4 +1,5 @@
 # integrate.py — the --integrate and --preview-integrate verbs (ticket #56).
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # Everything URL-shaped lives here too: the release-URL classifier, the
 # release-API asset lookup and the update-source auto-setup the install

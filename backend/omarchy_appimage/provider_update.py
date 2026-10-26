@@ -1,4 +1,5 @@
 # provider_update.py — update-from-URL, version recording and image
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 # metadata (ticket 57).
 #
 # Split out of provider.py as a mixin: `AppImageProvider` composes it, so

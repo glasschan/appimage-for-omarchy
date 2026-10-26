@@ -1,4 +1,5 @@
 # checks.py — the update-check verbs (ticket #56): --list-updates and
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 # --fetch-updates plus their shared core (_check_updates, the tri-state
 # per-app walk) and the durable updates-state record they merge into.
 #

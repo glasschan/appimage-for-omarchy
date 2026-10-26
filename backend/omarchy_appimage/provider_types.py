@@ -1,4 +1,5 @@
 # provider_types.py — the provider's shared data types (stdlib only).
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # Split out of provider.py (ticket 57): InstalledStatus / InternalError /
 # AppImageListElement / InstallPlan are referenced by every provider

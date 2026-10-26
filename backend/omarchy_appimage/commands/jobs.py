@@ -1,4 +1,5 @@
 # jobs.py — the --update --async background job runner (ticket #56).
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # The parent side validates the target, takes the job's atomic claim (the
 # flock on the job log) and double-forks the detached grandchild; the

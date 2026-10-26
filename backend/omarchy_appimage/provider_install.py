@@ -1,4 +1,5 @@
 # provider_install.py — install planning + commit (ticket 57).
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # Split out of provider.py as a mixin: `AppImageProvider` composes it, so
 # `plan_install` / `commit_install` keep their exact signatures (cli.py and

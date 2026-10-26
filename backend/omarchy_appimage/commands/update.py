@@ -1,4 +1,5 @@
 # update.py — the --update verb and the shared update pipeline (ticket #56).
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # run_update is the single update lifecycle, entered through its
 # single-flight claim (the flock on the job log): resolve target →

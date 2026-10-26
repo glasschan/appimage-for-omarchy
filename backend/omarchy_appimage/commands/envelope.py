@@ -1,4 +1,5 @@
 # envelope.py — shared CLI envelope helpers (ticket #56).
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # The helpers every verb reads: JSON printing, the interactive ask, argv
 # flag helpers, option validation, target resolution, the --list-installed
