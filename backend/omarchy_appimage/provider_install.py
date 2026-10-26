@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 from .install_writes import _atomic_install, _atomic_write_bytes
 from .desktop_entry import DesktopEntry
+from . import settings
 from .ini_config import Config
 from .install_writes import _resolve_install_names
 from .provider_types import (AppImageUpdateLogic, InstallPlan, InstalledStatus,
