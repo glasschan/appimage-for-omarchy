@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 from .install_writes import _atomic_install, _atomic_write_bytes
 from .desktop_entry import DesktopEntry
-from . import settings
+from . import launch, settings
 from .ini_config import Config
 from .install_writes import _resolve_install_names
 from .provider_types import (AppImageListElement, AppImageUpdateLogic,
@@ -203,30 +203,17 @@ class InstallMixin:
 
         # install_file used to rewrite the entry once more through
         # update_desktop_file() so it runs with `env VAR=...`. Compute
-        # that FINAL text here instead of writing the file twice, keeping
-        # the exact same precedence: the previous app's env vars are
-        # adopted for an update, and DESKTOPINTEGRATION=1 is appended when
-        # no variable carries it.
-        env_variables = list(el.env_variables)
-        rewrite_exec = False
-        if el.updating_from and el.updating_from.env_variables:
-            env_variables = list(el.updating_from.env_variables)
-            rewrite_exec = True
-        has_desktop_integration = any(
-            v.startswith('DESKTOPINTEGRATION=') for v in env_variables)
-        if not has_desktop_integration:
-            env_variables.append('DESKTOPINTEGRATION=1')
-            rewrite_exec = True
+        # that FINAL text here instead of writing the file twice —
+        # through the ONE launch-command builder (ticket #32), which
+        # owns both the DESKTOPINTEGRATION precedence and the Exec
+        # serialization; tests/test_launch.py pins its bytes.
+        env_variables, rewrite_exec = launch.merge_env_variables(
+            el.env_variables,
+            el.updating_from.env_variables if el.updating_from else None)
 
-        exec_arguments_text = ' '.join(exec_arguments)
         if rewrite_exec:
-            env_vars_prefix = (f'env {" ".join(env_variables)} '
-                               if env_variables else '')
-            jd_desktop_entry.Exec = ''.join([
-                env_vars_prefix,
-                shlex.quote(dest_appimage_file),
-                f' {exec_arguments_text}' if exec_arguments_text else '',
-            ])
+            jd_desktop_entry.Exec = launch.launch_exec_text(
+                dest_appimage_file, exec_arguments, env_variables)
 
         desktop_content = jd_desktop_entry.get_text().encode('utf-8')
 
@@ -257,7 +244,7 @@ class InstallMixin:
             dest_icon_file=dest_appimage_icon_file,
             icon_bytes=icon_bytes,
             desktop_content=desktop_content,
-            exec_arguments=exec_arguments_text,
+            exec_arguments=' '.join(exec_arguments),
             default_exec_arguments=new_default_exec_arguments,
             env_variables=env_variables,
             app_config=app_config,

@@ -15,7 +15,7 @@ import logging
 import os
 import sys
 
-from .. import procs, utils
+from .. import launch, procs, utils
 from ..provider import AppImageProvider
 
 EXIT_OK = 0
@@ -120,6 +120,11 @@ def _make_app_json(el, manager=None, running=None, probe=None,
         # the desktop entry's Exec arguments (field codes stay VERBATIM —
         # the UI strips them), "" when the app has none
         'exec_arguments': getattr(el, 'exec_arguments', '') or '',
+        # additive (schema_version stays 1), ticket #32: the launch command
+        # as argv, built by the ONE launch builder (omarchy_appimage.launch)
+        # — the panel spawns this instead of assembling it in QML.
+        'launch_argv': launch.panel_launch_argv(
+            el.file_path, getattr(el, 'exec_arguments', '') or ''),
         # additive (schema_version stays 1), issue #53: the verdict the
         # last check recorded for this app. `pending` is the record's own
         # entry for this app (None when the record has none): an entry

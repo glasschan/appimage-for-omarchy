@@ -36,6 +36,24 @@ export function run() {
     check("exec_arguments keeps the field codes verbatim",
       !!argsApp && argsApp.exec_arguments.indexOf("%U") !== -1)
 
+    // #32: the launch command as argv, built by the backend's ONE launch
+    // builder — the panel spawns this instead of assembling it in QML.
+    check("launch_argv prefixes env DESKTOPINTEGRATION=1",
+      !!argsApp && Array.isArray(argsApp.launch_argv)
+        && argsApp.launch_argv[0] === "env"
+        && argsApp.launch_argv[1] === "DESKTOPINTEGRATION=1",
+      JSON.stringify(argsApp && argsApp.launch_argv))
+    check("launch_argv carries the image path and drops the field codes",
+      !!argsApp && argsApp.launch_argv[2] === argsApp.path
+        && argsApp.launch_argv[3] === "--no-sandbox"
+        && argsApp.launch_argv.length === 4,
+      JSON.stringify(argsApp && argsApp.launch_argv))
+    check("launch_argv without arguments is just the prefix",
+      !!noArgsApp && Array.isArray(noArgsApp.launch_argv)
+        && noArgsApp.launch_argv.length === 3
+        && noArgsApp.launch_argv[2] === noArgsApp.path,
+      JSON.stringify(noArgsApp && noArgsApp.launch_argv))
+
     // the JS parse logic still handles the live document
     const liveList = Model.parseListJson(listRun.stdout)
     check("live backend document parses in Model", liveList.ok === true

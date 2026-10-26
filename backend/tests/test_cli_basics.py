@@ -70,6 +70,9 @@ class OfflineCliTests(FakeXDGTestCase):
             'name', 'path', 'desktop_id', 'current_version',
             'available_version', 'download_size', 'manager',
             'embedded_source', 'running', 'running_pids', 'exec_arguments',
+            # additive, ticket #32: the launch command as argv, built by
+            # the shared launch builder — the panel spawns this.
+            'launch_argv',
             'verification', 'installable',
             'pending_update', 'pending_version', 'pending_installable'})
         self.assertEqual(app['name'], 'Fake App')
