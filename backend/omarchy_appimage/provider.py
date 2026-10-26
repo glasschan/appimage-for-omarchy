@@ -20,38 +20,21 @@ import re
 import shlex
 import stat
 import tempfile
-from enum import Enum
 from types import SimpleNamespace
 from typing import List, Optional
 
 from . import elf, extractor, settings, trash, updaters
 from .desktop_entry import DesktopEntry
 from .ini_config import Config
+from .provider_types import (AppImageListElement, AppImageUpdateLogic,
+                             InstallPlan, InstalledStatus, InternalError,
+                             _HASH_SUFFIX_RE)
 from .utils import (atomic_write, extract_terminal_arguments, get_file_hash,
                     is_app_running, remove_special_chars, run_command)
 
-
-class InstalledStatus(Enum):
-    NOT_INSTALLED = 0
-    INSTALLED = 1
-    INSTALLING = 6
-
-
-class AppImageUpdateLogic(Enum):
-    REPLACE = 'REPLACE'
-    KEEP = 'KEEP'
-
-
-class InternalError(Exception):
-    def __init__(self, message: str):
-        super().__init__(message)
-        self.message = message
-
-
-# A display Name ending in GearLever's md5-prefix "version" artifact, e.g.
-# "Terax (77efdf)": six lowercase hex chars, the same shape the plugin's
-# lib/Model.js displayName() strips for the panel.
-_HASH_SUFFIX_RE = re.compile(r'^(.*?) \(([0-9a-f]{6})\)$')
+# Split modules (ticket 57): these names moved verbatim and are re-exported
+# here so the existing import surface (`omarchy_appimage.provider`) is
+# unchanged for cli.py and the test suite.
 
 
 def _resolve_install_names(source_basename: str, desktop_name, version: str,
@@ -236,32 +219,6 @@ class AppImageListElement():
 
     def get_config(self):
         return Config.get_app_config(self)
-
-
-@dataclasses.dataclass
-class InstallPlan:
-    """Everything an install will write, resolved and validated up front.
-
-    `AppImageProvider.plan_install` returns one of these after reading the
-    source image (extraction into a temp dir is a read) and proving the
-    whole install can succeed; `commit_install` then performs every write
-    in the order the ported GearLever flow used. Splitting the two means a
-    refused install — no root desktop entry, no desktop file to point at,
-    an Exec line that does not parse — leaves the managed folder, `.icons`,
-    the applications directory and apps.ini untouched."""
-    source_appimage: str
-    dest_appimage_file: str
-    desktop_id: str                       # app/desktop/icon file stem
-    dest_desktop_file_path: str
-    dest_icon_file: Optional[str]
-    icon_bytes: Optional[bytes]
-    desktop_content: bytes
-    exec_arguments: str
-    default_exec_arguments: str
-    env_variables: List[str]
-    app_config: dict
-    version: str
-    remove_original: bool
 
 
 class AppImageProvider():
