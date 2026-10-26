@@ -12,12 +12,16 @@
 #
 
 import os
+import shlex
 import stat
+import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from helpers import FakeXDGTestCase
 
+from omarchy_appimage import constants, launch
 from omarchy_appimage import extractor
 from omarchy_appimage.desktop_entry import DesktopEntry
 from omarchy_appimage.ini_config import Config
@@ -161,6 +165,8 @@ class PlanOnlyTests(InstallPlanTestCase):
         self.assertEqual(plan.app_config['icon_path'], plan.dest_icon_file)
         self.assertEqual(plan.app_config['default_exec_arguments'],
                          '--flag %F')
+        self.assertEqual(plan.app_config['launch_backend_dir'],
+                         constants.backend_dir())
         self.assertIn(b'Name=Demo App (1.2.3)\n', plan.desktop_content)
 
 
@@ -185,7 +191,14 @@ class SuccessfulInstallTests(InstallPlanTestCase):
             self.assertEqual(f.read(), (
                 '[Desktop Entry]\n'
                 'Name=Demo App (1.2.3)\n'
-                f'Exec=env DESKTOPINTEGRATION=1 {appimage} --flag %F\n'
+                # the scale-aware entry point (ticket #34): the launch
+                # goes through <python> <backend>/main.py
+                # --exec-with-scale <image>, the image's own arguments
+                # and field codes riding along verbatim
+                f'Exec=env DESKTOPINTEGRATION=1 '
+                f'{shlex.quote(sys.executable)} '
+                f'{shlex.quote(launch.entry_point_script(constants.backend_dir()))} '  # noqa: E501
+                f'--exec-with-scale {appimage} --flag %F\n'
                 f'TryExec={appimage}\n'
                 f'Icon={icon}\n'
                 'Type=Application\n'
@@ -201,6 +214,8 @@ class SuccessfulInstallTests(InstallPlanTestCase):
         self.assertEqual(config['desktop_file_path'], desktop)
         self.assertEqual(config['icon_path'], icon)
         self.assertEqual(config['default_exec_arguments'], '--flag %F')
+        self.assertEqual(config['launch_backend_dir'],
+                         constants.backend_dir())
 
         self.assertEqual(el.exec_arguments, '--flag %F')
         self.assertEqual(el.env_variables, ['DESKTOPINTEGRATION=1'])
@@ -218,6 +233,136 @@ class SuccessfulInstallTests(InstallPlanTestCase):
         self.assertFalse(os.path.exists(stale))
         self.assertTrue(os.path.exists(
             os.path.join(icons, 'demo_app.png')))
+
+
+class EntryPointLaunchTests(InstallPlanTestCase):
+    """Ticket #34: the desktop entry's Exec goes through the scale-aware
+    entry point, the plugin backend directory is recorded once, and a
+    re-integrate/update rewrites the Exec with the app's own arguments
+    and field codes preserved."""
+
+    def expected_exec(self, appimage, args_text=''):
+        """The Exec line a fresh install must write, spelled out rather
+        than delegated to the builder under test."""
+        text = (f'env DESKTOPINTEGRATION=1 {shlex.quote(sys.executable)} '
+                f'{shlex.quote(launch.entry_point_script(constants.backend_dir()))} '  # noqa: E501
+                f'--exec-with-scale {appimage}')
+        if args_text:
+            text += f' {args_text}'
+        return text
+
+    def installed_exec(self, el) -> str:
+        self.provider.install_file(el)
+        with open(os.path.join(self.applications_dir,
+                               'demo_app.desktop')) as f:
+            for line in f:
+                if line.startswith('Exec='):
+                    return line[5:].strip()
+        self.fail('no Exec line written')
+
+    def test_field_codes_survive_verbatim(self):
+        el = self.element()
+        self.assertEqual(self.installed_exec(el),
+                         self.expected_exec(
+                             os.path.join(self.managed_dir,
+                                          'demo_app.appimage'),
+                             '--flag %F'))
+
+    def test_custom_exec_arguments_are_preserved_on_re_integrate(self):
+        # the user customised the arguments after the first install; a
+        # re-integrate (KEEP) adopts them into the NEW entry-point Exec
+        appimage = os.path.join(self.managed_dir, 'demo_app.appimage')
+        el = self.element()
+        el.updating_from = SimpleNamespace(
+            file_path=appimage,
+            desktop_file_path=os.path.join(self.applications_dir,
+                                           'demo_app.desktop'),
+            exec_arguments='--my-custom-flag %U',
+            env_variables=['DESKTOPINTEGRATION=1'])
+        el.updating_from.exec_arguments = '--my-custom-flag %U'
+
+        previous = SimpleNamespace(file_path=appimage, name='Demo App')
+        Config.set_app_config(previous, {'default_exec_arguments':
+                                         '--flag %F'})
+
+        self.assertEqual(
+            self.installed_exec(el),
+            self.expected_exec(appimage, '--my-custom-flag %U'))
+
+    def test_entry_round_trips_through_the_listing_reader(self):
+        # the listing must recover the image's own arguments from the
+        # entry-point Exec (not the wrapper tokens)
+        el = self.element()
+        self.provider.install_file(el)
+
+        from omarchy_appimage import provider as provider_module
+        listed = provider_module.AppImageProvider().list_installed()
+
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0].exec_arguments, '--flag %F')
+        self.assertEqual(listed[0].env_variables,
+                         ['DESKTOPINTEGRATION=1'])
+        self.assertEqual(listed[0].file_path,
+                         os.path.join(self.managed_dir,
+                                      'demo_app.appimage'))
+
+    def test_desktop_actions_launch_through_the_entry_point_too(self):
+        desktop_content = DESKTOP + (
+            '\n[Desktop Action New]\n'
+            'Name=New Window\n'
+            'Exec=demo --new-window\n'
+            'Icon=demo\n')
+        el = self.element(desktop_content=desktop_content)
+        self.provider.install_file(el)
+
+        with open(os.path.join(self.applications_dir,
+                               'demo_app.desktop')) as f:
+            content = f.read()
+        self.assertIn(
+            f'Exec={sys.executable} '
+            f'{launch.entry_point_script(constants.backend_dir())} '
+            '--exec-with-scale '
+            f'{os.path.join(self.managed_dir, "demo_app.appimage")} '
+            '--new-window',
+            content)
+
+    def test_install_creates_nothing_beyond_the_three_artifacts(self):
+        # ticket #34: the launch path adds NO new file. The install
+        # footprint stays AppImage + .desktop + icon (plus the .icons
+        # directory), so Remove's existing containment covers everything
+        # the integrate created and nothing can orphan.
+        el = self.element()
+        self.provider.install_file(el)
+
+        self.assertEqual(sorted(os.listdir(self.managed_dir)),
+                         ['.icons', 'demo_app.appimage'])
+        self.assertEqual(sorted(os.listdir(
+            os.path.join(self.managed_dir, '.icons'))),
+            ['demo_app.png'])
+        self.assertEqual([n for n in sorted(os.listdir(self.applications_dir))
+                          if n != 'mimeinfo.cache'],
+                         ['demo_app.desktop'])
+
+    def test_remove_deletes_everything_the_integrate_created(self):
+        # the launch path adds no file of its own, so Remove's existing
+        # three-artifact removal already covers the whole integrate
+        # footprint: no orphan (launcher shim, wrapper script, ...) can
+        # be left behind
+        from omarchy_appimage import provider as provider_module
+        el = self.element()
+        self.provider.install_file(el)
+        listed = provider_module.AppImageProvider().list_installed()
+        self.assertEqual(len(listed), 1)
+
+        self.provider.uninstall(listed[0])
+
+        self.assertEqual([n for n in os.listdir(self.managed_dir)
+                          if n != '.icons'], [])
+        self.assertEqual(os.listdir(
+            os.path.join(self.managed_dir, '.icons')), [])
+        self.assertEqual([n for n in os.listdir(self.applications_dir)
+                          if n != 'mimeinfo.cache'], [])
+        self.assertEqual(Config.get_app_config(listed[0]), {})
 
 
 class BeforeReplaceOrderingTests(InstallPlanTestCase):

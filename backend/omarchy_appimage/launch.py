@@ -23,14 +23,31 @@ whitespace-split exec arguments with the desktop field codes (%f %F %u %U
 %i %c %d %k) dropped, because the panel has no file or URL to hand over.
 """
 
+import os
 import re
 import shlex
+import sys
 
 DESKTOPINTEGRATION_ENV = 'DESKTOPINTEGRATION=1'
+
+# The scale-aware entry point (tickets #33/#34): the desktop entry's
+# `Exec=` invokes `<python> <backend>/main.py --exec-with-scale <image>
+# [args]` instead of the raw image, so a launcher click gets the focused
+# monitor's scale. The plugin's backend directory is recorded per app at
+# integrate time (`launch_backend_dir` in apps.ini) and rebuilt from the
+# CURRENT directory by the install and repair paths, so a plugin update
+# that moves the directory re-points existing entries instead of
+# breaking them.
+EXEC_SCALE_FLAG = '--exec-with-scale'
+ENTRY_POINT_SCRIPT = 'main.py'
 
 # Exact-match desktop field codes (Exec spec): dropped on launch because
 # nothing can fill them. A partial match (%U1, file%U) is a real argument.
 _FIELD_CODE = re.compile(r'%[fFuUicdk]')
+
+# An env assignment as `env` writes it: NAME=value with a bare variable
+# name (never a path — a path can carry '=' and is not an assignment).
+_ENV_ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
 
 
 def merge_env_variables(current, previous):
@@ -73,6 +90,75 @@ def launch_exec_text(image_path, exec_arguments, env_variables):
         shlex.quote(image_path),
         f' {exec_arguments_text}' if exec_arguments_text else '',
     ])
+
+
+def entry_point_script(backend_dir) -> str:
+    """The absolute path of the scale-aware entry point inside
+    `backend_dir` (the plugin's backend directory)."""
+    return os.path.join(backend_dir, ENTRY_POINT_SCRIPT)
+
+
+def entry_point_argv(backend_dir, image_path, exec_arguments,
+                     env_variables=(DESKTOPINTEGRATION_ENV,),
+                     python_executable=None):
+    """The entry-point launch command as argv tokens: optional `env`
+    prefix, `<python> <backend>/main.py`, the `--exec-with-scale` flag,
+    the image, then the (already parsed) arguments verbatim."""
+    python = python_executable or sys.executable
+    tokens = [python, entry_point_script(backend_dir), EXEC_SCALE_FLAG,
+              image_path, *exec_arguments]
+    if env_variables:
+        tokens = ['env', *env_variables, *tokens]
+    return tokens
+
+
+def entry_point_exec_text(backend_dir, image_path, exec_arguments,
+                          env_variables=(DESKTOPINTEGRATION_ENV,),
+                          python_executable=None):
+    """The desktop file's ``Exec=`` text for the entry-point launch: the
+    same serialization rules as ``launch_exec_text`` (env prefix joined
+    with spaces, every path shlex-quoted, arguments joined raw so the
+    desktop field codes survive verbatim). An empty environment drops
+    the ``env`` prefix entirely."""
+    python = python_executable or sys.executable
+    env_vars_prefix = f'env {" ".join(env_variables)} ' if env_variables \
+        else ''
+    exec_arguments_text = ' '.join(exec_arguments)
+    return ''.join([
+        env_vars_prefix,
+        shlex.quote(python), ' ',
+        shlex.quote(entry_point_script(backend_dir)), ' ',
+        EXEC_SCALE_FLAG, ' ',
+        shlex.quote(image_path),
+        f' {exec_arguments_text}' if exec_arguments_text else '',
+    ])
+
+
+def parse_entry_point_exec(exec_text):
+    """Read back an ``Exec=`` written by ``entry_point_exec_text``.
+
+    Returns ``{'env_variables', 'image_path', 'arguments'}`` or None when
+    the text is not the entry-point shape (a legacy raw-image Exec, or an
+    app whose own first argument merely looks like one). The env
+    assignments are recognised between ``env`` and the interpreter only —
+    a bare NAME=value form, never a path."""
+    try:
+        tokens = shlex.split(exec_text)
+    except ValueError:
+        return None
+    index = 1 if tokens and tokens[0] == 'env' else 0
+    env_variables = []
+    while index < len(tokens) and _ENV_ASSIGNMENT.match(tokens[index]):
+        env_variables.append(tokens[index])
+        index += 1
+    remaining = tokens[index:]
+    if len(remaining) < 4:
+        return None
+    _python, script, flag, image_path = remaining[:4]
+    if flag != EXEC_SCALE_FLAG or not script.endswith(ENTRY_POINT_SCRIPT):
+        return None
+    return {'env_variables': env_variables, 'image_path': image_path,
+            'arguments': list(remaining[4:])}
 
 
 def panel_launch_argv(image_path, exec_arguments_text):

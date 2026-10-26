@@ -8,8 +8,10 @@
 # stay exactly what the pre-#32 assembly produced at each site.
 
 import shlex
+import sys
 import unittest
 
+import helpers  # noqa: F401 — puts the backend dir on sys.path
 from omarchy_appimage import launch
 
 
@@ -132,6 +134,106 @@ class LaunchExecTextTests(unittest.TestCase):
             launch.launch_exec_text('/a', ['--x="a b"'],
                                     ['DESKTOPINTEGRATION=1']),
             'env DESKTOPINTEGRATION=1 /a --x="a b"')
+
+
+class EntryPointArgvTests(unittest.TestCase):
+    """The entry-point argv (ticket #34): what the repair path
+    serialises with shlex.join."""
+
+    def test_shape_with_default_env(self):
+        self.assertEqual(
+            launch.entry_point_argv('/plugins/backend', '/apps/foo.appimage',
+                                    ['--flag', '%F']),
+            ['env', 'DESKTOPINTEGRATION=1', sys.executable,
+             '/plugins/backend/main.py', '--exec-with-scale',
+             '/apps/foo.appimage', '--flag', '%F'])
+
+    def test_explicit_python_executable(self):
+        argv = launch.entry_point_argv(
+            '/b', '/a', [], python_executable='/usr/bin/python3')
+        self.assertEqual(
+            argv,
+            ['env', 'DESKTOPINTEGRATION=1', '/usr/bin/python3',
+             '/b/main.py', '--exec-with-scale', '/a'])
+
+    def test_empty_env_drops_the_env_token(self):
+        self.assertEqual(
+            launch.entry_point_argv('/b', '/a', [], env_variables=[]),
+            [sys.executable, '/b/main.py', '--exec-with-scale', '/a'])
+
+
+class EntryPointExecTextTests(unittest.TestCase):
+    """The entry-point `Exec=` serialization (ticket #34)."""
+
+    def test_full_shape(self):
+        self.assertEqual(
+            launch.entry_point_exec_text(
+                '/plugins/backend', '/apps/foo.appimage',
+                ['--flag', '%F'],
+                python_executable='/usr/bin/python3'),
+            'env DESKTOPINTEGRATION=1 /usr/bin/python3 '
+            '/plugins/backend/main.py --exec-with-scale '
+            '/apps/foo.appimage --flag %F')
+
+    def test_field_codes_survive_verbatim(self):
+        for code in ('%f', '%F', '%u', '%U', '%i', '%c', '%d', '%k'):
+            text = launch.entry_point_exec_text(
+                '/b', '/a', ['--flag', code],
+                python_executable='/usr/bin/python3')
+            self.assertTrue(text.endswith(f'--flag {code}'), code)
+
+    def test_paths_are_quoted(self):
+        self.assertEqual(
+            launch.entry_point_exec_text(
+                '/my plug/backend', '/apps/my app.appimage', [],
+                python_executable='/usr/bin/py thon3'),
+            "env DESKTOPINTEGRATION=1 '/usr/bin/py thon3' "
+            "'/my plug/backend/main.py' --exec-with-scale "
+            "'/apps/my app.appimage'")
+
+
+class ParseEntryPointExecTests(unittest.TestCase):
+    """Reading back what entry_point_exec_text wrote."""
+
+    def test_round_trip(self):
+        text = launch.entry_point_exec_text(
+            '/plugins/backend', '/apps/foo.appimage',
+            ['--no-sandbox', '%U'],
+            env_variables=['DESKTOPINTEGRATION=1', 'GTK_THEME=Adwaita'],
+            python_executable='/usr/bin/python3')
+        self.assertEqual(
+            launch.parse_entry_point_exec(text),
+            {'env_variables': ['DESKTOPINTEGRATION=1', 'GTK_THEME=Adwaita'],
+             'image_path': '/apps/foo.appimage',
+             'arguments': ['--no-sandbox', '%U']})
+
+    def test_legacy_raw_image_exec_is_not_the_entry_point(self):
+        self.assertIsNone(launch.parse_entry_point_exec(
+            'env DESKTOPINTEGRATION=1 /apps/foo.appimage --flag %F'))
+
+    def test_plain_exec_is_not_the_entry_point(self):
+        self.assertIsNone(launch.parse_entry_point_exec('/apps/foo %F'))
+
+    def test_quoted_paths_round_trip(self):
+        text = launch.entry_point_exec_text(
+            '/my plug/backend', '/apps/my app.appimage', [],
+            python_executable='/usr/bin/py thon3')
+        self.assertEqual(
+            launch.parse_entry_point_exec(text),
+            {'env_variables': ['DESKTOPINTEGRATION=1'],
+             'image_path': '/apps/my app.appimage',
+             'arguments': []})
+
+    def test_unparseable_text_is_rejected(self):
+        self.assertIsNone(launch.parse_entry_point_exec('env "unclosed'))
+
+    def test_action_shape_without_env_prefix(self):
+        self.assertEqual(
+            launch.parse_entry_point_exec(
+                '/usr/bin/python3 /b/main.py --exec-with-scale /a '
+                '--new-window'),
+            {'env_variables': [], 'image_path': '/a',
+             'arguments': ['--new-window']})
 
 
 class PanelLaunchArgvTests(unittest.TestCase):

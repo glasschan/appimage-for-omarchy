@@ -11,8 +11,9 @@ import filecmp
 import logging
 import os
 import shlex
+from types import SimpleNamespace
 
-from . import elf, launch, settings
+from . import constants, elf, launch, settings
 from .desktop_entry import DesktopEntry
 from .ini_config import Config
 from .provider_types import AppImageListElement, InstalledStatus, InternalError
@@ -80,8 +81,22 @@ class ListingMixin:
                     continue
 
                 exec_location = entry.getTryExec()
-                exec_command_data = extract_terminal_arguments(entry.getExec())
-                exec_arguments = ' '.join(exec_command_data['arguments'])
+                # The entry-point shape (ticket #34: `env ... python
+                # main.py --exec-with-scale <image> [args]`) is parsed by
+                # the launch module's reader, which recovers the image's
+                # own arguments verbatim; anything else (a legacy
+                # raw-image Exec written by an older plugin, or an
+                # app-clobbered entry) falls back to the heuristic
+                # GearLever parser.
+                entry_point = launch.parse_entry_point_exec(entry.getExec())
+                if entry_point is not None:
+                    exec_arguments = ' '.join(entry_point['arguments'])
+                    exec_env_variables = entry_point['env_variables']
+                else:
+                    exec_command_data = extract_terminal_arguments(
+                        entry.getExec())
+                    exec_arguments = ' '.join(exec_command_data['arguments'])
+                    exec_env_variables = exec_command_data['env_vars']
                 recovered = False
 
                 if not os.path.isfile(exec_location):
@@ -101,7 +116,7 @@ class ListingMixin:
                             recorded)
                         # env vars from the clobbered entry are unreliable;
                         # the repaired entry below restores the standard ones
-                        exec_command_data['env_vars'] = []
+                        exec_env_variables = []
                     else:
                         logging.debug('%s skipped because %s does not exist',
                                       desktop_path, exec_location)
@@ -136,7 +151,7 @@ class ListingMixin:
                         trusted=True,
                         external_folder=(not exec_in_default_folder),
                         exec_arguments=exec_arguments,
-                        env_variables=exec_command_data['env_vars'],
+                        env_variables=exec_env_variables,
                         size=file_size,
                     )
                     list_element.architecture = None
@@ -144,6 +159,10 @@ class ListingMixin:
                     if recovered:
                         self._repair_clobbered_desktop(desktop_path,
                                                        recorded)
+                    self._repair_entry_point_dir(
+                        desktop_path, desktop_to_config.get(desktop_path),
+                        entry, exec_location, exec_arguments,
+                        exec_env_variables)
                 else:
                     logging.debug('%s skipped because %s is not a '
                                   'supported file type',
@@ -202,12 +221,65 @@ class ListingMixin:
         default_args = recorded.get('default_exec_arguments', '') or ''
         args = shlex.split(default_args) if default_args.strip() else []
         entry.TryExec = appimage
-        entry.Exec = shlex.join(
-            launch.launch_argv(appimage, args))
+        # the scale-aware entry point (ticket #34), built by the ONE
+        # launch builder with the CURRENT backend directory
+        entry.Exec = shlex.join(launch.entry_point_argv(
+            constants.backend_dir(), appimage, args))
         entry.Icon = icon
         entry.write_file(desktop_path)
         self._repaired_desktop_paths.add(desktop_path)
         logging.info('repaired clobbered desktop entry: %s', desktop_path)
+
+    def _repair_entry_point_dir(self, desktop_path, recorded, entry,
+                                appimage_path, exec_arguments,
+                                env_variables):
+        """Re-point an entry-point Exec at the CURRENT plugin backend
+        directory (ticket #34).
+
+        The directory recorded at integrate time (`launch_backend_dir` in
+        apps.ini) is compared against constants.backend_dir() on every
+        listing; a plugin update that moved the directory (or an
+        uninstall-leftover recorded path) re-points the entry instead of
+        leaving a dead Exec behind. Entries recorded before ticket #34
+        carry no key and are left alone — they adopt the entry point on
+        their next update or re-integrate, never from a passive listing.
+        The re-point is persisted in the record, so it happens once; the
+        per-instance set only guards a record write that keeps failing."""
+        recorded_dir = (recorded or {}).get('launch_backend_dir') or ''
+        if not recorded_dir:
+            return
+        current_dir = constants.backend_dir()
+        if recorded_dir == current_dir and os.path.isfile(
+                launch.entry_point_script(current_dir)):
+            return
+        if desktop_path in self._repaired_desktop_paths:
+            return
+        try:
+            args = (shlex.split(exec_arguments)
+                    if exec_arguments.strip() else [])
+        except ValueError as e:
+            logging.warning('entry-point repair: could not parse the '
+                            'arguments of %s: %s', desktop_path, e)
+            return
+        try:
+            entry.Exec = launch.entry_point_exec_text(
+                current_dir, appimage_path, args,
+                env_variables=list(env_variables or []))
+            entry.write_file(desktop_path)
+        except Exception as e:
+            logging.warning('entry-point repair: could not rewrite %s: %s',
+                            desktop_path, e)
+            return
+        self._repaired_desktop_paths.add(desktop_path)
+        if recorded is not None:
+            updated = dict(recorded)
+            updated['launch_backend_dir'] = current_dir
+            Config.set_app_config(
+                SimpleNamespace(file_path=appimage_path,
+                                name=recorded.get('name', '') or ''),
+                updated)
+        logging.info('re-pointed desktop entry at the current plugin '
+                     'directory: %s', desktop_path)
 
     def is_installed(self, el: AppImageListElement) -> bool:
         if el.file_path and os.path.exists(self._get_appimages_default_destination_path()):
