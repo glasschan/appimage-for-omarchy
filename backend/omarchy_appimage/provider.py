@@ -11,37 +11,31 @@
 #   * Gio.File.trash()                 -> trash.py (FreeDesktop spec)
 # Everything else (naming, conflict resolution, desktop entry rewriting,
 # update logic hooks) follows upstream behaviour.
+#
+# Since ticket 57 the provider is split by responsibility; this module is
+# the composition root + stable import surface:
+#   provider_types.py     data types (InstalledStatus, InternalError,
+#                         AppImageListElement, InstallPlan)
+#   install_writes.py     install name resolution + atomic file writes
+#   provider_listing.py   ListingMixin (listing, stale records, probes)
+#   provider_install.py   InstallMixin (plan_install / commit_install)
+#   provider_update.py    UpdateMixin (update_from_url, versions, metadata)
+#   provider_uninstall.py UninstallMixin (containment-bound removal)
+# The names below are re-exported verbatim so every existing importer
+# (`omarchy_appimage.provider import ...` in cli.py and the tests) keeps
+# working unchanged.
 
-import dataclasses
-import filecmp
-import logging
-import os
-import re
-import shlex
-import stat
-import tempfile
-from types import SimpleNamespace
-from typing import List, Optional
-
-from . import elf, extractor, settings, trash, updaters
-from .desktop_entry import DesktopEntry
-from .ini_config import Config
-from .provider_types import (AppImageListElement, AppImageUpdateLogic,
-                             InstallPlan, InstalledStatus, InternalError,
-                             _HASH_SUFFIX_RE)
+from . import settings
 from .install_writes import (_atomic_install, _atomic_write_bytes,
-                              _replace_destination, _resolve_install_names,
-                              _user_applications_dir, resolve_install_names)
-from .provider_listing import ListingMixin
+                             _replace_destination, _resolve_install_names,
+                             _user_applications_dir, resolve_install_names)
 from .provider_install import InstallMixin
-from .provider_update import UpdateMixin
+from .provider_listing import ListingMixin
+from .provider_types import (AppImageListElement, AppImageUpdateLogic,
+                             InstallPlan, InstalledStatus, InternalError)
 from .provider_uninstall import UninstallMixin
-from .utils import (atomic_write, extract_terminal_arguments, get_file_hash,
-                    is_app_running, remove_special_chars, run_command)
-
-# Split modules (ticket 57): these names moved verbatim and are re-exported
-# here so the existing import surface (`omarchy_appimage.provider`) is
-# unchanged for cli.py and the test suite.
+from .provider_update import UpdateMixin
+from .utils import remove_special_chars
 
 
 class AppImageProvider(ListingMixin, InstallMixin, UpdateMixin,
