@@ -236,6 +236,37 @@ X-AppImage-Version=1.0
             ['env', 'DESKTOPINTEGRATION=1', app['path']])
 
 
+class LaunchScaleArgvCliTests(LaunchArgvCliTests):
+    """`launch_scale_argv` (ticket #35): the argv tail for the backend's
+    `--exec-with-scale` entry point — the image plus its own arguments,
+    field codes dropped. The panel spawns
+    `[backendCommand..., '--exec-with-scale', *launch_scale_argv]` so the
+    panel launch shares the launcher's scale mechanism; `launch_argv`
+    stays for an older shell pairing and as the non-scale fallback.
+    Additive key; schema_version stays 1."""
+
+    def test_launch_scale_argv_leads_with_the_image(self):
+        self._install_with_exec('--no-sandbox %U')
+        app = self._listed()
+        self.assertEqual(app['launch_scale_argv'],
+                         [app['path'], '--no-sandbox'])
+
+    def test_launch_scale_argv_drops_the_field_codes(self):
+        self._install_with_exec('--flag %U')
+        app = self._listed()
+        self.assertEqual(app['launch_scale_argv'], [app['path'], '--flag'])
+
+    def test_launch_scale_argv_without_arguments_is_just_the_image(self):
+        self._install_with_exec('')
+        app = self._listed()
+        self.assertEqual(app['launch_scale_argv'], [app['path']])
+
+    def test_launch_scale_argv_agrees_with_launch_argv_behind_the_prefix(self):
+        self._install_with_exec('--no-sandbox %U')
+        app = self._listed()
+        self.assertEqual(app['launch_argv'][2:], app['launch_scale_argv'])
+
+
 class StaleRecordCliTests(FakeXDGTestCase):
     """A record whose .desktop file is gone is logged, never removed
     automatically, and can be cleaned up explicitly by its desktop id."""

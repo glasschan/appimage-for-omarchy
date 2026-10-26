@@ -32,6 +32,7 @@ import math
 import os
 
 from . import constants
+from .launch import DESKTOPINTEGRATION_ENV
 from .utils import run_command
 
 # The focused-monitor scale lives in the Wayland compositor. Omarchy is
@@ -134,8 +135,31 @@ def launch_env(environment, scale):
     return env
 
 
+# The managed-launch stamp (ticket #35): every launch the plugin
+# performs is a managed one — the launch builder (launch.py) writes
+# DESKTOPINTEGRATION=1 into the desktop entry's Exec and the panel's
+# env-prefixed `launch_argv`. The panel's scale-aware launch goes
+# through this backend CLI, and its detached spawn cannot carry env
+# vars, so the VERB applies the same stamp itself (append-if-absent:
+# a caller variable carrying the name always wins). Serialized as the
+# `VAR=VALUE` text launch.py owns; split here.
+PLUGIN_LAUNCH_ENV = dict(
+    pair.split('=', 1) for pair in (DESKTOPINTEGRATION_ENV,))
+
+
+def exec_env(environment, scale, extra_env=None):
+    """The full handover environment: `launch_env`'s GDK_SCALE result,
+    then `extra_env` applied with `setdefault` semantics — a caller
+    value always wins, and the caller's own map is never mutated.
+    Pure and seam-free so the tests drive every branch."""
+    env = launch_env(environment, scale)
+    for key, value in (extra_env or {}).items():
+        env.setdefault(key, value)
+    return env
+
+
 def exec_with_scale(image_path: str, arguments, environment=None,
-                    query=focused_scale):
+                    query=focused_scale, extra_env=None):
     """Compute the launch environment, then REPLACE this process with
     the image. Never returns on success; a failed exec (missing image,
     not executable) raises and the CLI's error path reports it.
@@ -143,8 +167,10 @@ def exec_with_scale(image_path: str, arguments, environment=None,
     `query` is the compositor-query seam (tests mock it). On any
     unusable answer the child inherits the caller's environment
     unchanged — a launch never fails because the scale could not be
-    determined."""
+    determined. `extra_env` (default None: the bare #33 handover) is
+    merged with setdefault semantics AFTER the GDK_SCALE adjustment;
+    the verb passes PLUGIN_LAUNCH_ENV."""
     if environment is None:
         environment = constants.process_environment()
-    env = launch_env(environment, query())
+    env = exec_env(environment, query(), extra_env)
     os.execve(image_path, [image_path, *arguments], env)

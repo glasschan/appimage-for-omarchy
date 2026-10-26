@@ -75,11 +75,29 @@ def launch_exec_text(image_path, exec_arguments, env_variables):
     ])
 
 
+def _panel_exec_args(exec_arguments_text):
+    """The image's own launch tokens, whitespace-split with the desktop
+    field codes dropped — the shared token set behind both panel keys
+    (`launch_argv`, `launch_scale_argv`)."""
+    args = exec_arguments_text.split()
+    return [a for a in args if not _FIELD_CODE.fullmatch(a)]
+
+
 def panel_launch_argv(image_path, exec_arguments_text):
     """The argv the panel spawns: ``launch_argv`` over the reported
     exec-argument string, whitespace-split with the desktop field codes
     dropped — byte-identical to what Panel.qml's launchItem assembled
     before ticket #32 moved the assembly here."""
-    args = exec_arguments_text.split()
-    args = [a for a in args if not _FIELD_CODE.fullmatch(a)]
-    return launch_argv(image_path, args)
+    return launch_argv(image_path, _panel_exec_args(exec_arguments_text))
+
+
+def panel_exec_scale_argv(image_path, exec_arguments_text):
+    """The argv tail for the backend's ``--exec-with-scale`` entry point
+    (ticket #35): the image followed by its own arguments — the same
+    token set ``panel_launch_argv`` places behind the ``env`` prefix,
+    minus the env part. The panel spawns
+    ``[backendCommand..., '--exec-with-scale', *this]``; the verb stamps
+    ``DESKTOPINTEGRATION=1`` itself (the detached spawn cannot carry env
+    vars), so no env prefix belongs here and both surfaces — launcher
+    and panel — share the scale mechanism by construction."""
+    return [image_path, *_panel_exec_args(exec_arguments_text)]
