@@ -430,6 +430,16 @@ class IconSafeCliTests(InProcessCliMixin, FakeXDGTestCase):
                                side_effect=AssertionError('fast path')):
             self.assertTrue(self._list()['icon_safe'])
 
+    def test_a_clean_poll_writes_no_registry_save(self):
+        # the registry write must not run on every 10 s poll: once every
+        # candidate carries a current verdict, the listing persists
+        # nothing
+        self._write_icon(self._hostile_png())
+        self.assertTrue(self._list()['icon_safe'])   # proof + save
+        with mock.patch.object(icon, 'save_sanitized_registry') as save:
+            self.assertTrue(self._list()['icon_safe'])  # registry hit
+        save.assert_not_called()
+
     def test_registry_save_failure_never_fails_the_listing(self):
         # a registry write failure is best-effort by contract: the
         # listing still succeeds and still reports its verdict

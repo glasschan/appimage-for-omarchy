@@ -4,9 +4,16 @@
 // must keep the built-in glyph unless it is exactly true. The mapping is
 // pinned here; the real backend's verdict is pinned in the Python suite.
 
+import { readFileSync } from "node:fs"
 import { Model, check } from "../core.mjs"
 
 export function run() {
+  // Pin the ENFORCING expression too: without this, deleting AppRow's
+  // `iconSafe === true` conjunct would show unproved icons with every other
+  // check green. The candidate ORDER matters as well — the panel probes
+  // .png first, then .svg (the same order the backend verdicts).
+  const appRowSrc = readFileSync(
+    new URL("../../../AppRow.qml", import.meta.url), "utf8")
   const listed = (entry) => Model.parseListJson(JSON.stringify({
     schema_version: 1,
     installed: [Object.assign({
@@ -37,4 +44,16 @@ export function run() {
   check("#62 iconBase is still derived alongside the gate",
     based.iconBase === "/x/.icons/icon" && based.iconSafe === true,
     JSON.stringify({ base: based.iconBase, safe: based.iconSafe }))
+
+  // ---- pin: the enforcing expression in AppRow.qml --------------------
+  // Both failures below must FAIL the case (test_security_coverage.py
+  // reads this file, so the pin itself is CI-covered).
+  check("#62 AppRow gates the icon candidates on iconSafe === true",
+    appRowSrc.includes("iconSafe === true"),
+    "the iconSafe === true conjunct is missing from AppRow.qml")
+  const pngAt = appRowSrc.indexOf('".png"')
+  const svgAt = appRowSrc.indexOf('".svg"')
+  check("#62 AppRow probes .png before .svg",
+    pngAt !== -1 && svgAt !== -1 && pngAt < svgAt,
+    JSON.stringify({ pngAt, svgAt }))
 }

@@ -69,11 +69,21 @@ then `.svg`) — via the persisted per-file verdict registry
 (`sanitized-icons.json`, see *Filesystem layout*) or a fresh verification
 that may rewrite the file. The listing is the proof, and it never relaxes
 the sweep: a file that cannot be sanitised reports `icon_safe: false` and
-stays on disk (deletion belongs to the sweep). **The panel renders its
-built-in glyph unless `icon_safe` is exactly true** — the shell must never
-open `.icons/<base>.{png,svg}` unproved (not during a throttle window, not
-after an interrupted sweep, not past the sweep's file cap, not after a
-failed atomic rewrite).
+stays on disk (deletion belongs to the sweep). **The panel row renders its
+built-in glyph unless `icon_safe` is exactly true** — the row's decoder
+never opens `.icons/<base>.{png,svg}` unproved (not during a throttle
+window, not after an interrupted sweep, not past the sweep's file cap,
+not after a failed atomic rewrite). **Accepted residual:** the LAUNCHER
+grid decodes the same file through the `.desktop` entry's `Icon=` path
+(provider_install) without this gate; there it is covered only by the
+async sweep — scoping the gate to the panel row is deliberate, since the
+launcher's icon choice is not ours to override.
+
+The fast path's trust boundary is the file identity it records:
+`(SANITIZER_VERSION, size, mtime_ns)`. A writer who replaces the content
+and restores `utimes` afterwards defeats the size/mtime check — out of
+scope by construction: that is a same-user process that already owns the
+whole state dir the registry lives in.
 
 The listing is desktop-driven: a record in `apps.ini` whose `.desktop` file
 is gone is **not** listed as installed. It is logged on stderr instead

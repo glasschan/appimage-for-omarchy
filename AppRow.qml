@@ -135,6 +135,10 @@ Column {
           }
           return list
         }
+        // A refresh can shrink the candidate list (an icon that lost its
+        // proof falls back to the glyph): reset the index so a stale one
+        // cannot point past the new list.
+        onIconCandidatesChanged: iconIndex = 0
         anchors.verticalCenter: parent.verticalCenter
         visible: iconIndex < iconCandidates.length
         source: visible ? iconCandidates[iconIndex] : ""

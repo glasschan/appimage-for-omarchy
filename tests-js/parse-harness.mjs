@@ -27,8 +27,9 @@ import * as c16 from "./harness/cases/16-errors.mjs"
 import * as c17 from "./harness/cases/17-stream-lines.mjs"
 import * as c18 from "./harness/cases/18-integrate-progress.mjs"
 import * as c19 from "./harness/cases/19-launch-argv.mjs"
+import * as c20 from "./harness/cases/20-icon-safe.mjs"
 
-const cases = [c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19]
+const cases = [c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20]
 for (const c of cases) c.run()
 
 cleanupLive()

@@ -18,6 +18,7 @@
 
 import json
 import logging
+import math
 import os
 import shutil
 import stat
@@ -289,7 +290,7 @@ def _record_icon_entry(path: str, reg: dict) -> bool:
     return False
 
 
-def verify_retained_icon(path: str, reg: dict) -> bool:
+def verify_retained_icon(path: str, reg: dict, dirty: list = None) -> bool:
     """THE retained-icon verdict: did the CURRENT sanitiser prove this file?
 
     The listing calls this per candidate icon and reports the answer as
@@ -305,11 +306,12 @@ def verify_retained_icon(path: str, reg: dict) -> bool:
     record (bytes already safe), rewrite and record the new stat, or
     drop the entry on any refusal. The FILE is never deleted here — the
     sweep owns deletion; a refusal costs a glyph. Never raises; may
-    mutate `reg` (the caller persists it)."""
+    mutate `reg` (every mutation also appends to `dirty` when the caller
+    passes a list, so a clean poll can skip the registry save)."""
     try:
         st = os.lstat(path)
     except OSError:
-        reg.pop(path, None)
+        _reg_drop(reg, path, dirty)
         return False
     entry = reg.get(path)
     if isinstance(entry, dict):
@@ -320,29 +322,44 @@ def verify_retained_icon(path: str, reg: dict) -> bool:
             return True
     data, fmt = icon.retained_bytes(path)
     if data is None:
-        reg.pop(path, None)
+        _reg_drop(reg, path, dirty)
         return False
     safe = icon.sanitize_icon(data, fmt)
     if safe is None:
-        reg.pop(path, None)
+        _reg_drop(reg, path, dirty)
         return False
     if safe == data:
-        reg[path] = {'v': icon.SANITIZER_VERSION, 's': st.st_size,
-                     'm': st.st_mtime_ns}
+        # record the PRE-read stat, deliberately: a file replaced after
+        # the read then leaves a stale entry whose stat miss forces a
+        # fresh verification next poll. The post-read stat would trust a
+        # file state we never sanitised.
+        _reg_record(reg, path, st.st_size, st.st_mtime_ns, dirty)
         return True
     try:
         icon.replace_icon_file(path, safe, stat.S_IMODE(st.st_mode))
     except OSError:
-        reg.pop(path, None)
+        _reg_drop(reg, path, dirty)
         return False
     try:
         st = os.lstat(path)
     except OSError:
-        reg.pop(path, None)
+        _reg_drop(reg, path, dirty)
         return False
-    reg[path] = {'v': icon.SANITIZER_VERSION, 's': st.st_size,
-                 'm': st.st_mtime_ns}
+    _reg_record(reg, path, st.st_size, st.st_mtime_ns, dirty)
     return True
+
+
+def _reg_drop(reg: dict, path: str, dirty):
+    if reg.pop(path, None) is not None and dirty is not None:
+        dirty.append(path)
+
+
+def _reg_record(reg: dict, path: str, size: int, mtime_ns: int, dirty):
+    entry = {'v': icon.SANITIZER_VERSION, 's': size, 'm': mtime_ns}
+    if reg.get(path) != entry:
+        reg[path] = entry
+        if dirty is not None:
+            dirty.append(path)
 
 
 def _sanitize_installed_icon(path: str) -> str:
@@ -455,10 +472,13 @@ def _write_sweep_marker(now: float):
 def _read_sweep_marker():
     """(version, epoch) out of the marker, or None when it cannot say.
 
-    The current format is the JSON `{"v": ..., "at": ...}` stamp; a
-    legacy bare-float marker (pre-v2) reads as version 0, so the first
-    reader re-sweeps and the new format replaces it. Anything else —
-    missing, corrupt, wrongly shaped — is None ("never swept")."""
+    The current format is the JSON `{"v": ..., "at": ...}` stamp: `v` must
+    be an exact int (not a bool, not a float — `2.0`/`true` do not pass)
+    and `at` a finite number; anything looser is treated as no marker, so
+    the safe direction is always one extra sweep. A legacy bare-float
+    marker (pre-v2) reads as version 0, so the first reader re-sweeps and
+    the new format replaces it. Anything else — missing, corrupt,
+    wrongly shaped — is None ("never swept")."""
     try:
         with open(sweep_marker_path(), 'r', encoding='utf-8') as f:
             raw = f.read().strip()
@@ -469,10 +489,14 @@ def _read_sweep_marker():
     except ValueError:
         doc = None
     if isinstance(doc, dict):
-        try:
-            return int(doc.get('v')), float(doc.get('at'))
-        except (TypeError, ValueError):
-            return None
+        v = doc.get('v')
+        at = doc.get('at')
+        if (isinstance(v, int) and not isinstance(v, bool)
+                and isinstance(at, (int, float))
+                and not isinstance(at, bool)
+                and math.isfinite(at)):
+            return v, float(at)
+        return None
     try:
         return 0, float(raw)
     except ValueError:

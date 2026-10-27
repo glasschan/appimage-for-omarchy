@@ -465,6 +465,33 @@ class SweepThrottleTests(_DocSeedMixin, InProcessCliMixin, FakeXDGTestCase):
             self.assertFalse(janitor.sweep_throttled())
         sweep.assert_not_called()
 
+    def test_marker_type_laxities_never_throttle(self):
+        # strictness is fail-safe: a wrong-typed v or a non-finite at
+        # reads as "no marker" and costs one sweep, never a skip
+        for doc in (
+                {'v': 2.0, 'at': time.time()},        # float version
+                {'v': True, 'at': time.time()},       # bool version
+                {'v': '2', 'at': time.time()},        # string version
+                {'v': icon.SANITIZER_VERSION,
+                 'at': str(time.time())},             # string stamp
+                {'v': icon.SANITIZER_VERSION, 'at': True},
+                {'v': icon.SANITIZER_VERSION, 'at': None},
+                {'at': time.time()},                  # v missing
+        ):
+            Path(janitor.sweep_marker_path()).parent.mkdir(
+                parents=True, exist_ok=True)
+            Path(janitor.sweep_marker_path()).write_text(json.dumps(doc))
+            with mock.patch.object(janitor, 'sweep') as sweep, \
+                    self.subTest(doc=doc):
+                self.assertTrue(janitor.sweep_throttled())
+                sweep.assert_called_once()
+
+    def test_exact_int_version_with_finite_stamp_throttles(self):
+        self._stamp(v=int(icon.SANITIZER_VERSION))
+        with mock.patch.object(janitor, 'sweep') as sweep:
+            self.assertFalse(janitor.sweep_throttled())
+        sweep.assert_not_called()
+
     def test_marker_from_an_older_gate_version_sweeps_again(self):
         self._stamp(v=icon.SANITIZER_VERSION - 1)
         with mock.patch.object(janitor, 'sweep') as sweep:

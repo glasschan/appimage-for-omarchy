@@ -48,10 +48,12 @@ def cmd_list_installed(args: list) -> int:
         # matched per app by the record's own key.
         state = settings.load_updates_state()
         # The icon display gate (ticket #62): the registry is read ONCE
-        # and persisted ONCE after the loop — a save failure must never
-        # fail the listing.
+        # and persisted ONCE after the loop — and only when the loop
+        # actually changed it (every verify mutation appends to `dirty`),
+        # so a clean 10 s poll costs no registry write at all.
         reg = icon.load_sanitized_registry()
         icons_dir = os.path.join(settings.appimages_folder(), '.icons')
+        dirty = []
         table = []
         for a in apps:
             # check_url_for_app is local-only (apps.ini config + the
@@ -61,8 +63,9 @@ def cmd_list_installed(args: list) -> int:
             table.append(_make_app_json(
                 a, manager=UpdateManagerChecker.check_url_for_app(a),
                 probe=scan, pending=state.get(_updates_state_key(a)),
-                icon_safe=_listing_icon_safe(a, reg, icons_dir)))
-        icon.save_sanitized_registry(reg)
+                icon_safe=_listing_icon_safe(a, reg, icons_dir, dirty)))
+        if dirty:
+            icon.save_sanitized_registry(reg)
         _print_json({
             'schema_version': constants.JSON_SCHEMA_VERSION,
             'installed': table,
@@ -164,17 +167,18 @@ def cmd_remove(args: list) -> int:
 _ICON_EXTENSIONS = ('.png', '.svg')
 
 
-def _listing_icon_safe(el, reg: dict, icons_dir: str) -> bool:
+def _listing_icon_safe(el, reg: dict, icons_dir: str, dirty: list) -> bool:
     """True only when the CURRENT sanitiser proved the icon file this row
-    would load (janitor.verify_retained_icon against `reg`, which the
-    listing persists once after the loop). Never raises."""
+    would load (janitor.verify_retained_icon against `reg`; every registry
+    mutation appends to `dirty`, which the listing persists once after the
+    loop). Never raises."""
     stem = os.path.join(
         icons_dir,
         os.path.splitext(os.path.basename(el.file_path or ''))[0])
     for ext in _ICON_EXTENSIONS:
         candidate = stem + ext
         if os.path.exists(candidate):
-            return janitor.verify_retained_icon(candidate, reg)
+            return janitor.verify_retained_icon(candidate, reg, dirty)
     return False
 
 

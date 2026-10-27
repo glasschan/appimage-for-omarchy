@@ -496,15 +496,33 @@ class RetainedIconVerdictTests(unittest.TestCase):
         self.assertTrue(janitor.verify_retained_icon(path, reg))
         self.assertEqual(reg[path], self._entry(path))
 
-    def test_fast_path_hits_without_a_read_or_a_decode(self):
-        # the poison proves the fast path: if the verdict so much as
-        # touched the sanitiser, the raise would fail the call
+    def test_fast_path_answers_without_reading_or_decoding_the_file(self):
+        # poising BOTH the read and the sanitiser proves the fast path
+        # end to end: if the verdict so much as opened the file, the
+        # retained_bytes raise would fail the call
         path = self._write_icon()
         reg = {path: self._entry(path)}
-        with mock.patch.object(icon, 'sanitize_icon',
-                               side_effect=AssertionError('slow path')):
+        with mock.patch.object(icon, 'retained_bytes',
+                               side_effect=AssertionError('read')), \
+                mock.patch.object(icon, 'sanitize_icon',
+                                  side_effect=AssertionError('decode')):
             self.assertTrue(janitor.verify_retained_icon(path, reg))
         self.assertEqual(reg[path], self._entry(path))
+
+    def test_a_clean_verdict_reports_no_mutation(self):
+        # the listing skips the registry save when nothing changed, so
+        # the verdict must keep its mutation signal exact
+        path = self._write_icon()
+        reg = {path: self._entry(path)}
+        dirty = []
+        self.assertTrue(janitor.verify_retained_icon(path, reg, dirty))
+        self.assertEqual(dirty, [])
+
+    def test_a_slow_path_verdict_reports_its_mutation(self):
+        path = self._write_icon()
+        dirty = []
+        self.assertTrue(janitor.verify_retained_icon(path, {}, dirty))
+        self.assertEqual(dirty, [path])
 
     def test_touched_file_drops_the_entry_and_reproves(self):
         # the recorded mtime_ns no longer matches: the fast path must
