@@ -524,7 +524,7 @@ if __name__ == '__main__':
     unittest.main()
 
 
-class IconSweepTests(unittest.TestCase):
+class IconSweepTests(FakeXDGTestCase):
     """The on-disk backstop for icons installed before the sanitiser.
 
     sanitize_icon() runs at extract time only, so a `.icons/<stem>.png`
@@ -534,9 +534,15 @@ class IconSweepTests(unittest.TestCase):
     rewritten, what it refuses is removed. The header-only backstop it
     replaced could only read the IHDR, so a small-dimension icon full of
     inflated metadata passed it and was decoded unbounded.
+
+    FakeXDGTestCase is NOT optional here: sweep_icons loads and persists
+    the sanitisation registry through the plugin state dir, and this
+    class's first version (plain unittest.TestCase) wrote the real user
+    state dir on every run (issue found in review round 3).
     """
 
     def setUp(self):
+        super().setUp()
         self.icons = tempfile.mkdtemp(prefix='icons-sweep-')
         self.addCleanup(shutil.rmtree, self.icons, True)
 
@@ -679,22 +685,19 @@ class IconSweepTests(unittest.TestCase):
         self.assertEqual(janitor.sweep_icons(icons_dir=None), 0)
 
 
-class IconRegistrySweepTests(unittest.TestCase):
+class IconRegistrySweepTests(FakeXDGTestCase):
     """sweep_icons mirrors every per-icon outcome into the sanitisation
     registry the listing's verdict reads: kept/rewritten icons get an
     entry recording the CURRENT stat, removed/skipped ones lose theirs,
-    stale entries are pruned, and a changed map is persisted."""
+    stale entries are pruned, and a changed map is persisted. The
+    registry path resolves inside the FakeXDGTestCase sandbox — never
+    the real user state dir."""
 
     def setUp(self):
+        super().setUp()
         self.icons = tempfile.mkdtemp(prefix='icons-reg-')
         self.addCleanup(shutil.rmtree, self.icons, True)
-        self.registry = os.path.join(tempfile.mkdtemp(prefix='icons-state-'),
-                                     'sanitized-icons.json')
-        self.addCleanup(shutil.rmtree, os.path.dirname(self.registry), True)
-        patcher = mock.patch.object(icon, 'sanitized_registry_path',
-                                    return_value=self.registry)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.registry = icon.sanitized_registry_path()
 
     def _write(self, name, data):
         path = os.path.join(self.icons, name)
@@ -749,3 +752,24 @@ class IconRegistrySweepTests(unittest.TestCase):
         reg = icon.load_sanitized_registry()
         janitor.sweep_icons(icons_dir=self.icons, reg=reg)
         self.assertEqual(Path(self.registry).read_bytes(), before)
+
+
+class SandboxIsolationPinTests(FakeXDGTestCase):
+    """P1 regression pin (review round 3): the registry and the throttle
+    marker must resolve UNDER the sandboxed $XDG_STATE_HOME while a
+    FakeXDGTestCase runs — a prefix assertion, so the pin survives the
+    path layout inside the state dir. The first version of the icon
+    sweep tests (plain unittest.TestCase) wrote the real user state dir
+    (`sanitized-icons.json`, `last-sweep`) on every suite run."""
+
+    def test_registry_and_marker_resolve_under_the_sandbox(self):
+        # the sandbox itself must not BE the real user state dir, or the
+        # prefix assertion below would prove nothing
+        self.assertNotEqual(
+            self.state_home,
+            os.path.join(os.path.expanduser('~'), '.local', 'state'))
+        for path in (icon.sanitized_registry_path(),
+                     janitor.sweep_marker_path()):
+            with self.subTest(path=path):
+                self.assertTrue(path.startswith(
+                    self.state_home + os.sep), path)

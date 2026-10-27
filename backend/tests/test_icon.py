@@ -11,6 +11,7 @@ import zlib
 from unittest import mock
 
 import helpers  # noqa: F401  — puts backend/ on sys.path (as the other suites do)
+from helpers import FakeXDGTestCase
 
 from omarchy_appimage import icon, janitor
 from omarchy_appimage.extractor import _find_icon, image_format
@@ -399,11 +400,15 @@ class SanitizeFixedPointTests(unittest.TestCase):
         self.assertEqual(icon.sanitize_icon(svg, 'image/svg+xml'), svg)
 
 
-class RetainedIconRegistryTests(unittest.TestCase):
+class RetainedIconRegistryTests(FakeXDGTestCase):
     """The sanitised-icon registry + the retained-icon verdict
     (janitor.verify_retained_icon lives on janitor, but its primitives —
     the registry path, load/save, the capped O_NOFOLLOW read and the
     atomic rewrite — are this module's, so they are pinned here).
+
+    FakeXDGTestCase sandboxes $XDG_STATE_HOME, so every load/save below
+    resolves inside the sandbox — these tests must never write the real
+    user state dir.
 
     The verdict is the display gate: the listing reports True only for a
     file THIS gate version has proved, so the shell never opens a
@@ -411,13 +416,11 @@ class RetainedIconRegistryTests(unittest.TestCase):
     a failed rewrite."""
 
     def setUp(self):
+        super().setUp()
         self.tmp = tempfile.mkdtemp(prefix='icon-registry-')
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.registry = os.path.join(self.tmp, 'sanitized-icons.json')
-        patcher = mock.patch.object(icon, 'sanitized_registry_path',
-                                    return_value=self.registry)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.registry = icon.sanitized_registry_path()
+        os.makedirs(os.path.dirname(self.registry), exist_ok=True)
 
     def _write_icon(self, name='icon.png', data=None):
         path = os.path.join(self.tmp, name)
@@ -456,6 +459,7 @@ class RetainedIconRegistryTests(unittest.TestCase):
     def test_save_never_raises_on_an_unwritable_path(self):
         # a directory squatting on the registry path: the save is
         # best-effort by contract
+        os.makedirs(os.path.dirname(self.registry), exist_ok=True)
         os.mkdir(self.registry)
         self.addCleanup(os.rmdir, self.registry)
         icon.save_sanitized_registry({'/a.png': {'v': 2, 's': 1, 'm': 1}})
@@ -472,10 +476,13 @@ class RetainedIconRegistryTests(unittest.TestCase):
                                         's': 12, 'm': 34}})
 
 
-class RetainedIconVerdictTests(unittest.TestCase):
-    """janitor.verify_retained_icon: the per-file display verdict."""
+class RetainedIconVerdictTests(FakeXDGTestCase):
+    """janitor.verify_retained_icon: the per-file display verdict.
+    Sandboxed like the registry tests — a verdict that mutates the map
+    must never be able to persist into the real user state dir."""
 
     def setUp(self):
+        super().setUp()
         self.tmp = tempfile.mkdtemp(prefix='icon-verdict-')
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
