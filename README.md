@@ -369,6 +369,23 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.11.3
+
+- **Icons are display-gated, not just sweep-gated.** The listing now
+  reports an additive `icon_safe` verdict per app: the icon file is
+  shown in the panel only when the CURRENT sanitiser proved those bytes
+  — via a per-file registry (`sanitized-icons.json` in the plugin state
+  dir, keyed by sanitiser version, size and mtime) — otherwise the row
+  shows the built-in glyph and the shell never opens the file. A hostile
+  retained icon can therefore no longer reach the decoder during a
+  sweep throttle window, after an interrupted or capped sweep, or after
+  a failed rewrite. The sweep throttle marker now names the sanitiser
+  version and is stamped only after a sweep completes.
+- **The enforcing QML expression is pinned by CI.** A harness case reads
+  `AppRow.qml` from disk and fails when the `iconSafe === true` guard or
+  the png→svg probe order is missing, so the gate cannot be silently
+  regressed with every check green.
+
 ### 0.11.2
 
 - **`Panel.qml` is cut into domain controllers.** 2,622 → 1,469 lines: the
