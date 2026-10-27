@@ -40,9 +40,10 @@ def _pixels(width, height, depth, color_type, interlace):
 
 
 def build_png(width=8, height=8, *, depth=8, color_type=6, interlace=0,
-              extra=(), plte=None, trns=None, idat=None, trailing=b''):
-    ihdr = struct.pack('>IIBBBBB', width, height, depth, color_type, 0, 0,
-                       interlace)
+              comp=0, filt=0, extra=(), plte=None, trns=None, idat=None,
+              trailing=b''):
+    ihdr = struct.pack('>IIBBBBB', width, height, depth, color_type, comp,
+                       filt, interlace)
     out = icon._PNG_SIG + _chunk(b'IHDR', ihdr)
     if plte is not None:
         out += _chunk(b'PLTE', plte)
@@ -130,6 +131,69 @@ class PngSanitizeTests(unittest.TestCase):
         self.assertIsNone(icon.sanitize_icon(b'GIF89a' + b'\x00' * 32,
                                              'image/png'))
         self.assertIsNone(icon.sanitize_icon(b'', 'image/png'))
+
+
+class IhdrFieldTests(unittest.TestCase):
+    """Ticket #63: an IHDR a conforming decoder rejects must be refused,
+    not re-emitted for the row to fail to decode (and fall through to the
+    next, unverified candidate). Compression/filter methods other than 0,
+    interlace other than 0/1, and any (colour type, bit depth) pair off
+    the spec table are each a refusal."""
+
+    def test_sanitizer_version_is_3(self):
+        # the strict IHDR gate is verdict logic: the bump forces one
+        # re-sweep and one re-verification of every retained icon
+        self.assertEqual(icon.SANITIZER_VERSION, 3)
+
+    def test_unknown_compression_method_refused(self):
+        self.assertIsNone(icon.sanitize_icon(
+            build_png(comp=1), 'image/png'))
+
+    def test_unknown_filter_method_refused(self):
+        self.assertIsNone(icon.sanitize_icon(
+            build_png(filt=1), 'image/png'))
+
+    def test_unknown_interlace_method_refused(self):
+        self.assertIsNone(icon.sanitize_icon(
+            build_png(interlace=2), 'image/png'))
+
+    def test_invalid_depth_colour_pairs_refused(self):
+        bad_pairs = [(0, 32),          # depth off the spec table
+                     (2, 1), (2, 2), (2, 4), (2, 32),
+                     (3, 16),
+                     (4, 1), (4, 2), (4, 4),
+                     (6, 1), (6, 2), (6, 4),
+                     (5, 8)]          # colour type 5 does not exist
+        for color_type, depth in bad_pairs:
+            with self.subTest(color_type=color_type, depth=depth):
+                # an unknown colour type has no channel table, so the
+                # helper cannot synthesise pixels for it: an empty idat
+                # still reaches the IHDR check (which must fire first)
+                data = build_png(color_type=color_type, depth=depth,
+                                 plte=b'\x00' * 3 * 4,
+                                 idat=zlib.compress(b''))
+                self.assertIsNone(icon.sanitize_icon(data, 'image/png'))
+
+    def test_valid_depth_colour_pairs_accepted(self):
+        good_pairs = [(0, 1), (0, 2), (0, 4), (0, 8), (0, 16),
+                      (2, 8), (2, 16),
+                      (3, 1), (3, 2), (3, 4), (3, 8),
+                      (4, 8), (4, 16),
+                      (6, 8), (6, 16)]
+        for color_type, depth in good_pairs:
+            with self.subTest(color_type=color_type, depth=depth):
+                data = build_png(color_type=color_type, depth=depth,
+                                 plte=(b'\x00' * 3 * 4
+                                       if color_type == 3 else None))
+                self.assertIsNotNone(icon.sanitize_icon(data, 'image/png'))
+
+    def test_palette_required_iff_colour_type_3(self):
+        # colour 3 without PLTE: refused; every other colour type needs
+        # no PLTE at all
+        self.assertIsNone(icon.sanitize_icon(
+            build_png(1, 1, color_type=3), 'image/png'))
+        self.assertIsNotNone(icon.sanitize_icon(
+            build_png(1, 1, color_type=6), 'image/png'))
 
 
 class SvgSanitizeTests(unittest.TestCase):
@@ -611,3 +675,51 @@ class RetainedIconVerdictTests(FakeXDGTestCase):
         with open(path, 'rb') as handle:
             rewritten = handle.read()
         self.assertNotIn(b'zTXt', rewritten)
+
+
+class BothCandidatesVerdictTests(FakeXDGTestCase):
+    """Ticket #63: the listing verifies EACH existing candidate, not just
+    the first — a .png that fails to DECODE makes the row's Image fall
+    through to the .svg, so the .svg needs its own verdict (and its own
+    registry entry)."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp(prefix='icon-candidates-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.png = os.path.join(self.tmp, 'app.png')
+        self.svg = os.path.join(self.tmp, 'app.svg')
+
+    def _write(self, path, data):
+        with open(path, 'wb') as handle:
+            handle.write(data)
+
+    def _valid_svg(self):
+        return (b'<?xml version="1.0" encoding="UTF-8"?>'
+                b'<svg xmlns="http://www.w3.org/2000/svg" '
+                b'width="8" height="8" viewBox="0 0 8 8">'
+                b'<rect width="8" height="8" fill="#123456"/></svg>')
+
+    def test_both_candidates_verified_with_two_registry_entries(self):
+        self._write(self.png, build_png(8, 8))
+        self._write(self.svg, self._valid_svg())
+        reg, dirty = {}, []
+        self.assertTrue(janitor.verify_retained_icon(self.png, reg, dirty))
+        self.assertTrue(janitor.verify_retained_icon(self.svg, reg, dirty))
+        self.assertIn(self.png, reg)
+        self.assertIn(self.svg, reg)
+        self.assertEqual(sorted(dirty), sorted([self.png, self.svg]))
+
+    def test_refusing_the_svg_drops_only_the_svg_entry(self):
+        self._write(self.png, build_png(8, 8))
+        self._write(self.svg, b'<svg xmlns="http://www.w3.org/2000/svg"'
+                              b' width="8" height="8"><script/></svg>')
+        reg, dirty = {}, []
+        self.assertTrue(janitor.verify_retained_icon(self.png, reg, dirty))
+        self.assertFalse(janitor.verify_retained_icon(self.svg, reg, dirty))
+        self.assertIn(self.png, reg)
+        self.assertNotIn(self.svg, reg)
+        self.assertEqual(dirty, [self.png])
+        # the refused svg file itself survives — deletion is the sweep's
+        self.assertTrue(os.path.exists(self.svg))
+

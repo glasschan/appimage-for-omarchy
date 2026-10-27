@@ -61,21 +61,27 @@ disappearing with the next 10 s poll, and they survive a shell restart.
 An app the last check found up to date reports `pending_update: false`; an
 app whose check failed keeps its last known verdict (issue #43's rule).
 
-**Icon display gate (additive `icon_safe`, ticket #62).** Each app object
-also carries `icon_safe: true | false`: true only when the CURRENT
-sanitiser (`icon.sanitize_icon`, `SANITIZER_VERSION`) proved the icon file
-the row would load (`<managed>/.icons/<basename-without-extension>.png`,
-then `.svg`) — via the persisted per-file verdict registry
-(`sanitized-icons.json`, see *Filesystem layout*) or a fresh verification
-that may rewrite the file. The listing is the proof, and it never relaxes
-the sweep: a file that cannot be sanitised reports `icon_safe: false` and
-stays on disk (deletion belongs to the sweep). **The panel row renders its
-built-in glyph unless `icon_safe` is exactly true** — the row's decoder
-never opens `.icons/<base>.{png,svg}` unproved (not during a throttle
-window, not after an interrupted sweep, not past the sweep's file cap,
-not after a failed atomic rewrite). **Accepted residual:** the LAUNCHER
-grid decodes the same file through the `.desktop` entry's `Icon=` path
-(provider_install) without this gate; there it is covered only by the
+**Icon display gate (additive `icon_safe`, tickets #62/#63).** Each app
+object also carries `icon_safe: {"png": bool, "svg": bool} | null`: one
+key per EXISTING candidate (`<managed>/.icons/<basename-without-
+extension>.png`, then `.svg` — a candidate that does not exist gets no
+key), true only when the CURRENT sanitiser (`icon.sanitize_icon`,
+`SANITIZER_VERSION`) proved that exact file — via the persisted per-file
+verdict registry (`sanitized-icons.json`, see *Filesystem layout*) or a
+fresh verification that may rewrite the file. Per-candidate since #63:
+a .png that is verdict-safe but fails to DECODE makes the row's `Image`
+fall through to the next candidate, so the row loads only the candidates
+whose OWN verdict is true — the safe png never vouches for the svg. No
+icon file at all, or a non-object `icon_safe` (an older backend),
+reports `null`. The listing is the proof, and it never relaxes the sweep:
+a file that cannot be sanitised reports `false` for its key and stays on
+disk (deletion belongs to the sweep). **The panel row renders its built-in
+glyph unless the candidate's own verdict is exactly true** — the row's
+decoder never opens `.icons/<base>.{png,svg}` unproved (not during a
+throttle window, not after an interrupted sweep, not past the sweep's
+file cap, not after a failed atomic rewrite). **Accepted residual:** the
+LAUNCHER grid decodes the same file through the `.desktop` entry's `Icon=`
+path (provider_install) without this gate; there it is covered only by the
 async sweep — scoping the gate to the panel row is deliberate, since the
 launcher's icon choice is not ours to override.
 
@@ -84,6 +90,18 @@ The fast path's trust boundary is the file identity it records:
 and restores `utimes` afterwards defeats the size/mtime check — out of
 scope by construction: that is a same-user process that already owns the
 whole state dir the registry lives in.
+
+**Sanitiser version 3 (ticket #63).** The PNG path validates every IHDR
+field a conforming decoder checks: compression method and filter method
+must both be 0, interlace 0 or 1, and the (colour type, bit depth) pair
+must be on the PNG spec's table (colour 0 → 1/2/4/8/16; 2 → 8/16;
+3 → 1/2/4/8; 4 → 8/16; 6 → 8/16; other colour types were already
+refused). A PLTE is required exactly for colour type 3. An IHDR a
+decoder would reject is refused instead of re-emitted — re-emitting it
+just moved the decode failure into the row, which then fell through to
+the next, otherwise-unverified candidate. The verdict change bumped
+`SANITIZER_VERSION` to 3, so v2 registry entries and the v2 sweep marker
+force one re-verification / re-sweep respectively (no migration code).
 
 The listing is desktop-driven: a record in `apps.ini` whose `.desktop` file
 is gone is **not** listed as installed. It is logged on stderr instead
@@ -1053,7 +1071,7 @@ No arguments prints usage and exits **2**.
 | `pending_update` | boolean | True when the plugin's durable check record holds an entry for this app — the last successful check found a newer release. Read from that record (never recomputed by a listing), so it survives the 10 s listing poll and a shell restart; `false` when there is no entry (no check has run, or the last check found the app up to date) |
 | `pending_version` | string or null | The release version that check found; `null` when there is no record, or when the source named no version (a plain-URL/zsync source). A pending release can therefore be reported without a version |
 | `pending_installable` | boolean or null | Whether that pending release could be installed (`true` / `false`); `null` when there is no record — including a legacy plain-signature entry written before this version. A verdict here never promises the fetch will succeed: the strict policy still decides at install time |
-| `icon_safe` | boolean | The display gate (ticket #62): true only when the current sanitiser proved the row's icon file (see `--list-installed`). The panel shows its built-in glyph unless this is exactly true — the shell never opens an unproved icon file |
+| `icon_safe` | object \| null | The display gate (tickets #62/#63): `{"png": bool, "svg": bool}`, one key per existing `.icons/<base>.<ext>` candidate — true only when the current sanitiser proved that exact file; `null` when no icon file exists (see `--list-installed`). The panel loads only the candidates whose own verdict is true and shows its built-in glyph otherwise — the shell never opens an unproved icon file |
 | `embedded_source` | boolean | True when the source comes from the AppImage's embedded `.upd_info` string (false for custom configs and for no source) |
 | `running` | boolean | True when the AppImage is currently running. Computed by **one rule shared with `running_pids`** (`utils._running_by_ps` → `procs.pids_for`'s `parent` list, plus the `fuse.*` mount signal for the runtime that has no attributable exe): a process whose `/proc/<pid>/exe` is the AppImage path (compared through `os.path.realpath`, so a symlinked install directory matches either way round), or a `fuse.*` mount in `/proc/mounts` attributed to it (matched on the mount source's basename — see Process identity under Security model). Because the mount signal can outlive the processes, `running: true` with `running_pids: 0` is possible: the mount is still there, no process of ours is |
 | `running_pids` | int | How many processes belong to this AppImage: the runtime parent (its `exe` is the AppImage path) **plus** the helpers running out of the `fuse.*` mount attributed to it — the set `--kill-running` would close (`procs.pids_for`). `0` when the app is not running (a non-running row is never scanned) and `0` when the count cannot be determined (a failed scan is a warning, never an error, and never flips `running`). **Display-only**: the panel's prompt names it; no command reads it back. A listing builds one process table (and one `/proc/mounts` read) and reuses it for every running row, because the panel polls the listing every 10 s |

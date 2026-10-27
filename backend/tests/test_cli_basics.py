@@ -79,8 +79,10 @@ class OfflineCliTests(FakeXDGTestCase):
             'launch_scale_argv',
             'verification', 'installable',
             'pending_update', 'pending_version', 'pending_installable',
-            # additive, ticket #62: the icon display gate — True only when
-            # the current sanitiser proved the row's icon file.
+            # additive, ticket #62/#63: the icon display gate — a
+            # per-candidate verdict dict (`{"png": bool, "svg": bool}`),
+            # one key per existing `.icons/<base>.<ext>` candidate; null
+            # when no icon file exists.
             'icon_safe'})
         self.assertEqual(app['name'], 'Fake App')
         self.assertEqual(app['path'], appimage)

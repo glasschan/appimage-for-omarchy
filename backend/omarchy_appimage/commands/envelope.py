@@ -148,12 +148,15 @@ def _make_app_json(el, manager=None, running=None, probe=None,
         'pending_version': (_update_state_version(pending) or None)
         if isinstance(pending, (dict, str)) else None,
         'pending_installable': _update_state_installable(pending),
-        # additive (schema_version stays 1), ticket #62 — the display
-        # gate: True only when the CURRENT sanitiser proved this app's
-        # icon file (janitor.verify_retained_icon against the persisted
-        # registry). Absent/false means the panel must show its built-in
-        # glyph and never open `.icons/<base>.{png,svg}`.
-        'icon_safe': icon_safe is True,
+        # additive (schema_version stays 1), ticket #62/#63 — the display
+        # gate: a per-candidate verdict dict (`{"png": bool, "svg": bool}`,
+        # one key per EXISTING `.icons/<base>.<ext>` candidate) from
+        # janitor.verify_retained_icon against the persisted registry.
+        # The row may load ONLY the candidates whose own verdict is true;
+        # a non-dict or an empty dict reports `null` — the panel shows its
+        # built-in glyph and never opens `.icons/<base>.{png,svg}`.
+        'icon_safe': (icon_safe if isinstance(icon_safe, dict) and icon_safe
+                      else None),
     }
 
 

@@ -63,7 +63,7 @@ def cmd_list_installed(args: list) -> int:
             table.append(_make_app_json(
                 a, manager=UpdateManagerChecker.check_url_for_app(a),
                 probe=scan, pending=state.get(_updates_state_key(a)),
-                icon_safe=_listing_icon_safe(a, reg, icons_dir, dirty)))
+                icon_safe=_listing_icon_verdicts(a, reg, icons_dir, dirty)))
         if dirty:
             icon.save_sanitized_registry(reg)
         _print_json({
@@ -158,28 +158,32 @@ def cmd_remove(args: list) -> int:
     return EXIT_OK
 
 
-# The icon display gate (ticket #62): candidates are tried in the same
-# png→svg order the panel probes (lib/Model.js iconBaseFor derives
-# `.icons/<basename-without-extension>`); the FIRST existing candidate is
-# the file the row would load, so only its verdict matters. No candidate
-# at all → False: the row shows its built-in glyph either way, and the
-# gate never claims a file that does not exist.
+# The icon display gate (ticket #63): the panel probes candidates in the
+# same png→svg order (lib/Model.js iconBaseFor derives
+# `.icons/<basename-without-extension>`), but a candidate that fails to
+# DECODE makes the Image fall through to the next one — so verifying only
+# the first existing candidate let an unproved .svg reach the shell's
+# decoder. Each existing candidate therefore carries its OWN verdict; a
+# candidate without `true` is never offered to the Image at all.
 _ICON_EXTENSIONS = ('.png', '.svg')
 
 
-def _listing_icon_safe(el, reg: dict, icons_dir: str, dirty: list) -> bool:
-    """True only when the CURRENT sanitiser proved the icon file this row
-    would load (janitor.verify_retained_icon against `reg`; every registry
-    mutation appends to `dirty`, which the listing persists once after the
-    loop). Never raises."""
+def _listing_icon_verdicts(el, reg: dict, icons_dir: str,
+                           dirty: list) -> dict:
+    """Per-candidate verdicts: `{"png": bool, "svg": bool}`, one key per
+    EXISTING candidate (janitor.verify_retained_icon against `reg`; every
+    registry mutation appends to `dirty`, which the listing persists once
+    after the loop). No icon file at all → {}. Never raises."""
     stem = os.path.join(
         icons_dir,
         os.path.splitext(os.path.basename(el.file_path or ''))[0])
+    verdicts = {}
     for ext in _ICON_EXTENSIONS:
         candidate = stem + ext
         if os.path.exists(candidate):
-            return janitor.verify_retained_icon(candidate, reg, dirty)
-    return False
+            verdicts[ext[1:]] = janitor.verify_retained_icon(
+                candidate, reg, dirty)
+    return verdicts
 
 
 # ------------------------------------------------------- update commands

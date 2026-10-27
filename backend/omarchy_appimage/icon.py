@@ -3,7 +3,7 @@
 
 An icon is read out of an AppImage the plugin downloaded from a release
 host, written next to the installed AppImage and then decoded by the
-omarchy shell's QML ``Image`` element (Panel.qml, ``.icons/<base>.png``).
+omarchy shell's QML ``Image`` element (AppRow.qml, ``.icons/<base>.png``).
 The decoders are libpng and Qt's SVG renderer, and neither is given a
 memory budget by us:
 
@@ -66,7 +66,12 @@ _PNG_SIG = b'\x89PNG\r\n\x1a\n'
 # than trusted.
 _KEEP = frozenset({b'IHDR', b'PLTE', b'tRNS', b'IDAT', b'IEND'})
 _CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
-_DEPTHS = (1, 2, 4, 8, 16)
+# The PNG spec's valid (colour type → bit depth) table: any other pair is
+# a file no conforming decoder will render, so it is refused even though
+# the raw stream size could be predicted for it (ticket #63 — an IHDR a
+# decoder rejects must never be re-emitted for the shell to try).
+_DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8),
+           4: (8, 16), 6: (8, 16)}
 # Adam7: (x start, y start, x step, y step)
 _ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
           (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
@@ -200,12 +205,17 @@ def _chunks(data: bytes):
 def _parse_ihdr(body: bytes):
     if len(body) != 13:
         raise _Unsafe('bad IHDR length')
-    width, height, depth, color_type, _comp, _filt, interlace = \
+    width, height, depth, color_type, comp, filt, interlace = \
         struct.unpack('>IIBBBBB', body)
-    if depth not in _DEPTHS or color_type not in _CHANNELS:
+    if depth not in _DEPTHS.get(color_type, ()):
         raise _Unsafe('unsupported depth/colour type')
-    if color_type == 3 and depth > 8:
-        raise _Unsafe('palette depth')
+    # A conforming decoder rejects any compression or filter method other
+    # than 0 (the two methods the spec defines); re-emitting such an IHDR
+    # just moves the decode failure into the row (ticket #63).
+    if comp != 0:
+        raise _Unsafe('unsupported compression method')
+    if filt != 0:
+        raise _Unsafe('unsupported filter method')
     if not (1 <= width <= MAX_SIDE and 1 <= height <= MAX_SIDE):
         raise _Unsafe(f'{width}x{height} exceeds {MAX_SIDE}')
     if width * height > MAX_PIXELS:
@@ -321,7 +331,7 @@ def installed_icon_format(name: str, data: bytes) -> Optional[str]:
     """The format of an icon already on disk, or None when it is unknown.
 
     The file name is the primary signal, because the shell probes the
-    extension (Panel.qml tries `.png`, then `.svg`): the panel decodes
+    extension (AppRow.qml tries `.png`, then `.svg`): the row decodes
     whatever sits at `<stem>.png`, so that name decides how the bytes
     must be judged. A name that says nothing is decided by the content
     (the PNG magic). Anything else is unsanitisable — the sanitiser has
@@ -355,8 +365,11 @@ def installed_icon_format(name: str, data: bytes) -> Optional[str]:
 # Bump on ANY change to sanitize_icon's verdict logic. Stored in the
 # registry (and in the sweep-throttle marker) so icons proven by an older
 # gate re-verify under the new one. 1 = the v0.9.9 extract-time gate,
-# 2 = this display gate (the retained-icon verdict + registry).
-SANITIZER_VERSION = 2
+# 2 = this display gate (the retained-icon verdict + registry),
+# 3 = strict IHDR field validation (ticket #63: compression/filter
+# methods and the spec's (colour type, bit depth) pairs are enforced, so
+# an IHDR a decoder would reject is refused instead of re-emitted).
+SANITIZER_VERSION = 3
 
 
 def sanitized_registry_path() -> str:

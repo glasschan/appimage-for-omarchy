@@ -294,11 +294,11 @@ def verify_retained_icon(path: str, reg: dict, dirty: list = None) -> bool:
     """THE retained-icon verdict: did the CURRENT sanitiser prove this file?
 
     The listing calls this per candidate icon and reports the answer as
-    the app object's additive `icon_safe`; the frontend renders its
-    built-in glyph unless it is True, so the shell's decoder never opens
-    a file the current gate has not proved — not during a throttle
-    window, not after an interrupted sweep, not past the sweep's file
-    cap, not after a failed rewrite.
+    that candidate's own bool in the app object's additive `icon_safe`
+    dict; the frontend loads only candidates whose verdict is True, so
+    the shell never opens a file the current gate has not proved — not
+    during a throttle window, not after an interrupted sweep, not past
+    the sweep's file cap, not after a failed rewrite.
 
     Fast path: a registry entry recorded by THIS gate version whose
     size/mtime_ns still match the file answers without a read or a
