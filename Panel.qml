@@ -1,5 +1,4 @@
 import QtQuick
-import Qt.labs.folderlistmodel
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
@@ -264,11 +263,26 @@ Panel {
   property alias listFlickRef: listFlick
 
   // Domain controllers (one per feature cluster; state stays on root).
-  PanelJobs { id: jobs; panel: root }
-  PanelIntegrate { id: integrateCtl; panel: root }
-  PanelUpdates { id: updatesCtl; panel: root }
-  PanelSourceEditor { id: sourceEditorCtl; panel: root }
-  PanelPython { id: pythonCtl; panel: root }
+  PanelJobs {
+    id: jobs
+    panel: root
+  }
+  PanelIntegrate {
+    id: integrateCtl
+    panel: root
+  }
+  PanelUpdates {
+    id: updatesCtl
+    panel: root
+  }
+  PanelSourceEditor {
+    id: sourceEditorCtl
+    panel: root
+  }
+  PanelPython {
+    id: pythonCtl
+    panel: root
+  }
 
 
   readonly property var strings: Model.strings
@@ -321,11 +335,11 @@ Panel {
     busyPick = ops.busy.pick
     busyRemove = ops.busy.remove
     busyUpdates = ops.busy.updates
-    var jobs = {}
+    var mirrors = {}
     for (var id in Model.state.jobStates) {
-      jobs[id] = Model.state.jobStates[id].decision
+      mirrors[id] = Model.state.jobStates[id].decision
     }
-    jobStates = jobs
+    jobStates = mirrors
     jobsBusy = Model.anyJobActive()
     lastError = Model.state.lastError
     statusText = Model.state.status
@@ -402,7 +416,6 @@ Panel {
     // output. Fail the newcomer synthetically (same result shape as
     // Backend.handleExit's timeout report) so the caller's normal failure
     // path runs.
-    // timeout report) so the caller's normal failure path runs.
     if (runCtx && runCtx.active === true) {
       // A second call is a WAIT, never a failure: the caller's normal
       // failure path would otherwise invent "Backend call failed (list)"

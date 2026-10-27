@@ -143,6 +143,11 @@ LOCAL_TYPES = {
     'IntegratePicker': ('IntegratePicker.qml', BORDER_MEMBERS),
     'CardHeader': ('CardHeader.qml', ITEM_MEMBERS),
     'AppRow': ('AppRow.qml', COLUMN_MEMBERS),
+    'PanelJobs': ('PanelJobs.qml', ITEM_MEMBERS),
+    'PanelIntegrate': ('PanelIntegrate.qml', ITEM_MEMBERS),
+    'PanelUpdates': ('PanelUpdates.qml', ITEM_MEMBERS),
+    'PanelSourceEditor': ('PanelSourceEditor.qml', ITEM_MEMBERS),
+    'PanelPython': ('PanelPython.qml', ITEM_MEMBERS),
 }
 
 DECL_RE = re.compile(r'^\s*(?:required\s+|default\s+)*(?:readonly\s+)?'
@@ -216,36 +221,50 @@ for type_name, (file_name, inherited) in LOCAL_TYPES.items():
                 offset += len(raw_line) + 1
                 if not raw_line.strip():
                     continue
-                # only assignments at the block's own level
-                if depth_of(text, offset - len(raw_line) - 1) != base_depth + 1:
-                    continue
                 if DECL_RE.match(raw_line):
                     continue  # a declaration, not an assignment
-                m = HANDLER_RE.match(raw_line)
-                if m:
-                    # `onFoo` binds to signal `foo` or to the change
-                    # handler of property `foo` (signal `fooChanged`).
-                    raw_name = m.group(2)
-                    name = raw_name[0].lower() + raw_name[1:]
-                    if name not in known and f'{name}Changed' not in known:
+                # Only fragments that are bindings of THIS block: exactly
+                # one brace level past the block's opening (deeper lines
+                # belong to child objects, checked via their own type).
+                # Measured PER FRAGMENT, never per line: a whole block on
+                # one line starts at the parent's depth, so a line-level
+                # check skips every binding it carries — that is how a
+                # single-line `Panel { id: p; panel: root }` escaped the
+                # gate entirely. QML cannot put a `;` inside a binding
+                # value and strings/comments are already blanked, so the
+                # `;` split is exact.
+                line_start = offset - len(raw_line) - 1
+                scan = 0
+                for fragment in raw_line.split(';'):
+                    fstart = line_start + scan
+                    scan += len(fragment) + 1
+                    if depth_of(text, fstart) != base_depth + 1:
+                        continue
+                    m = HANDLER_RE.match(fragment)
+                    if m:
+                        # `onFoo` binds to signal `foo` or to the change
+                        # handler of property `foo` (signal `fooChanged`).
+                        raw_name = m.group(2)
+                        name = raw_name[0].lower() + raw_name[1:]
+                        if name not in known and f'{name}Changed' not in known:
+                            err('qml-property-gate', path, line_no,
+                                f'{type_name} has no signal/property "{name}" — '
+                                'QML rejects the assignment at compile time and '
+                                'the whole panel fails to load')
+                        continue
+                    m = ASSIGN_RE.match(fragment)
+                    if not m:
+                        continue
+                    name = m.group(2)
+                    if name in ('property', 'signal', 'readonly', 'default',
+                                'required', 'function', 'id'):
+                        continue
+                    if name not in known:
                         err('qml-property-gate', path, line_no,
-                            f'{type_name} has no signal/property "{name}" — '
-                            'QML rejects the assignment at compile time and '
-                            'the whole panel fails to load')
-                    continue
-                m = ASSIGN_RE.match(raw_line)
-                if not m:
-                    continue
-                name = m.group(2)
-                if name in ('property', 'signal', 'readonly', 'default',
-                            'required', 'function', 'id'):
-                    continue
-                if name not in known:
-                    err('qml-property-gate', path, line_no,
-                        f'{type_name} has no property "{name}" — QML rejects '
-                        'the assignment at compile time and the whole panel '
-                        'fails to load (declare it in '
-                        f'{file_name} or stop assigning it)')
+                            f'{type_name} has no property "{name}" — QML rejects '
+                            'the assignment at compile time and the whole panel '
+                            'fails to load (declare it in '
+                            f'{file_name} or stop assigning it)')
 
 if not QML:
     err('qml-property-gate', ROOT, None, 'no root QML files found')
