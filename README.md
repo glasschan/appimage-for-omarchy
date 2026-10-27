@@ -369,6 +369,20 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.11.4
+
+- **The icon display gate is per candidate.** The listing now reports
+  `icon_safe` as `{"png": bool, "svg": bool}` — one verdict per existing
+  icon file — and a row loads a candidate only when that candidate's own
+  verdict is true. A `.png` that passes the sanitiser but fails to decode
+  can no longer fall through to an unverified `.svg`. The sanitiser also
+  refuses IHDR fields no conforming PNG decoder accepts (compression and
+  filter methods other than 0, invalid bit-depth/colour-type pairs), so
+  an undecodable PNG is refused at the gate instead of failing inside the
+  row.
+- `SANITIZER_VERSION` is now 3: icons proven by the older gate re-verify
+  once and the sweep throttle forces one re-sweep. No action needed.
+
 ### 0.11.3
 
 - **Icons are display-gated, not just sweep-gated.** The listing now
