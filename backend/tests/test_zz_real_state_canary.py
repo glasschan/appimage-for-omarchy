@@ -1,3 +1,4 @@
+# Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 # test_zz_real_state_canary.py — suite-wide real-state isolation canary.
 #
 # FakeXDGTestCase sandboxes each test's environment, and
