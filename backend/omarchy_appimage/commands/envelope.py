@@ -84,7 +84,7 @@ def _running_pid_count(el, probe=None) -> int:
 
 
 def _make_app_json(el, manager=None, running=None, probe=None,
-                   pending=None) -> dict:
+                   pending=None, icon_safe=None) -> dict:
     if running is None:
         try:
             # `probe` is the listing's ONE cached scan: asking the question
@@ -148,6 +148,12 @@ def _make_app_json(el, manager=None, running=None, probe=None,
         'pending_version': (_update_state_version(pending) or None)
         if isinstance(pending, (dict, str)) else None,
         'pending_installable': _update_state_installable(pending),
+        # additive (schema_version stays 1), ticket #62 — the display
+        # gate: True only when the CURRENT sanitiser proved this app's
+        # icon file (janitor.verify_retained_icon against the persisted
+        # registry). Absent/false means the panel must show its built-in
+        # glyph and never open `.icons/<base>.{png,svg}`.
+        'icon_safe': icon_safe is True,
     }
 
 

@@ -34,17 +34,25 @@ The same gate covers the icons that are ALREADY on disk: an icon
 installed by an older plugin version never went through it, and the
 shell decodes whatever sits in the icons folder on every panel open.
 janitor.sweep_icons runs this sanitiser over those retained icons and
-removes the ones it refuses.
+removes the ones it refuses — and the listing verifies each icon a row
+would load (`janitor.verify_retained_icon`, recorded in the
+``sanitized-icons.json`` registry), so the frontend only ever opens a
+file the CURRENT sanitiser has proved.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 import struct
+import tempfile
 import zlib
-from typing import Optional
+from typing import Optional, Tuple
 from xml.etree import ElementTree
+
+from . import constants, utils
 
 # Ceilings a rail: 1024x1024 is far above any real app icon (the extractor
 # looks for 512/256/128/96 hicolor sizes) and caps a decode at 4 MiB RGBA.
@@ -333,3 +341,120 @@ def installed_icon_format(name: str, data: bytes) -> Optional[str]:
     if data[:8] == _PNG_SIG:
         return 'image/png'
     return None
+
+
+# --------------------------------------------------------------------------
+# Retained icons: read, atomic replace, and the sanitisation registry.
+#
+# The sweep (janitor.sweep_icons) and the listing verdict
+# (janitor.verify_retained_icon, reported as the app object's additive
+# `icon_safe`) share the primitives below, so the sweep and the listing
+# read and rewrite a retained icon identically — and the frontend only
+# opens a file whose sanitisation the CURRENT gate has proved.
+
+# Bump on ANY change to sanitize_icon's verdict logic. Stored in the
+# registry (and in the sweep-throttle marker) so icons proven by an older
+# gate re-verify under the new one. 1 = the v0.9.9 extract-time gate,
+# 2 = this display gate (the retained-icon verdict + registry).
+SANITIZER_VERSION = 2
+
+
+def sanitized_registry_path() -> str:
+    """The sanitised-icon registry: plugin state dir, never /tmp."""
+    return os.path.join(constants.plugin_state_dir(), 'sanitized-icons.json')
+
+
+def load_sanitized_registry() -> dict:
+    """The persisted `{path: {v, s, m}}` verdicts, or {} on ANY failure.
+
+    A registry is bookkeeping, never a source of truth: a missing,
+    unreadable, corrupt, or wrongly-shaped file costs a re-verification
+    (one sanitiser pass per icon), never an error."""
+    try:
+        with open(sanitized_registry_path(), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {key: value for key, value in data.items()
+            if isinstance(key, str) and isinstance(value, dict)}
+
+
+def save_sanitized_registry(reg: dict):
+    """Persist the registry atomically, best-effort; never raises.
+
+    Only well-formed entries are written (string path, dict entry with
+    int v/s/m), so a hand-edited or programmatically polluted map cannot
+    poison the file a later load would have to trust-shape."""
+    clean = {}
+    for key, entry in (reg or {}).items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        v, s, m = entry.get('v'), entry.get('s'), entry.get('m')
+        if all(isinstance(x, int) and not isinstance(x, bool)
+               for x in (v, s, m)):
+            clean[key] = {'v': v, 's': s, 'm': m}
+    try:
+        utils.atomic_write(sanitized_registry_path(),
+                           json.dumps(clean).encode('utf-8'))
+    except OSError as e:
+        logging.debug('icon: could not save the sanitised-icon registry: %s',
+                      e)
+
+
+def retained_bytes(path: str) -> Tuple[Optional[bytes], Optional[str]]:
+    """Read one retained icon the way the sweep and the verdict both do.
+
+    lstat size check against extractor.MAX_ICON_BYTES (oversized is
+    unusable, never read), then an O_NOFOLLOW open capped at
+    MAX_ICON_BYTES + 1 (a symlink planted in place is never followed),
+    then the format from the file name (`installed_icon_format`). Returns
+    (data, fmt); (None, None) when the file is unusable — the caller
+    decides skip vs. remove. Never raises."""
+    # imported here, not at module level: extractor imports this module's
+    # sanitiser, so a top-level import would be circular
+    from . import extractor
+    try:
+        st = os.lstat(path)
+        if st.st_size > extractor.MAX_ICON_BYTES:
+            return None, None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as handle:
+            data = handle.read(extractor.MAX_ICON_BYTES + 1)
+    except OSError:
+        return None, None
+    return data, installed_icon_format(os.path.basename(path), data)
+
+
+# Prefix of the temporary file an atomic icon rewrite writes first. It is
+# hidden (the sweep skips hidden names) and lives in the icons folder
+# itself, because os.replace is only atomic within one filesystem.
+ICON_TMP_PREFIX = '.icon-sweep-'
+
+
+def replace_icon_file(path: str, data: bytes, mode: int):
+    """Replace an icon with `data` atomically.
+
+    The new bytes land in a temporary file in the SAME directory
+    (os.replace is only atomic within one filesystem) and are renamed
+    over the old file, so a crash never leaves a half-written icon for
+    the shell to decode. The temporary name is hidden and carries this
+    module's own prefix, so a concurrent sweep never mistakes it for an
+    icon. Raises on failure (OSError); callers decide what that costs."""
+    directory = os.path.dirname(path) or '.'
+    fd, tmp_path = tempfile.mkstemp(prefix=ICON_TMP_PREFIX, dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+

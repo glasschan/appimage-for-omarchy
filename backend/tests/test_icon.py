@@ -1,13 +1,18 @@
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 """Icon sanitisation: provider bytes never reach the shell's decoder unbounded."""
 
+import errno
+import os
+import shutil
 import struct
+import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 import helpers  # noqa: F401  — puts backend/ on sys.path (as the other suites do)
 
-from omarchy_appimage import icon
+from omarchy_appimage import icon, janitor
 from omarchy_appimage.extractor import _find_icon, image_format
 
 
@@ -392,3 +397,192 @@ class SanitizeFixedPointTests(unittest.TestCase):
         svg = (b'<svg xmlns="http://www.w3.org/2000/svg" width="16" '
                b'height="16"/>')
         self.assertEqual(icon.sanitize_icon(svg, 'image/svg+xml'), svg)
+
+
+class RetainedIconRegistryTests(unittest.TestCase):
+    """The sanitised-icon registry + the retained-icon verdict
+    (janitor.verify_retained_icon lives on janitor, but its primitives —
+    the registry path, load/save, the capped O_NOFOLLOW read and the
+    atomic rewrite — are this module's, so they are pinned here).
+
+    The verdict is the display gate: the listing reports True only for a
+    file THIS gate version has proved, so the shell never opens a
+    retained icon during a throttle window, past the sweep cap, or after
+    a failed rewrite."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='icon-registry-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = os.path.join(self.tmp, 'sanitized-icons.json')
+        patcher = mock.patch.object(icon, 'sanitized_registry_path',
+                                    return_value=self.registry)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_icon(self, name='icon.png', data=None):
+        path = os.path.join(self.tmp, name)
+        with open(path, 'wb') as handle:
+            handle.write(data if data is not None else build_png(8, 8))
+        return path
+
+    def _entry(self, path):
+        st = os.lstat(path)
+        return {'v': icon.SANITIZER_VERSION, 's': st.st_size,
+                'm': st.st_mtime_ns}
+
+    def test_registry_round_trips(self):
+        reg = {'/a/icon.png': self._entry('/a/icon.png')
+               if os.path.exists('/a/icon.png')
+               else {'v': 2, 's': 10, 'm': 20}}
+        icon.save_sanitized_registry(reg)
+        self.assertEqual(icon.load_sanitized_registry(), reg)
+
+    def test_corrupt_registry_loads_as_empty(self):
+        for content in ('', 'not json', '[1, 2]', '{"a": 3}'):
+            with open(self.registry, 'w') as handle:
+                handle.write(content)
+            with self.subTest(content=content):
+                self.assertEqual(icon.load_sanitized_registry(), {})
+
+    def test_malformed_entries_are_filtered_not_fatal(self):
+        with open(self.registry, 'w') as handle:
+            handle.write('{"a": "str", "b": {"v": 1, "s": 2, "m": 3}}')
+        self.assertEqual(icon.load_sanitized_registry(),
+                         {'b': {'v': 1, 's': 2, 'm': 3}})
+
+    def test_missing_registry_loads_as_empty(self):
+        self.assertEqual(icon.load_sanitized_registry(), {})
+
+    def test_save_never_raises_on_an_unwritable_path(self):
+        # a directory squatting on the registry path: the save is
+        # best-effort by contract
+        os.mkdir(self.registry)
+        self.addCleanup(os.rmdir, self.registry)
+        icon.save_sanitized_registry({'/a.png': {'v': 2, 's': 1, 'm': 1}})
+
+    def test_save_only_writes_well_formed_entries(self):
+        icon.save_sanitized_registry({
+            '/good.png': {'v': icon.SANITIZER_VERSION, 's': 12, 'm': 34},
+            '/junk.png': 'not a dict',
+            42: {'v': 2, 's': 1, 'm': 1},
+            '/half.png': {'v': 'two', 's': 1, 'm': 1},
+        })
+        self.assertEqual(icon.load_sanitized_registry(),
+                         {'/good.png': {'v': icon.SANITIZER_VERSION,
+                                        's': 12, 'm': 34}})
+
+
+class RetainedIconVerdictTests(unittest.TestCase):
+    """janitor.verify_retained_icon: the per-file display verdict."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='icon-verdict-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _write_icon(self, data=None, name='icon.png'):
+        path = os.path.join(self.tmp, name)
+        with open(path, 'wb') as handle:
+            handle.write(data if data is not None else build_png(8, 8))
+        return path
+
+    def _entry(self, path):
+        st = os.lstat(path)
+        return {'v': icon.SANITIZER_VERSION, 's': st.st_size,
+                'm': st.st_mtime_ns}
+
+    def test_safe_file_is_proved_and_recorded(self):
+        path = self._write_icon()
+        reg = {}
+        self.assertTrue(janitor.verify_retained_icon(path, reg))
+        self.assertEqual(reg[path], self._entry(path))
+
+    def test_fast_path_hits_without_a_read_or_a_decode(self):
+        # the poison proves the fast path: if the verdict so much as
+        # touched the sanitiser, the raise would fail the call
+        path = self._write_icon()
+        reg = {path: self._entry(path)}
+        with mock.patch.object(icon, 'sanitize_icon',
+                               side_effect=AssertionError('slow path')):
+            self.assertTrue(janitor.verify_retained_icon(path, reg))
+        self.assertEqual(reg[path], self._entry(path))
+
+    def test_touched_file_drops_the_entry_and_reproves(self):
+        # the recorded mtime_ns no longer matches: the fast path must
+        # not fire (proven by the refusal-poison) — a stale stat can
+        # only earn a fresh verdict
+        path = self._write_icon()
+        reg = {path: self._entry(path)}
+        st = os.lstat(path)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+        with mock.patch.object(icon, 'sanitize_icon', return_value=None):
+            self.assertFalse(janitor.verify_retained_icon(path, reg))
+        self.assertNotIn(path, reg)
+
+    def test_touched_safe_file_is_reproved_and_re_recorded(self):
+        path = self._write_icon()
+        reg = {path: dict(self._entry(path), m=1)}
+        self.assertTrue(janitor.verify_retained_icon(path, reg))
+        self.assertEqual(reg[path], self._entry(path))
+
+    def test_entry_from_an_older_gate_version_is_not_trusted(self):
+        path = self._write_icon()
+        reg = {path: dict(self._entry(path), v=icon.SANITIZER_VERSION - 1)}
+        with mock.patch.object(icon, 'sanitize_icon', return_value=None):
+            self.assertFalse(janitor.verify_retained_icon(path, reg))
+        self.assertNotIn(path, reg)
+
+    def test_refused_bytes_drop_the_entry_and_keep_the_file(self):
+        # truncated PNG: the sanitiser refuses it, the verdict is False,
+        # and the FILE SURVIVES — deletion belongs to the sweep; a
+        # refusal costs a glyph, never a file
+        data = build_png(8, 8)[:-4]
+        path = self._write_icon(data)
+        reg = {}
+        self.assertFalse(janitor.verify_retained_icon(path, reg))
+        self.assertNotIn(path, reg)
+        self.assertTrue(os.path.exists(path))
+        with open(path, 'rb') as handle:
+            self.assertEqual(handle.read(), data)
+
+    def test_failed_rewrite_drops_the_entry_and_keeps_the_bytes(self):
+        bomb = zlib.compress(b'A' * (1024 * 1024), 9)
+        data = build_png(8, 8, extra=[(b'zTXt', b'C\x00\x00' + bomb)])
+        path = self._write_icon(data)
+        reg = {}
+        with mock.patch.object(icon, 'replace_icon_file',
+                               side_effect=OSError(errno.ENOSPC,
+                                                   'no space')):
+            self.assertFalse(janitor.verify_retained_icon(path, reg))
+        self.assertNotIn(path, reg)
+        with open(path, 'rb') as handle:
+            self.assertEqual(handle.read(), data)
+
+    def test_missing_path_is_false(self):
+        reg = {'/gone/icon.png': {'v': icon.SANITIZER_VERSION,
+                                  's': 1, 'm': 1}}
+        self.assertFalse(janitor.verify_retained_icon(
+            os.path.join(self.tmp, 'absent.png'), reg))
+        self.assertFalse(janitor.verify_retained_icon(
+            os.path.join(self.tmp, 'absent.png'), {}))
+
+    def test_symlink_is_never_followed(self):
+        outside = os.path.join(self.tmp, 'outside.png')
+        with open(outside, 'wb') as handle:
+            handle.write(build_png(8, 8))
+        link = os.path.join(self.tmp, 'link.png')
+        os.symlink(outside, link)
+        reg = {}
+        self.assertFalse(janitor.verify_retained_icon(link, reg))
+        self.assertNotIn(link, reg)
+        self.assertTrue(os.path.islink(link))
+
+    def test_rewritten_file_records_the_new_stat(self):
+        bomb = zlib.compress(b'A' * (1024 * 1024), 9)
+        path = self._write_icon(
+            build_png(8, 8, extra=[(b'zTXt', b'C\x00\x00' + bomb)]))
+        reg = {}
+        self.assertTrue(janitor.verify_retained_icon(path, reg))
+        self.assertEqual(reg[path], self._entry(path))
+        with open(path, 'rb') as handle:
+            rewritten = handle.read()
+        self.assertNotIn(b'zTXt', rewritten)

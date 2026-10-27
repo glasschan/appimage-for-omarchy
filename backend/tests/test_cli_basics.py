@@ -78,7 +78,10 @@ class OfflineCliTests(FakeXDGTestCase):
             # launch shares the launcher's scale mechanism.
             'launch_scale_argv',
             'verification', 'installable',
-            'pending_update', 'pending_version', 'pending_installable'})
+            'pending_update', 'pending_version', 'pending_installable',
+            # additive, ticket #62: the icon display gate — True only when
+            # the current sanitiser proved the row's icon file.
+            'icon_safe'})
         self.assertEqual(app['name'], 'Fake App')
         self.assertEqual(app['path'], appimage)
         self.assertEqual(app['desktop_id'], 'fakeapp.desktop')

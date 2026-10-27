@@ -7,16 +7,20 @@
 # cmd_* functions in-process (with unittest.mock seams) instead of via the
 # main.py subprocess; everything else goes through the real CLI.
 
+import errno
 import json
 import os
+import time
+import zlib
 from pathlib import Path
 from unittest import mock
 
 from cli_support import InProcessCliMixin
 from helpers import FakeXDGTestCase
+from test_icon import build_png, chunk_types
 from test_procs import FakeProbe
 
-from omarchy_appimage import cli, procs, utils
+from omarchy_appimage import cli, icon, janitor, procs, utils
 from omarchy_appimage.ini_config import Config
 from omarchy_appimage.provider import AppImageListElement, InstalledStatus
 
@@ -352,3 +356,86 @@ class StaleRecordCliTests(FakeXDGTestCase):
         # a listing never removes anything
         self.assertTrue(os.path.isfile(appimage))
         self.assertIn('stale', self._apps_ini())
+
+
+class IconSafeCliTests(InProcessCliMixin, FakeXDGTestCase):
+    """`icon_safe` (ticket #62): the listing's display gate. The panel
+    must render its built-in glyph unless the CURRENT sanitiser proved
+    the icon file the row would load — proven here end-to-end through
+    the throttled sweep, the persisted verdict registry and the throttle
+    marker."""
+
+    def setUp(self):
+        super().setUp()
+        self.appimage, _desktop, _old_icon = self.install_fake_app()
+        self.icon_path = os.path.join(self.managed_dir, '.icons',
+                                      'fakeapp.png')
+        self.marker = janitor.sweep_marker_path()
+
+    def _write_icon(self, data):
+        os.makedirs(os.path.dirname(self.icon_path), exist_ok=True)
+        Path(self.icon_path).write_bytes(data)
+
+    def _hostile_png(self):
+        bomb = zlib.compress(b'A' * (1024 * 1024), 9)
+        return build_png(8, 8, extra=[(b'zTXt', b'C\x00\x00' + bomb)])
+
+    def _list(self):
+        out, err, code = self.run_cmd(cli.cmd_list_installed, ['--json'])
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(len(payload['installed']), 1)
+        return payload['installed'][0]
+
+    def test_retained_hostile_icon_is_sanitised_and_reported_safe(self):
+        self._write_icon(self._hostile_png())
+        app = self._list()
+        self.assertTrue(app['icon_safe'])
+        with open(self.icon_path, 'rb') as handle:
+            rewritten = handle.read()
+        self.assertNotIn(b'zTXt', rewritten)
+        self.assertEqual(chunk_types(rewritten),
+                         [b'IHDR', b'IDAT', b'IEND'])
+
+    def test_fresh_marker_skips_the_sweep_and_reports_unsafe(self):
+        # the sweep is throttled away, so nothing removed the refused
+        # icon — the verdict must still refuse it (a glyph, never the
+        # file); a metadata-laden but sanitisable icon is instead
+        # REWRITTEN by the verdict itself (see the safe-path test)
+        self._write_icon(build_png(60000, 60000, idat=zlib.compress(b'')))
+        Path(self.marker).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.marker).write_text(json.dumps(
+            {'v': icon.SANITIZER_VERSION, 'at': time.time()}))
+        self.assertFalse(self._list()['icon_safe'])
+        self.assertTrue(os.path.exists(self.icon_path))
+
+    def test_failed_rewrite_reports_unsafe_and_keeps_the_file(self):
+        self._write_icon(self._hostile_png())
+        with mock.patch.object(icon, 'replace_icon_file',
+                               side_effect=OSError(errno.ENOSPC,
+                                                   'no space')):
+            self.assertFalse(self._list()['icon_safe'])
+        self.assertIn(b'zTXt', Path(self.icon_path).read_bytes())
+
+    def test_no_icon_file_reports_unsafe(self):
+        self.assertFalse(self._list()['icon_safe'])
+
+    def test_proven_icon_stays_safe_through_the_registry_fast_path(self):
+        # first listing proves (and rewrites) the icon and persists the
+        # verdict; the second listing must answer from the registry
+        # WITHOUT a read or a decode — proven by the poisoned sanitiser
+        self._write_icon(self._hostile_png())
+        self.assertTrue(self._list()['icon_safe'])
+        with mock.patch.object(icon, 'sanitize_icon',
+                               side_effect=AssertionError('fast path')):
+            self.assertTrue(self._list()['icon_safe'])
+
+    def test_registry_save_failure_never_fails_the_listing(self):
+        # a registry write failure is best-effort by contract: the
+        # listing still succeeds and still reports its verdict
+        self._write_icon(self._hostile_png())
+        with mock.patch.object(icon.utils, 'atomic_write',
+                               side_effect=OSError(errno.ENOSPC,
+                                                   'no space')):
+            app = self._list()
+        self.assertTrue(app['icon_safe'])

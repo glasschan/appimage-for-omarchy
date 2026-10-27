@@ -404,10 +404,11 @@ class SweepThrottleTests(_DocSeedMixin, InProcessCliMixin, FakeXDGTestCase):
         with mock.patch.object(janitor, 'sweep') as sweep:
             self.assertTrue(janitor.sweep_throttled())
         sweep.assert_called_once()
-        # …and the sweep re-stamped it, so the marker is healthy again
-        self.assertLessEqual(
-            abs(float(Path(janitor.sweep_marker_path()).read_text())
-                - time.time()), 60)
+        # …and the sweep re-stamped it (new JSON format), so the marker
+        # is healthy again
+        stamp = json.loads(Path(janitor.sweep_marker_path()).read_text())
+        self.assertEqual(stamp['v'], icon.SANITIZER_VERSION)
+        self.assertLessEqual(abs(stamp['at'] - time.time()), 60)
 
     def test_marker_lives_in_the_plugin_state_dir(self):
         # never bare in the temp area: the marker must sit inside the
@@ -417,6 +418,58 @@ class SweepThrottleTests(_DocSeedMixin, InProcessCliMixin, FakeXDGTestCase):
                          os.path.dirname(self.plugin_jobs_dir))
         self.assertNotEqual(os.path.dirname(janitor.sweep_marker_path()),
                             os.path.realpath(tempfile.gettempdir()))
+
+    def _stamp(self, v=None, at=None):
+        path = janitor.sweep_marker_path()
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps({
+            'v': icon.SANITIZER_VERSION if v is None else v,
+            'at': time.time() if at is None else at}))
+        return path
+
+    def test_marker_json_carries_the_sanitiser_version(self):
+        self._stamp()
+        stamp = json.loads(Path(janitor.sweep_marker_path()).read_text())
+        self.assertEqual(stamp['v'], icon.SANITIZER_VERSION)
+        self.assertIsInstance(stamp['at'], float)
+
+    def test_marker_is_stamped_only_after_the_sweep(self):
+        # the reviewer-demanded ordering: an interrupted sweep must leave
+        # the OLD marker behind, so the next poll re-sweeps — a marker
+        # stamped BEFORE the sweep would make a half-finished pass look
+        # complete for a whole throttle window
+        observed = {}
+
+        def spy(now=None, temp_area=None, icons_dir=None):
+            observed['at_sweep'] = os.path.exists(
+                janitor.sweep_marker_path())
+            return {'documents_removed': 0, 'temp_dirs_removed': 0,
+                    'icons_removed': 0}
+
+        with mock.patch.object(janitor, 'sweep', side_effect=spy):
+            self.assertTrue(janitor.sweep_throttled())
+        self.assertFalse(observed['at_sweep'])
+        self.assertTrue(os.path.exists(janitor.sweep_marker_path()))
+
+    def test_legacy_bare_float_marker_sweeps_once_and_is_upgraded(self):
+        path = janitor.sweep_marker_path()
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(repr(time.time() - 1.0))
+        with mock.patch.object(janitor, 'sweep') as sweep:
+            self.assertTrue(janitor.sweep_throttled())
+        sweep.assert_called_once()
+        stamp = json.loads(Path(path).read_text())
+        self.assertEqual(stamp['v'], icon.SANITIZER_VERSION)
+        # …and the upgraded marker throttles the next poll again
+        with mock.patch.object(janitor, 'sweep') as sweep:
+            self.assertFalse(janitor.sweep_throttled())
+        sweep.assert_not_called()
+
+    def test_marker_from_an_older_gate_version_sweeps_again(self):
+        self._stamp(v=icon.SANITIZER_VERSION - 1)
+        with mock.patch.object(janitor, 'sweep') as sweep:
+            self.assertTrue(janitor.sweep_throttled())
+        sweep.assert_called_once()
 
     def test_list_installed_sweeps_only_once_per_window(self):
         with mock.patch.object(janitor, 'sweep') as sweep:
@@ -597,3 +650,75 @@ class IconSweepTests(unittest.TestCase):
         self.assertEqual(janitor.sweep_icons(
             icons_dir=os.path.join(self.icons, 'absent')), 0)
         self.assertEqual(janitor.sweep_icons(icons_dir=None), 0)
+
+
+class IconRegistrySweepTests(unittest.TestCase):
+    """sweep_icons mirrors every per-icon outcome into the sanitisation
+    registry the listing's verdict reads: kept/rewritten icons get an
+    entry recording the CURRENT stat, removed/skipped ones lose theirs,
+    stale entries are pruned, and a changed map is persisted."""
+
+    def setUp(self):
+        self.icons = tempfile.mkdtemp(prefix='icons-reg-')
+        self.addCleanup(shutil.rmtree, self.icons, True)
+        self.registry = os.path.join(tempfile.mkdtemp(prefix='icons-state-'),
+                                     'sanitized-icons.json')
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.registry), True)
+        patcher = mock.patch.object(icon, 'sanitized_registry_path',
+                                    return_value=self.registry)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write(self, name, data):
+        path = os.path.join(self.icons, name)
+        with open(path, 'wb') as handle:
+            handle.write(data)
+        return path
+
+    def _entry(self, path):
+        st = os.lstat(path)
+        return {'v': icon.SANITIZER_VERSION, 's': st.st_size,
+                'm': st.st_mtime_ns}
+
+    def test_sweep_records_kept_and_rewritten_and_drops_the_rest(self):
+        clean = self._write('clean.png', build_png(8, 8))
+        bomb = zlib.compress(b'A' * (1024 * 1024), 9)
+        dirty = self._write('dirty.png',
+                            build_png(8, 8, extra=[(b'zTXt', b'C\x00\x00'
+                                                   + bomb)]))
+        hostile = self._write('hostile.svg',
+                              b'<svg xmlns="http://www.w3.org/2000/svg" '
+                              b'width="16" height="16"><image/></svg>')
+        outside = self._write('target.png', b'x')
+        link = os.path.join(self.icons, 'link.png')
+        os.unlink(outside)
+        os.symlink(os.path.join(self.icons, 'absent.png'), link)
+
+        reg = {}
+        self.assertEqual(janitor.sweep_icons(icons_dir=self.icons, reg=reg),
+                         1)  # only the hostile svg is removed
+
+        self.assertEqual(reg[clean], self._entry(clean))
+        self.assertEqual(reg[dirty], self._entry(dirty))
+        self.assertNotIn(hostile, reg)
+        self.assertNotIn(link, reg)
+        # the changed map was persisted
+        self.assertEqual(icon.load_sanitized_registry(),
+                         {clean: reg[clean], dirty: reg[dirty]})
+
+    def test_sweep_prunes_entries_for_gone_icons(self):
+        stale = os.path.join(self.icons, 'uninstalled.png')
+        reg = {stale: {'v': icon.SANITIZER_VERSION, 's': 1, 'm': 1},
+               '/elsewhere/kept.png': {'v': icon.SANITIZER_VERSION,
+                                       's': 1, 'm': 1}}
+        janitor.sweep_icons(icons_dir=self.icons, reg=reg)
+        self.assertNotIn(stale, reg)
+        self.assertIn('/elsewhere/kept.png', reg)
+
+    def test_sweep_without_changes_does_not_touch_the_registry_file(self):
+        clean = self._write('clean.png', build_png(8, 8))
+        icon.save_sanitized_registry({clean: self._entry(clean)})
+        before = Path(self.registry).read_bytes()
+        reg = icon.load_sanitized_registry()
+        janitor.sweep_icons(icons_dir=self.icons, reg=reg)
+        self.assertEqual(Path(self.registry).read_bytes(), before)

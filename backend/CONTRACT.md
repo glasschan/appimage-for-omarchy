@@ -61,6 +61,20 @@ disappearing with the next 10 s poll, and they survive a shell restart.
 An app the last check found up to date reports `pending_update: false`; an
 app whose check failed keeps its last known verdict (issue #43's rule).
 
+**Icon display gate (additive `icon_safe`, ticket #62).** Each app object
+also carries `icon_safe: true | false`: true only when the CURRENT
+sanitiser (`icon.sanitize_icon`, `SANITIZER_VERSION`) proved the icon file
+the row would load (`<managed>/.icons/<basename-without-extension>.png`,
+then `.svg`) — via the persisted per-file verdict registry
+(`sanitized-icons.json`, see *Filesystem layout*) or a fresh verification
+that may rewrite the file. The listing is the proof, and it never relaxes
+the sweep: a file that cannot be sanitised reports `icon_safe: false` and
+stays on disk (deletion belongs to the sweep). **The panel renders its
+built-in glyph unless `icon_safe` is exactly true** — the shell must never
+open `.icons/<base>.{png,svg}` unproved (not during a throttle window, not
+after an interrupted sweep, not past the sweep's file cap, not after a
+failed atomic rewrite).
+
 The listing is desktop-driven: a record in `apps.ini` whose `.desktop` file
 is gone is **not** listed as installed. It is logged on stderr instead
 (`stale integration record: the desktop file <path> is gone; orphaned
@@ -1029,6 +1043,7 @@ No arguments prints usage and exits **2**.
 | `pending_update` | boolean | True when the plugin's durable check record holds an entry for this app — the last successful check found a newer release. Read from that record (never recomputed by a listing), so it survives the 10 s listing poll and a shell restart; `false` when there is no entry (no check has run, or the last check found the app up to date) |
 | `pending_version` | string or null | The release version that check found; `null` when there is no record, or when the source named no version (a plain-URL/zsync source). A pending release can therefore be reported without a version |
 | `pending_installable` | boolean or null | Whether that pending release could be installed (`true` / `false`); `null` when there is no record — including a legacy plain-signature entry written before this version. A verdict here never promises the fetch will succeed: the strict policy still decides at install time |
+| `icon_safe` | boolean | The display gate (ticket #62): true only when the current sanitiser proved the row's icon file (see `--list-installed`). The panel shows its built-in glyph unless this is exactly true — the shell never opens an unproved icon file |
 | `embedded_source` | boolean | True when the source comes from the AppImage's embedded `.upd_info` string (false for custom configs and for no source) |
 | `running` | boolean | True when the AppImage is currently running. Computed by **one rule shared with `running_pids`** (`utils._running_by_ps` → `procs.pids_for`'s `parent` list, plus the `fuse.*` mount signal for the runtime that has no attributable exe): a process whose `/proc/<pid>/exe` is the AppImage path (compared through `os.path.realpath`, so a symlinked install directory matches either way round), or a `fuse.*` mount in `/proc/mounts` attributed to it (matched on the mount source's basename — see Process identity under Security model). Because the mount signal can outlive the processes, `running: true` with `running_pids: 0` is possible: the mount is still there, no process of ours is |
 | `running_pids` | int | How many processes belong to this AppImage: the runtime parent (its `exe` is the AppImage path) **plus** the helpers running out of the `fuse.*` mount attributed to it — the set `--kill-running` would close (`procs.pids_for`). `0` when the app is not running (a non-running row is never scanned) and `0` when the count cannot be determined (a failed scan is a warning, never an error, and never flips `running`). **Display-only**: the panel's prompt names it; no command reads it back. A listing builds one process table (and one `/proc/mounts` read) and reuses it for every running row, because the panel polls the listing every 10 s |
@@ -1037,7 +1052,7 @@ No arguments prints usage and exits **2**.
 | `launch_scale_argv` | string array | The argv **tail** for the `--exec-with-scale` entry point (`launch.panel_exec_scale_argv`: `<image> [args]`, no env part — the detached spawn cannot carry env variables). The panel spawns `[backendCommand..., "--exec-with-scale", *launch_scale_argv]` so the panel launch shares the launcher's scale mechanism; the verb stamps `DESKTOPINTEGRATION=1` itself (see the launch contract under `--exec-with-scale`). Additive since ticket #35 |
 
 > `verification`, `installable`, `pending_update`, `pending_version`,
-> `pending_installable`, `exec_arguments`, `launch_argv`,
+> `pending_installable`, `icon_safe`, `exec_arguments`, `launch_argv`,
 > `launch_scale_argv` and `running_pids` are
 > **additive** keys: every other key keeps its meaning, and a reader that
 > ignores unknown keys (the QML layer does) is unaffected — the same way
@@ -1133,6 +1148,8 @@ meaning, so readers that ignore unknown keys are unaffected
 | `$XDG_CONFIG_HOME/io.github.glasschan.appimage/apps.ini` | Per-app metadata (`[app.<md5>]`) and update sources (`[app.<md5>.update_manager]`, `manager` + config keys, booleans stored as `true`/`false`), INI format compatible with GearLever |
 | `$XDG_CONFIG_HOME/io.github.glasschan.appimage/updates-state.json` | Per-app pending-update record (desktop id falls back to the AppImage basename), one entry per app: `{"signature": "<available_version>|<download_size>", "installable": true \| false \| null, "path": "<absolute AppImage path>", "version": "<release version the source named, "" when it names none>"}`. An entry present means a pending release is known for that app; a legacy plain-signature entry is still read as pending, with no version and no verdict. Written by `--list-updates` and `--fetch-updates` (merged per app, never rebuilt wholesale) and retired by a successful `--update` |
 | `$XDG_STATE_HOME/io.github.glasschan.appimage/jobs/` | Background job documents (`<desktop id stem>.json`) and their size-capped logs (`<stem>.log`) written by `--update --async` |
+| `$XDG_STATE_HOME/io.github.glasschan.appimage/sanitized-icons.json` | Per-icon verdict registry of the display gate (ticket #62): `{ "<absolute icon path>": {"v": <SANITIZER_VERSION>, "s": <size>, "m": <mtime_ns>} }`. An entry means the sanitiser version `v` proved that exact file (size + mtime_ns matched); the listing re-proves anything else and rewrites refused-but-sanitisable icons in place. Best-effort bookkeeping — missing/corrupt file costs a re-verification, never an error |
+| `$XDG_STATE_HOME/io.github.glasschan.appimage/last-sweep` | The janitor throttle marker, JSON `{"v": <SANITIZER_VERSION>, "at": <epoch>}`, stamped **after** a completed sweep — an interrupted sweep leaves the old marker so the next poll re-sweeps. The throttle holds only when `v` names the current sanitiser and `at` is inside the 300 s window; a legacy bare-float marker reads as version 0 (one forced re-sweep), and a missing/corrupt/future marker still sweeps |
 
 ### XDG override behaviour (required for tests/sandboxes)
 

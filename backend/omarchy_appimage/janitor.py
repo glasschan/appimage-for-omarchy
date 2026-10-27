@@ -16,7 +16,6 @@
 # removals are capped per sweep, and the entrypoints never raise — a
 # sweep failure must never fail --list-installed or a job start.
 
-import errno
 import json
 import logging
 import os
@@ -74,10 +73,10 @@ UPDATE_TEMP_PREFIXES = ('appimage-update-', INTEGRATE_TEMP_PREFIX)
 MAX_REMOVALS_PER_SWEEP = 200
 
 # The prefix of the temporary file the icon sweep writes before it
-# renames the sanitised bytes over the old icon. It is hidden (the
-# sweep skips hidden names) and lives in the icons folder itself,
-# because os.replace is only atomic within one filesystem.
-ICON_TMP_PREFIX = '.icon-sweep-'
+# renames the sanitised bytes over the old icon: owned by icon.py now,
+# kept here as an alias for compatibility with the docs/tests that name
+# it (the atomic writer is icon.replace_icon_file).
+ICON_TMP_PREFIX = icon.ICON_TMP_PREFIX
 
 
 def sweep_job_documents(now: float = None) -> int:
@@ -181,7 +180,7 @@ def sweep_update_temp_dirs(now: float = None,
     return removed
 
 
-def sweep_icons(icons_dir: str = None) -> int:
+def sweep_icons(icons_dir: str = None, reg: dict = None) -> int:
     """Make the retained icons safe to decode: sanitise them or remove them.
 
     The v0.9.9 sanitiser gates the EXTRACT path only, and provider.py
@@ -197,11 +196,19 @@ def sweep_icons(icons_dir: str = None) -> int:
     * a file larger than extractor.MAX_ICON_BYTES is removed — it is
       not worth sanitising, and its stored bytes alone are past the cap;
     * the format comes from the file name, and from the content when the
-      name says nothing (icon.installed_icon_format);
-    * the sanitised bytes REPLACE the file atomically, or the file is
-      left byte-identical when it is already sanitised;
+      name says nothing (icon.retained_bytes);
+    * the sanitised bytes REPLACE the file atomically
+      (icon.replace_icon_file), or the file is left byte-identical when
+      it is already sanitised;
     * a file the sanitiser refuses — or cannot read — is REMOVED: an
       icon that cannot be sanitised must not be handed to the decoder.
+
+    Every outcome is mirrored into the sanitisation registry (`reg`,
+    default icon.load_sanitized_registry()): kept/rewritten icons get an
+    entry recording the CURRENT stat, removed/skipped ones lose theirs,
+    and registry entries naming files no longer in the folder are pruned.
+    The registry is SAVED at the end when this pass changed it
+    (best-effort).
 
     The folder is the plugin's own (one icon per integrated app) and the
     sweep is throttled (janitor.sweep_throttled), so a full pass stays
@@ -212,6 +219,9 @@ def sweep_icons(icons_dir: str = None) -> int:
     if not icons_dir or os.path.islink(icons_dir) \
             or not os.path.isdir(icons_dir):
         return 0
+    if reg is None:
+        reg = icon.load_sanitized_registry()
+    dirty = False
     try:
         entries = os.listdir(icons_dir)
     except OSError as e:
@@ -219,6 +229,7 @@ def sweep_icons(icons_dir: str = None) -> int:
         return 0
     removed = 0
     changed = 0
+    seen = set()
     for name in entries:
         if changed >= MAX_REMOVALS_PER_SWEEP:
             break
@@ -231,19 +242,107 @@ def sweep_icons(icons_dir: str = None) -> int:
             # which would break the install that owns it.
             continue
         path = os.path.join(icons_dir, name)
+        seen.add(path)
         try:
             if not _is_regular_file(path):
+                reg.pop(path, None)
+                dirty = True
                 continue
             outcome = _sanitize_installed_icon(path)
         except Exception as e:
             logging.debug('janitor: skipped icon %s: %s', path, e)
+            if reg.pop(path, None) is not None:
+                dirty = True
             continue
-        if outcome == 'removed':
-            removed += 1
-            changed += 1
-        elif outcome == 'rewritten':
-            changed += 1
+        if outcome in ('kept', 'rewritten'):
+            if _record_icon_entry(path, reg):
+                dirty = True
+        else:
+            if outcome == 'removed':
+                removed += 1
+                changed += 1
+            if reg.pop(path, None) is not None:
+                dirty = True
+    # Opportunistic prune: entries for icons the folder no longer holds
+    # (an uninstalled app, an integrated icon that replaced its stem).
+    for path in list(reg.keys()):
+        if os.path.dirname(path) == icons_dir and path not in seen:
+            reg.pop(path, None)
+            dirty = True
+    if dirty:
+        icon.save_sanitized_registry(reg)
     return removed
+
+
+def _record_icon_entry(path: str, reg: dict) -> bool:
+    """Record an icon's current stat in the registry (True when the map
+    changed). A file that vanished mid-sweep gets its entry dropped."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return reg.pop(path, None) is not None
+    entry = {'v': icon.SANITIZER_VERSION, 's': st.st_size,
+             'm': st.st_mtime_ns}
+    if reg.get(path) != entry:
+        reg[path] = entry
+        return True
+    return False
+
+
+def verify_retained_icon(path: str, reg: dict) -> bool:
+    """THE retained-icon verdict: did the CURRENT sanitiser prove this file?
+
+    The listing calls this per candidate icon and reports the answer as
+    the app object's additive `icon_safe`; the frontend renders its
+    built-in glyph unless it is True, so the shell's decoder never opens
+    a file the current gate has not proved — not during a throttle
+    window, not after an interrupted sweep, not past the sweep's file
+    cap, not after a failed rewrite.
+
+    Fast path: a registry entry recorded by THIS gate version whose
+    size/mtime_ns still match the file answers without a read or a
+    decode. Slow path: read (icon.retained_bytes), sanitise, and either
+    record (bytes already safe), rewrite and record the new stat, or
+    drop the entry on any refusal. The FILE is never deleted here — the
+    sweep owns deletion; a refusal costs a glyph. Never raises; may
+    mutate `reg` (the caller persists it)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        reg.pop(path, None)
+        return False
+    entry = reg.get(path)
+    if isinstance(entry, dict):
+        v, s, m = entry.get('v'), entry.get('s'), entry.get('m')
+        if (isinstance(v, int) and v == icon.SANITIZER_VERSION
+                and isinstance(s, int) and s == st.st_size
+                and isinstance(m, int) and m == st.st_mtime_ns):
+            return True
+    data, fmt = icon.retained_bytes(path)
+    if data is None:
+        reg.pop(path, None)
+        return False
+    safe = icon.sanitize_icon(data, fmt)
+    if safe is None:
+        reg.pop(path, None)
+        return False
+    if safe == data:
+        reg[path] = {'v': icon.SANITIZER_VERSION, 's': st.st_size,
+                     'm': st.st_mtime_ns}
+        return True
+    try:
+        icon.replace_icon_file(path, safe, stat.S_IMODE(st.st_mode))
+    except OSError:
+        reg.pop(path, None)
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        reg.pop(path, None)
+        return False
+    reg[path] = {'v': icon.SANITIZER_VERSION, 's': st.st_size,
+                 'm': st.st_mtime_ns}
+    return True
 
 
 def _sanitize_installed_icon(path: str) -> str:
@@ -253,27 +352,26 @@ def _sanitize_installed_icon(path: str) -> str:
     sanitised bytes replaced it), 'removed' (it could not be made safe)
     or 'skipped' (it is not a regular file after all). Never raises:
     every failure ends in a removal or in the file being left alone.
+    The read and the atomic rewrite go through icon.retained_bytes /
+    icon.replace_icon_file so the sweep and the listing's verdict share
+    the same primitives.
     """
     st = os.lstat(path)
     if st.st_size > extractor.MAX_ICON_BYTES:
         os.unlink(path)
         logging.debug('janitor: removed oversized installed icon %s', path)
         return 'removed'
-    try:
-        # O_NOFOLLOW: the name was a regular file a moment ago, and a
-        # symlink planted in its place must not be followed (nor removed)
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, 'rb') as handle:
-            data = handle.read(extractor.MAX_ICON_BYTES + 1)
-    except OSError as e:
-        if e.errno == errno.ELOOP:
+    data, fmt = icon.retained_bytes(path)
+    if data is None:
+        if os.path.islink(path):
+            # the name was a regular file a moment ago, and a symlink
+            # planted in its place must not be followed (nor removed)
             return 'skipped'
         # An icon we cannot read cannot be sanitised, and the shell
         # decodes whatever sits in the folder: it goes.
-        logging.debug('janitor: cannot read installed icon %s: %s', path, e)
+        logging.debug('janitor: cannot read installed icon %s', path)
         _unlink_quietly(path)
         return 'removed'
-    fmt = icon.installed_icon_format(os.path.basename(path), data)
     safe = icon.sanitize_icon(data, fmt) if fmt else None
     if safe is None:
         os.unlink(path)
@@ -282,7 +380,7 @@ def _sanitize_installed_icon(path: str) -> str:
         return 'removed'
     if safe == data:
         return 'kept'
-    _replace_icon(path, safe, stat.S_IMODE(st.st_mode))
+    icon.replace_icon_file(path, safe, stat.S_IMODE(st.st_mode))
     logging.debug('janitor: sanitised installed icon %s', path)
     return 'rewritten'
 
@@ -295,32 +393,6 @@ def _unlink_quietly(path: str):
         logging.debug('janitor: cannot remove installed icon %s: %s',
                       path, e)
 
-
-def _replace_icon(path: str, data: bytes, mode: int):
-    """Replace an icon with `data` atomically.
-
-    The new bytes land in a temporary file in the SAME directory
-    (os.replace is only atomic within one filesystem) and are renamed
-    over the old file, so a crash never leaves a half-written icon for
-    the shell to decode. The temporary name is hidden and carries this
-    module's own prefix, so a concurrent sweep never mistakes it for an
-    icon.
-    """
-    directory = os.path.dirname(path) or '.'
-    fd, tmp_path = tempfile.mkstemp(prefix=ICON_TMP_PREFIX, dir=directory)
-    try:
-        with os.fdopen(fd, 'wb') as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp_path, mode)
-        os.replace(tmp_path, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
 
 
 def sweep(now: float = None, temp_area: str = None,
@@ -366,39 +438,82 @@ def sweep_marker_path() -> str:
     return os.path.join(constants.plugin_state_dir(), 'last-sweep')
 
 
+def _write_sweep_marker(now: float):
+    """Stamp the marker as JSON {"v": SANITIZER_VERSION, "at": epoch}.
+
+    The version makes a sanitiser change force exactly one re-sweep; `at`
+    is the throttled call's epoch."""
+    try:
+        utils.atomic_write(
+            sweep_marker_path(),
+            json.dumps({'v': icon.SANITIZER_VERSION,
+                        'at': float(now)}).encode('utf-8'))
+    except OSError as e:
+        logging.debug('janitor: could not stamp the sweep marker: %s', e)
+
+
+def _read_sweep_marker():
+    """(version, epoch) out of the marker, or None when it cannot say.
+
+    The current format is the JSON `{"v": ..., "at": ...}` stamp; a
+    legacy bare-float marker (pre-v2) reads as version 0, so the first
+    reader re-sweeps and the new format replaces it. Anything else —
+    missing, corrupt, wrongly shaped — is None ("never swept")."""
+    try:
+        with open(sweep_marker_path(), 'r', encoding='utf-8') as f:
+            raw = f.read().strip()
+    except OSError:
+        return None
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict):
+        try:
+            return int(doc.get('v')), float(doc.get('at'))
+        except (TypeError, ValueError):
+            return None
+    try:
+        return 0, float(raw)
+    except ValueError:
+        return None
+
+
 def sweep_throttled(interval_seconds: float = SWEEP_THROTTLE_SECONDS,
                     now: float = None, icons_dir: str = None) -> bool:
     """sweep(), at most once per `interval_seconds`.
 
     For the high-frequency hook (--list-installed) only; sweep() itself
-    keeps its semantics for every direct caller. The marker holds the
-    epoch of the last sweep; a MISSING or CORRUPT marker means "never
-    swept" and sweeps (the throttle is an optimisation, never a
-    precondition — a janitor that stops running because its bookkeeping
-    broke is worse than one extra sweep). A marker timestamped in the
-    future (clock skew) is treated the same way.
+    keeps its semantics for every direct caller. The marker is JSON
+    carrying the sanitiser version and the sweep's epoch: the throttle
+    holds only when the marker names the CURRENT SANITIZER_VERSION and
+    its stamp is inside the window — a marker left by an older gate (or
+    the legacy bare-float format) forces exactly one re-sweep. A MISSING
+    or CORRUPT marker means "never swept" and sweeps (the throttle is an
+    optimisation, never a precondition — a janitor that stops running
+    because its bookkeeping broke is worse than one extra sweep). A
+    marker timestamped in the future (clock skew) is treated the same
+    way.
+
+    The marker is stamped AFTER sweep() returns: a sweep interrupted by
+    process death leaves the OLD marker, so the next poll re-sweeps
+    instead of trusting a pass that never finished. The bounded sweeps
+    (MAX_REMOVALS_PER_SWEEP) make that crash-loop cost acceptable, and
+    verify_retained_icon's registry fast path keeps the listing cheap
+    regardless.
 
     Returns True when this call swept, False when it was throttled.
     Never raises."""
     if now is None:
         now = time.time()
-    last = None
-    try:
-        with open(sweep_marker_path(), 'r', encoding='utf-8') as f:
-            last = float(f.read().strip())
-    except (OSError, ValueError):
-        last = None
-    if last is not None and 0 <= now - last < interval_seconds:
-        return False
-
-    # stamp BEFORE sweeping: a sweep that is interrupted (or that dies in
-    # a crash loop) must not be retried on every single poll
-    try:
-        utils.atomic_write(sweep_marker_path(),
-                           repr(float(now)).encode('utf-8'))
-    except OSError as e:
-        logging.debug('janitor: could not stamp the sweep marker: %s', e)
+    marker = _read_sweep_marker()
+    if marker is not None:
+        version, last = marker
+        if version == icon.SANITIZER_VERSION \
+                and 0 <= now - last < interval_seconds:
+            return False
     sweep(now=now, icons_dir=icons_dir)
+    _write_sweep_marker(now)
     return True
 
 

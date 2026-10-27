@@ -116,16 +116,18 @@ Column {
       anchors.rightMargin: Style.spacing.sm
       spacing: Style.spacing.sm
 
-      // Extracted icon when it exists (png then svg
-      // next to the AppImage under .icons/, CONTRACT.md
-      // filesystem layout), tabler cube-unfolded icon otherwise.
+      // Extracted icon only when the listing proved it sanitised by the
+      // CURRENT sanitiser (`icon_safe`, ticket #62 — the shell must never
+      // open an unproved file), png then svg next to the AppImage under
+      // .icons/ (CONTRACT.md filesystem layout), tabler cube-unfolded
+      // icon otherwise.
       Image {
         id: appIcon
         property int iconIndex: 0
         readonly property var iconCandidates: {
           var list = []
           var base = rowOuter.modelData.iconBase
-          if (base) {
+          if (base && rowOuter.modelData.iconSafe === true) {
             var exts = [".png", ".svg"]
             for (var i = 0; i < exts.length; i++) {
               list.push(Util.fileUrl(base + exts[i]))

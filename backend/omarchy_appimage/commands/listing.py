@@ -10,7 +10,7 @@
 import logging
 import os
 
-from .. import constants, janitor, jobs, procs, settings
+from .. import constants, janitor, jobs, procs, settings, icon
 from ..updaters import UpdateManagerChecker
 from .jobs import _job_desktop_id
 from .envelope import (EXIT_OK, EXIT_USAGE, OperationError, UsageError, _ask,
@@ -47,6 +47,11 @@ def cmd_list_installed(args: list) -> int:
         # for the whole listing (the panel polls this every 10 s) and
         # matched per app by the record's own key.
         state = settings.load_updates_state()
+        # The icon display gate (ticket #62): the registry is read ONCE
+        # and persisted ONCE after the loop — a save failure must never
+        # fail the listing.
+        reg = icon.load_sanitized_registry()
+        icons_dir = os.path.join(settings.appimages_folder(), '.icons')
         table = []
         for a in apps:
             # check_url_for_app is local-only (apps.ini config + the
@@ -55,7 +60,9 @@ def cmd_list_installed(args: list) -> int:
             # stay null until an actual check runs (--list-updates).
             table.append(_make_app_json(
                 a, manager=UpdateManagerChecker.check_url_for_app(a),
-                probe=scan, pending=state.get(_updates_state_key(a))))
+                probe=scan, pending=state.get(_updates_state_key(a)),
+                icon_safe=_listing_icon_safe(a, reg, icons_dir)))
+        icon.save_sanitized_registry(reg)
         _print_json({
             'schema_version': constants.JSON_SCHEMA_VERSION,
             'installed': table,
@@ -148,5 +155,27 @@ def cmd_remove(args: list) -> int:
     return EXIT_OK
 
 
-# ------------------------------------------------------- update commands
+# The icon display gate (ticket #62): candidates are tried in the same
+# png→svg order the panel probes (lib/Model.js iconBaseFor derives
+# `.icons/<basename-without-extension>`); the FIRST existing candidate is
+# the file the row would load, so only its verdict matters. No candidate
+# at all → False: the row shows its built-in glyph either way, and the
+# gate never claims a file that does not exist.
+_ICON_EXTENSIONS = ('.png', '.svg')
 
+
+def _listing_icon_safe(el, reg: dict, icons_dir: str) -> bool:
+    """True only when the CURRENT sanitiser proved the icon file this row
+    would load (janitor.verify_retained_icon against `reg`, which the
+    listing persists once after the loop). Never raises."""
+    stem = os.path.join(
+        icons_dir,
+        os.path.splitext(os.path.basename(el.file_path or ''))[0])
+    for ext in _ICON_EXTENSIONS:
+        candidate = stem + ext
+        if os.path.exists(candidate):
+            return janitor.verify_retained_icon(candidate, reg)
+    return False
+
+
+# ------------------------------------------------------- update commands
