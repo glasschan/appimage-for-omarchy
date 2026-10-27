@@ -369,6 +369,28 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.11.2
+
+- **`Panel.qml` is cut into domain controllers.** 2,622 → 1,469 lines: the
+  update-job, integrate/preview, row-update/force-quit, per-app source
+  editor and python-install clusters move into five non-visual sibling
+  components (`PanelJobs`, `PanelIntegrate`, `PanelUpdates`,
+  `PanelSourceEditor`, `PanelPython`) — each a plain `Item` holding its
+  cluster's processes and timers, taking the panel as an untyped
+  `property var panel`, with every entry point still reachable through a
+  one-line delegating function on `Panel.qml`. State and claims never
+  leave the panel root.
+- **Narration comments are purged.** ~520 comment lines of ticket
+  references, history and restatement go; every constraint comment
+  (delegate traps, bounded row meta, watchdog budgets, claim semantics)
+  stays.
+- **The property gate covers one-line instantiations.** Its depth check
+  used to measure the whole line, so `Widget { id: w; panel: root }` on a
+  single line escaped the gate entirely — coverage depended on code
+  style. Depth is now measured per `;`-separated fragment, the five new
+  controllers are registered in the gate's type map, and the fix is
+  plant-proven in both directions.
+
 ### 0.11.1
 
 - **The monoliths are split.** `Panel.qml` (3883 lines) extracts its eight
