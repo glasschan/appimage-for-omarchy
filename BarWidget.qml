@@ -8,7 +8,7 @@ import "lib/Backend.js" as Backend
 
 // Bar entry for the AppImage plugin: a tabler cube-unfolded icon plus the
 // installed count, and an urgent tint once updates are pending. The icon
-// doubles as a drop-to-integrate target (#21): dropping an AppImage here
+// doubles as a drop-to-integrate target: dropping an AppImage here
 // summons the panel seeded with the file and straight into the preview
 // flow — never an install (see the DropArea below).
 //
@@ -154,12 +154,12 @@ BarWidget {
     labelVisible: false
     hasVisualContent: true
     implicitWidth: Math.max(12, barContent.implicitWidth + button.scaledHorizontalMargin * 2)
-    // WidgetButton paints `active` in bar.urgent, which is exactly the
-    // "updates pending" badge treatment the PRD asks for.
+    // WidgetButton paints `active` in bar.urgent — the
+    // "updates pending" badge treatment.
     active: root.updateCount > 0
     useActiveColor: root.updateCount > 0
     horizontalMargin: 8.5
-    // Tooltip mirrors the badge's urgency: once M2 update sweeps fill the
+    // Tooltip mirrors the badge's urgency: once update sweeps fill the
     // store, the actionable number (pending updates) wins over the
     // installed count.
     tooltipText: root.updateCount > 0
@@ -197,7 +197,7 @@ BarWidget {
     }
   }
 
-  // ---- drop-to-integrate (#21) ----------------------------------------------
+  // ---- drop-to-integrate ----------------------------------------------------
   //
   // A file drag dropped on the bar icon opens the integrate picker with
   // the file prefilled and straight into the preview flow — a drop NEVER
@@ -207,14 +207,10 @@ BarWidget {
   // summon payload ({drop_path, drop_ignored}) to Panel.open, whose
   // tryConsumePendingDrop runs the flow once the panel's backend is idle.
   // A rejected drop (web address, no AppImage in the selection) summons
-  // nothing — the drag simply does not register, like dropping anywhere
-  // else outside the panel. keys restricts the target to real file drags
-  // (text/uri-list), so a dragged web address never even lights the
-  // accent affordance above; URL-text drops are out of scope by the spec.
-  //
-  // Whether the shell's bar actually delivers drops to an embedded widget
-  // can only be proven live (compositor + embedding dependent); the spec
-  // accepts a panel-only fallback, decided at review.
+  // nothing — the drag simply does not register. keys restricts the
+  // target to real file drags (text/uri-list), so a dragged web address
+  // never even lights the accent affordance above; URL-text drops are out
+  // of scope by the spec.
   DropArea {
     id: barDropArea
     anchors.fill: parent

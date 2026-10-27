@@ -3,22 +3,20 @@ import qs.Commons
 import qs.Ui
 import "lib/Model.js" as Model
 
-// One installed-app row plus its inline F9 source editor — extracted from
-// Panel.qml (ticket #55). Pure view: the listing item arrives as
-// `modelData` (Repeater-required), every rendered flag is a property, and
-// every action is reported as a signal the panel handles (launch, update,
-// remove, source editor, save/unset).
+// One installed-app row plus its inline per-app source editor. Pure view:
+// the listing item arrives as `modelData`, every rendered flag is a
+// property, and every action is reported as a signal the panel handles.
 //
-// Row meta is printed on TWO lines (issue #51): the identity line and the
-// status line, each rendered as ONE bounded, elided Text whose StyledText
-// spans metaText() assembles through Model.escapeHtml. A Row of separate
-// Texts is forbidden here — it has no width bound and Text does not clip,
-// so the fragments painted over the action buttons (v0.9.1).
+// Row meta is printed on TWO lines: the identity line and the status
+// line, each rendered as ONE bounded, elided Text whose StyledText spans
+// metaText() assembles through Model.escapeHtml. A Row of separate Texts
+// is forbidden here — it has no width bound and Text does not clip, so
+// the fragments would paint over the action buttons.
 //
 // The inline editor's field templates live at the bottom of this file.
-// Text entry goes through SafeTextField (round 3 of review #11415): no
-// native editable input may exist even while its card is open — the
-// Qt 6.12 clipboard hook arms on every readOnly: false QQuickTextInput.
+// Text entry goes through SafeTextField: no native editable input may
+// exist even while its card is open — the Qt 6.12 clipboard hook arms on
+// every readOnly: false QQuickTextInput.
 // The Repeater's model is row-gated (empty unless THIS row's editor is
 // open), so a hidden editor card never instantiates a field at all.
 Column {
@@ -26,9 +24,8 @@ Column {
 
   // The listing item. NOT a `required` property: this component is the
   // Repeater's delegate and this Qt does not auto-initialize required
-  // delegate properties — every row failed to instantiate ("Cannot
-  // create delegate", an empty list) until Panel.qml assigned it
-  // explicitly (`modelData: root.items[index]`).
+  // delegate properties — every row fails to instantiate without the
+  // explicit assignment.
   property var modelData
 
   // Rendered state (owned by Panel.qml). jobActive is THIS row's active
@@ -79,9 +76,9 @@ Column {
 
   // Assemble one row line's segments into a single StyledText: every
   // dynamic fragment is escaped (Model.escapeHtml) and the accent
-  // segments carry the accent colour. One bounded, elided Text per line
-  // — a Row of separate Texts has no width bound and painted over the
-  // row's action buttons (v0.9.1).
+  // segments carry the accent colour. One bounded, elided Text per line —
+  // a Row of separate Texts has no width bound and would paint over the
+  // row's action buttons.
   function metaText(segs) {
     var parts = []
     for (var i = 0; i < segs.length; i++) {
@@ -171,11 +168,9 @@ Column {
           width: parent.width
         }
 
-        // The row's IDENTITY line: the version and the
-        // running dot. ONE bounded, elided Text —
-        // separate Texts in a Row have no width bound
-        // and painted over the action buttons as soon
-        // as the fragments got long (v0.9.1).
+        // The row's IDENTITY line: the version and the running dot.
+        // ONE bounded, elided Text — separate Texts in a Row have no
+        // width bound and would paint over the action buttons.
         Text {
           width: parent.width
           visible: text !== ""
@@ -188,12 +183,10 @@ Column {
             Model.rowIdentityMeta(rowOuter.modelData))
         }
 
-        // The row's STATUS line: the pending release
-        // (or "cannot verify") and the live job
-        // progress. It has its own line so the update
-        // status never reads as part of the version
-        // (issue #51) — and it stays ONE bounded,
-        // elided Text, never a Row of Texts.
+        // The row's STATUS line: the pending release (or "cannot verify")
+        // and the live job progress. It has its own line so the update
+        // status never reads as part of the version — and it stays ONE
+        // bounded, elided Text, never a Row of Texts.
         Text {
           width: parent.width
           visible: text !== ""
@@ -226,9 +219,7 @@ Column {
         spacing: Style.spacing.xxs
         anchors.verticalCenter: parent.verticalCenter
 
-        // Launch (F4) as an icon-only action with a tooltip:
-        // the row card itself launches too, so the caption
-        // was dead weight next to the trash button.
+        // Launch as an icon-only action with a tooltip.
         PanelActionButton {
           id: launchButton
           tooltipText: rowOuter.strings.launch
@@ -249,26 +240,19 @@ Column {
           onClicked: rowOuter.launchRequested()
         }
 
-        // F7: one-click update, shown only once a
-        // pending release is known for the row.
-        // Per-app single flight (ticket #11): only
-        // THIS row's button dims and loops its arrow
-        // while its job runs — other rows keep
-        // launching/updating in parallel, and the
-        // state behind the flag is the app's job
-        // document, not a click.
+        // One-click update, shown only once a pending release is known
+        // for the row. Per-app single flight: only THIS row's button dims
+        // and loops its arrow while its job runs — other rows keep
+        // launching/updating in parallel, and the state behind the flag
+        // is the app's job document, not a click.
         PanelActionButton {
           id: updateButton
-          // The button appears exactly when the row's
-          // pending verdict says a newer release is
-          // known (issue #50: the listing's
-          // pending_update) — the same rule the badge
-          // counts on, so the marker, the badge and
-          // this button always agree.
-          // A source that cannot prove its artifact
-          // (ticket #39) offers no update action: the
-          // backend would refuse the install, so the row
-          // shows "cannot verify" instead.
+          // Appears exactly when the row's pending verdict says a newer
+          // release is known — the same rule the badge counts on, so the
+          // marker, the badge and this button always agree. A source that
+          // cannot prove its artifact offers no update action: the
+          // backend would refuse the install, so the row shows "cannot
+          // verify" instead.
           visible: rowOuter.modelData.hasUpdate === true
             && rowOuter.modelData.installable !== false
           enabled: !rowOuter.jobActive
@@ -288,12 +272,10 @@ Column {
               ? (updateButton._hot ? updateButton.hoverColor : updateButton.foreground)
               : Qt.darker(updateButton.foreground, 2.0)
 
-            // Slide+fade loop: the arrow floats out the
-            // top, reappears below and slides back into
-            // place — "moving up" without a spin (which
-            // reads as "loading" rather than direction).
-            // The icon is anchored, so the shift rides a
-            // Translate transform instead of y.
+            // Slide+fade loop: the arrow floats out the top, reappears
+            // below and slides back into place — "moving up" without a
+            // spin (which reads as "loading"). The icon is anchored, so
+            // the shift rides a Translate transform instead of y.
             transform: Translate {
               id: updateIconShift
               y: 0
@@ -349,8 +331,8 @@ Column {
 
               PauseAnimation { duration: 120 }
 
-              // The update can finish mid-loop: park the
-              // icon back at rest when the loop stops.
+              // The update can finish mid-loop: park the icon back at
+              // rest when the loop stops.
               onRunningChanged: if (!running) {
                 updateIconShift.y = 0
                 updateIcon.opacity = 1
@@ -361,7 +343,7 @@ Column {
           onClicked: rowOuter.updateRequested()
         }
 
-        // F9: open this row's inline source editor.
+        // Open this row's inline source editor.
         PanelActionButton {
           id: sourceRowButton
           tooltipText: rowOuter.strings.sourceEditTooltip
@@ -382,11 +364,10 @@ Column {
           onClicked: rowOuter.sourceEditRequested()
         }
 
-        // Two-click inline remove (F3): first click arms
-        // "Remove?" on this row only, second click runs it.
-        // Blocked while this row's update job runs: the
-        // job is installing over the AppImage, so a
-        // remove would delete the target under it.
+        // Two-click inline remove: first click arms "Remove?" on this
+        // row only, second click runs it. Blocked while this row's update
+        // job runs: the job is installing over the AppImage, so a remove
+        // would delete the target under it.
         Button {
           visible: rowOuter.confirmRemoveId === rowOuter.modelData.id
           text: rowOuter.strings.removeConfirm
@@ -403,9 +384,8 @@ Column {
         PanelActionButton {
           id: removeButton
           visible: rowOuter.confirmRemoveId !== rowOuter.modelData.id
-          // same per-row gate as the update button: only
-          // THIS row dims while ITS job runs (other rows
-          // stay removable)
+          // same per-row gate as the update button: only THIS row dims
+          // while ITS job runs (other rows stay removable)
           enabled: !rowOuter.jobActive
           tooltipText: rowOuter.strings.removeTooltip
           foreground: rowOuter.foreground
@@ -429,9 +409,9 @@ Column {
     }
   }
 
-  // Inline F9 editor under the row whose gear was
-  // clicked: the app name fixes context, the manager
-  // dropdown swaps the field set from Model.MANAGERS.
+  // Inline editor under the row whose gear was clicked: the app name
+  // fixes context, the manager dropdown swaps the field set from
+  // Model.MANAGERS.
   BorderSurface {
     width: parent.width
     visible: rowOuter.sourceEditId === rowOuter.modelData.id
@@ -470,9 +450,9 @@ Column {
           rowOuter.managerSelected(value)
         }
 
-        // selectCurrent() writes `value` directly, which
-        // would sever a plain value: binding on the
-        // persisted delegate; a one-way Binding survives.
+        // selectCurrent() writes `value` directly, which would sever a
+        // plain value binding on the persisted delegate; a one-way
+        // Binding survives.
         Binding {
           target: sourceManagerDropdown
           property: "value"
@@ -483,10 +463,9 @@ Column {
       Repeater {
         id: sourceFieldsRepeater
         // The model is global (the panel's sourceEditManager), so
-        // without the row-visibility gate every other row's
-        // hidden editor card would instantiate the same
-        // editable inputs — no field may exist while its
-        // card is hidden (see the field templates note).
+        // without the row-visibility gate every other row's hidden
+        // editor card would instantiate the same editable inputs — no
+        // field may exist while its card is hidden.
         model: {
           if (rowOuter.sourceEditId !== rowOuter.modelData.id) return []
           var mgr = Model.managersByName()[rowOuter.sourceEditManager]
@@ -494,8 +473,8 @@ Column {
         }
 
         Loader {
-          // Plain property + explicit assignment (see the modelData
-          // note on rowOuter): required delegate properties are never
+          // Plain property + explicit assignment (see the modelData note
+          // on rowOuter): required delegate properties are never
           // auto-initialized here.
           property var modelData: sourceFieldsRepeater.model[index]
           width: sourceEditCol.width
@@ -535,19 +514,18 @@ Column {
     }
   }
 
-  // Source editor field templates (F9): one Loader per MANAGERS field in
-  // the editor above, keyed by `fieldKey` into the panel's
-  // sourceEditValues. Bool values are "true"/"false" strings so the Save
-  // argv passes them through verbatim; the focus deltas tell the key
-  // catcher when a field is typing (see formEditing in Panel.qml).
+  // Source editor field templates: one Loader per MANAGERS field in the
+  // editor above, keyed by `fieldKey` into the panel's sourceEditValues.
+  // Bool values are "true"/"false" strings so the Save argv passes them
+  // through verbatim; the focus deltas tell the key catcher when a field
+  // is typing (see formEditing in Panel.qml).
   //
-  // Text entry goes through SafeTextField (round 3 of review #11415): no
-  // native editable input may exist even while its card is open — the
-  // Qt 6.12 clipboard hook arms on every readOnly: false QQuickTextInput.
-  // `value` mirrors sourceEditValues; `edited` writes it back storage-only
-  // (the panel's setSourceValue never reassigns the object, so the value
-  // binding never re-evaluates mid-typing — same contract the old text
-  // binding had).
+  // Text entry goes through SafeTextField: no native editable input may
+  // exist even while its card is open — the Qt 6.12 clipboard hook arms
+  // on every readOnly: false QQuickTextInput. `value` mirrors
+  // sourceEditValues; `edited` writes it back storage-only (the panel's
+  // setSourceValue never reassigns the object, so the value binding never
+  // re-evaluates mid-typing).
   Component {
     id: sourceStringFieldComp
 

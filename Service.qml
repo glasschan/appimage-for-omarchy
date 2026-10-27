@@ -5,7 +5,7 @@ import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
 import "lib/JobDocs.js" as JobDocs
 
-// Background update checker (F8).
+// Background update checker.
 //
 // The plugin declares the "service" kind, so the shell instantiates this
 // document once at startup (shell.qml ensureService injects shell, manifest
@@ -31,7 +31,7 @@ import "lib/JobDocs.js" as JobDocs
 // backend already sent the desktop notification itself when the sweep
 // found something.
 //
-// Background job adoption (issue #12): when the startup settings read
+// Background job adoption: when the startup settings read
 // lands and at the end of every completed sweep, the service reads the
 // background update-job documents (lib/JobDocs.js) for the apps the
 // store knows and surfaces their finished outcomes — done, error,
@@ -86,7 +86,7 @@ Item {
   property int seenSettingsRevision: -1
   property var unsubscribe: null
 
-  // Background job adoption (issue #12). jobsDir mirrors the backend's
+  // Background job adoption. jobsDir mirrors the backend's
   // plugin_state_dir()/jobs layout (constants.py honours XDG_STATE_HOME
   // with the same ~/.local/state default). jobSurfaced is the
   // once-per-session acknowledgement memory (desktop id → the outcome
@@ -151,7 +151,7 @@ Item {
             Model.applySettings(parsed.settings)
             settingsLoaded = true
             reschedule(true)
-            // Startup job adoption (issue #12): surface what a previous
+            // Startup job adoption: surface what a previous
             // session's background jobs left behind without waiting for
             // the first sweep. Runs after the rearm; a no-op when the
             // store's installed list has not landed yet (the first
@@ -207,7 +207,7 @@ Item {
             result.error, Backend.elide(result.stderr || result.stdout))
         }
         scheduleNext()
-        // End-of-sweep job adoption (issue #12). Strictly after
+        // End-of-sweep job adoption. Strictly after
         // scheduleNext(): the next check is already armed before any
         // job document is touched, so adoption — however weird the
         // state dir looks — can never delay or derail the sweep cadence.
@@ -253,7 +253,7 @@ Item {
     listCtx = ctx && ctx.active ? ctx : null
   }
 
-  // ---- background job adoption (issue #12) ------------------------------------
+  // ---- background job adoption --------------------------------------------------
   //
   // Reads the background update-job documents the detached --update
   // --async runner publishes (backend/CONTRACT.md, "Job documents";
@@ -495,7 +495,7 @@ Item {
     onTriggered: Backend.handleTimeout(root.listCtx)
   }
 
-  // Single-slot reader for job documents (issue #12). These are tiny
+  // Single-slot reader for job documents. These are tiny
   // local JSON files, so adoption reads them synchronously (blockLoading)
   // and stays plain JS — no timers, no callback chains, nothing left
   // running between checks. A failed/missing read yields empty text and
@@ -507,7 +507,7 @@ Item {
     printErrors: false
   }
 
-  // Fire-and-forget pair for job-outcome notifications (issue #12): the
+  // Fire-and-forget pair for job-outcome notifications: the
   // same wiring as listProc. notify-send produces nothing we parse —
   // the handlers only feed the shared Backend.run ctx machinery, so a
   // runaway binary is killed by the watchdog like any other call.

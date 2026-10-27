@@ -9,50 +9,27 @@ import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
 import "lib/JobDocs.js" as JobDocs
 
-// Main AppImage manager surface.
-//
-// The plugin declares both "bar-widget" and "panel" kinds, so this panel
-// is mounted by the shell's panel loader (summon path) as a standalone
-// layer-shell surface — the same shape omarchy.menu and the dev gallery
-// use — while BarWidget.qml is just the launcher button in the bar.
-//
-// Lifecycle: the qs.Ui.Panel base supplies `opened`, open()/close()/
-// toggle(), and the popout-switch pair; `open(payloadJson)` below extends
-// open() for the loader's summon payload. Escape closes through
-// PanelKeyCatcher, exactly like the first-party panels.
-//
-// M1b wiring: every action runs backend/main.py (see backend/CONTRACT.md)
-// through dedicated Process/Timer pairs in this file — a shared short-call
-// pair for refresh-style calls, a dedicated pair for the --update --async
-// spawn (so refresh traffic can never fail it synthetically) and the
-// python probe pair —
-// F1 list (cache-first, the
-// store renders instantly and refreshes in the background), F2 integrate
-// (inline picker: Quickshell ships no file dialog, so a path field, a
-// Browse button, Downloads quick-picks and drop-to-integrate stand in;
-// every action previews first through the offline --preview-integrate
-// verb and installs only on explicit confirm — #18, #19, #21), F3 remove
-// (two-click inline confirm, keyed on desktop_id), F4 launch (detached
-// exec of the AppImage path), F5 bar badge (observer over the same Model
-// store).
-//
-// M2 wiring: F6 check updates (--list-updates with a long watchdog; the
-// offline error document surfaces its own message), F7 one-click update
-  // per row as a DETACHED BACKGROUND JOB (--update --async: the spawn
-  // answers within milliseconds, the transfer runs outside this panel's
-  // process tree, and every row renders the app's on-disk job document —
-  // reader lib/JobDocs.js — so no in-memory flag can outlive a reload and
-  // no spinner can exist without a document behind it), F9 per-row
-  // update-source editors plus the F8 cadence knobs in a settings card
-  // toggled by the header gear. The F8 background service itself lives in
-  // Service.qml — this panel only edits what it runs on.
+// Main AppImage manager surface. The plugin declares both "bar-widget" and
+// "panel" kinds: this panel is mounted by the shell's panel loader (summon
+// path) as a standalone layer-shell surface; BarWidget.qml is just the bar
+// launcher button. The qs.Ui.Panel base supplies opened/open()/close()/
+// toggle(); open(payloadJson) below extends open() for the summon payload.
+// Every action runs backend/main.py (backend/CONTRACT.md) through dedicated
+// Process/Timer pairs: a shared short-call pair for refresh-style calls, a
+// dedicated pair for the --update --async spawn (refresh traffic can never
+// synthetically fail it) and the python probe pair. Integrate previews
+// first through the offline --preview-integrate verb and installs only on
+// explicit confirm; update runs per row as a detached background job whose
+// on-disk job document (reader lib/JobDocs.js) is the only row state; the
+// background service lives in Service.qml — this panel only edits what it
+// runs on.
 Panel {
   id: root
   moduleName: "io.github.glasschan.appimage"
   ipcTarget: "io.github.glasschan.appimage"
-  // The panel owns its IPC handler so extra verbs (refresh, list) can be
-  // exposed alongside the standard lifecycle set; the base would install
-  // a second handler on the same target if left enabled.
+  // Own IPC handler: extra verbs (refresh, list) ride alongside the
+  // standard lifecycle set; the base would install a second handler on
+  // the same target if left enabled.
   manageIpc: false
 
   // Injected by the shell's panel loader when summoned.
@@ -61,16 +38,13 @@ Panel {
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   readonly property string homeDir: Quickshell.env("HOME") || ""
 
-  // Cache policy: opening the panel shows the cached list immediately and
-  // only rescans when the cache is older than this (PRD §2: no rescan on
-  // every summon). The Refresh button always forces one.
+  // Cache policy: show the cached list immediately and rescan only when
+  // the cache is older than this. Refresh always forces one.
   readonly property int staleAfterMs: 60000
   // Integrating means squashfs extraction + a file copy; give it room.
   readonly property int integrateTimeoutMs: 120000
-  // --integrate from a release URL downloads the whole AppImage inside
-  // this panel's process — the watchdog must outlast the transfer, not
-  // the UI. (--update no longer needs a long budget here: it runs as a
-  // detached background job and the spawn answers in milliseconds.)
+  // A URL integrate downloads the whole AppImage inside this panel's
+  // process — the watchdog must outlast the transfer, not the UI.
   readonly property int integrateUrlTimeoutMs: 600000
   // Update sweeps walk every configured release source over the network.
   readonly property int checkTimeoutMs: 120000
@@ -83,31 +57,29 @@ Panel {
   readonly property int confirmResetMs: 4000
   // Grace before the post-launch refresh so `ps` can see the new process.
   readonly property int launchSettleMs: 1500
-  // Launch-failure banner (F4): the id of the app awaiting its post-launch
+  // Launch-failure banner: the id of the app awaiting its post-launch
   // settle verdict ("" when none) and the moment the launch was clicked.
-  // execDetached cannot report the AppImage runtime's own death (a type-2
-  // AppImage without fuse2 exits right after spawn), so the verdict comes
-  // from the first completed listing that STARTED after the click — a
-  // listing already in flight at click time has a pre-spawn ps snapshot
-  // and must never judge the launch. On a failed verdict the banner gets
-  // the fuse2 hint line only when that same listing's runtime block says
-  // "missing" (Model.launchFailureBanner decides).
-  // Status notices fade on their own after this long (matching the
-  // backend's desktop-notification expire time); errors never auto-hide.
+  // execDetached cannot report the AppImage runtime's own death, so the
+  // verdict comes from the first completed listing that STARTED after the
+  // click — a listing already in flight at click time has a pre-spawn ps
+  // snapshot and must never judge the launch. On a failed verdict the
+  // banner gets the fuse2 hint line only when that same listing's runtime
+  // block says "missing" (Model.launchFailureBanner). Status notices fade
+  // after this long (matching the backend's desktop-notification expire
+  // time); errors never auto-hide.
   readonly property int statusTimeoutMs: 5000
 
-  // ---- background update jobs (F7 reworked, ticket #11) ----------------------
+  // ---- background update jobs ----------------------------------------------
   // Row update state is derived from the backend's on-disk job documents
   // (CONTRACT.md "Job documents", reader lib/JobDocs.js): every open and
   // every poll tick re-reads the documents, so a reload mid-download
   // re-derives everything from disk and no spinner can outlive its doc.
   readonly property int jobPollMs: 3000
-  // $XDG_STATE_HOME/io.github.glasschan.appimage/jobs (jobs.py's path rule;
-  // XDG_STATE_HOME defaults to ~/.local/state like XDG_DATA_HOME).
+  // jobs.py's path rule; XDG_STATE_HOME defaults to ~/.local/state.
   readonly property string jobsDir: (Quickshell.env("XDG_STATE_HOME")
     || (homeDir + "/.local/state")) + "/io.github.glasschan.appimage/jobs"
-  // desktop_id → adopted decision (JobDocs shape), mirrored from the store
-  // so row bindings stay reactive; jobsBusy gates both polls below.
+  // desktop_id → adopted decision (JobDocs shape); row bindings read
+  // jobStates[id]; jobsBusy gates the job polls.
   property var jobStates: ({})
   property bool jobsBusy: false
   // Sequential single-document read state for jobFileView: at most one
@@ -115,40 +87,36 @@ Panel {
   // aborts the old load, so the queue never races on one instance).
   property var jobReadQueue: []
   property string jobReadingId: ""
-  // Click grace (per id → Date.now()): a "no document" read landing
-  // within jobStartGraceMs of a job-started reply is a race with the
-  // grandchild's FIRST write, not evidence that nothing runs — during
-  // the grace it must not overwrite the provisional active decision
-  // (that would kill the spinner AND the poll before the document ever
-  // appears). Past the grace an absent document honestly means the job
-  // died before writing anything, and idle wins.
+  // Click grace (per id): a "no document" read landing within
+  // jobStartGraceMs of a job-started reply is a race with the grandchild's
+  // FIRST write — during the grace it must not overwrite the provisional
+  // active decision. Past the grace an absent document means the job died
+  // before writing anything, and idle wins.
   readonly property int jobStartGraceMs: 10000
   property var jobStartGraces: ({})
 
-  // Force-quit confirm card (ticket #27): Update on a row whose last
-  // --list-installed poll said the app runs opens this card first. The id,
-  // name and process count are pinned at click time (the row's model data
-  // may be replaced by the refresh that follows); nothing is spawned until
+  // Force-quit confirm card: Update on a row whose last --list-installed
+  // poll said the app runs opens this card first. The id, name and
+  // process count are pinned at click time (the row's model data may be
+  // replaced by the refresh that follows); nothing is spawned until
   // confirmForceQuit, and cancel clears the trio with zero side effects.
-  // The count comes from the backend's additive `running_pids`; 0 means
-  // "not known" (a stale flag, or an older backend) and the card falls
-  // back to its count-free sentence.
+  // running_pids 0 means "not known" and the card falls back to its
+  // count-free sentence.
   property string forceQuitId: ""
   property string forceQuitName: ""
   property int forceQuitPids: 0
 
-  // "Update all" consent card (issue #52): one action for every pending
-  // app. The click only OPENS this card — the batch is spawned after the
-  // user accepts it, and dismissing the card starts nothing. The apps are
-  // pinned at open time (id, name, running, running_pids), so a refresh
-  // cannot rewrite what the user is consenting to.
+  // "Update all" consent card: one action for every pending app. The
+  // click only OPENS this card — the batch is spawned after the user
+  // accepts it, and dismissing starts nothing. The apps are pinned at
+  // open time (id, name, running, running_pids), so a refresh cannot
+  // rewrite what the user is consenting to.
   property bool updateAllOpen: false
   property var updateAllApps: []
-  // The card's wording, derived from the pinned app list (the apps it
-  // names and the processes it would close).
+  // The card's wording, derived from the pinned app list.
   readonly property var updateAllSummary: Model.updateAllSummary(root.updateAllApps)
-  // The ids whose background job still has to be spawned. The spawn pair
-  // is one-at-a-time, so the queue advances when each spawn answers.
+  // The ids whose background job still has to be spawned; the spawn pair
+  // advances the queue when each spawn answers.
   property var updateAllQueue: []
 
   // Current Backend.run context (null while idle); the Process and Timer
@@ -156,34 +124,31 @@ Panel {
   property var runCtx: null
 
   // Backend.run context for the --update --async spawn (null while idle).
-  // The spawn owns a dedicated Process/Timer pair (updateSpawnProc below):
-  // routing it through the shared short-call pair instead would let any
-  // in-flight re-list or update check synthetically fail the click via
-  // callBackend's single flight.
+  // The spawn owns a dedicated Process/Timer pair: routing it through the
+  // shared short-call pair would let any in-flight re-list or update
+  // check synthetically fail the click via callBackend's single flight.
   property var updateSpawnCtx: null
 
   // ---- python3 dependency (authorized install) ------------------------------
   // The probe settles python presence once per open (and every second while
-  // an authorized install runs). Until it answers the panel assumes nothing;
-  // a confirmed-missing python3 swaps the body for the install card, whose
-  // button opens a visible floating terminal presenting `/usr/bin/omarchy
-  // pkg add python` — the terminal (and its sudo prompt) is the
-  // authorization, the marker files under XDG_RUNTIME_DIR are its report
-  // channel. The presented terminal command is a CONSTANT shell source (the
-  // omarchy wrapper would run an interpolated string as bash source): it
-  // reads XDG_RUNTIME_DIR itself via "${XDG_RUNTIME_DIR:?}" expansion, and
-  // the runtime dir the panel holds is validated — syntactically by
-  // Model.pythonRuntimeDirUsable(), then authoritatively by the prep step
-  // (absolute, a directory, owned by the euid, mode 700) — and travels
-  // only as argv data, never inside a shell string.
+  // an authorized install runs). A confirmed-missing python3 swaps the body
+  // for the install card, whose button opens a visible floating terminal
+  // presenting `/usr/bin/omarchy pkg add python` — the terminal (and its
+  // sudo prompt) is the authorization; the marker files under
+  // XDG_RUNTIME_DIR are its report channel. The presented terminal command
+  // is a CONSTANT shell source: it reads XDG_RUNTIME_DIR itself via
+  // "${XDG_RUNTIME_DIR:?}" expansion, and the runtime dir the panel holds
+  // is validated (syntactically by Model.pythonRuntimeDirUsable(), then
+  // authoritatively by the prep step) and travels only as argv data, never
+  // inside a shell string.
   property bool pythonStateKnown: false
   property bool pythonMissing: false
   property bool installingPython: false
   // Install-button verify gate (verify-then-start): set when the user
   // presses Install and consumed by the next probe result, which alone
   // decides whether the prep step + terminal may start. The verify probe
-  // runs with installingPython=false — a plain presence check, so stale
-  // marker files from an old attempt cannot trigger a new terminal.
+  // runs with installingPython=false, so stale marker files from an old
+  // attempt cannot trigger a new terminal.
   property bool installVerifyPending: false
   // Backend.run context for the in-flight probe (null while idle).
   property var probeCtx: null
@@ -202,61 +167,55 @@ Panel {
   property string lastError: ""
   property string statusText: ""
   property var unsubscribe: null
-  // The ids of the apps a batch update would touch (mirrored from the
-  // store: the "Update all" action is enabled exactly while at least one
-  // app has a pending release the backend would accept).
+  // The ids of the apps a batch update would touch: the "Update all"
+  // action is enabled exactly while at least one app has a pending
+  // release the backend would accept.
   property var pendingIds: []
 
-  // Integrate picker (F2): Quickshell has no FileDialog type (checked
-  // against /usr/lib/qt6/qml/Quickshell — no dialog types ship with it),
-  // so the picker is a path field, a Browse button backed by the backend's
-  // crash-isolated --pick-file dialog (portal first, zenity fallback), and
-  // AppImages found in ~/Downloads and ~/downloads.
+  // Integrate picker: Quickshell ships no FileDialog, so the picker is a
+  // path field, a Browse button backed by the backend's crash-isolated
+  // --pick-file dialog (portal first, zenity fallback), and AppImages
+  // found in ~/Downloads and ~/downloads.
   property bool pickerOpen: false
   property string pickerPath: ""
 
-  // Confirm-before-integrate preview (#18): pressing the integrate action
-  // (field Enter, Go button, Downloads row) first runs --preview-integrate
-  // — offline and fast, so its watchdog is a short budget — and renders the
-  // preview card; Confirm then runs the existing integrate command and
-  // Esc/Cancel dismisses back to the picker with zero side effects.
-  // previewInput pins the exact input the shown document was computed from:
-  // editing the path dismisses the card, so Confirm can only ever install
-  // what the user actually saw previewed.
+  // Confirm-before-integrate preview: pressing the integrate action first
+  // runs the offline, fast --preview-integrate and renders the preview
+  // card; Confirm then runs the integrate command and Esc/Cancel dismisses
+  // back to the picker with zero side effects. previewInput pins the exact
+  // input the shown document was computed from: editing the path dismisses
+  // the card, so Confirm can only ever install what the user actually saw
+  // previewed.
   readonly property int previewTimeoutMs: 10000
   property bool previewOpen: false
   property bool busyPreview: false
   property string previewInput: ""
   property var previewDoc: null
 
-  // Single-source of the picker-owning composite — a browse dialog, a
+  // Single source of the picker-owning busy state — a browse dialog, a
   // preview call or an integrate run in flight. Browse, Go and the
-  // Downloads quick-picks all disable on exactly this conjunction
-  // (#18/#19 guards), so it is combined once here instead of
-  // hand-assembled per control. Sites whose guard intentionally differs
-  // keep their extra terms separate: Go also requires a non-empty path,
-  // the preview card's Confirm/Cancel omit the pick term by design, and
-  // dropBusy()/confirmPreview() read the store flags directly.
+  // Downloads quick-picks all disable on exactly this conjunction; sites
+  // whose guard intentionally differs keep their extra terms separate.
   readonly property bool pickerBusy: busyPick || busyIntegrate || busyPreview
 
-  // Drop-to-integrate (#21): the bar widget converts its dropped URIs
-  // through Model.dropUriToPath and hands the usable path over in the
-  // summon payload; open() parks it here and tryConsumePendingDrop runs it
-  // once the store is idle (the panel's own DropArea path checks the same
-  // guard live and reports a busy drop with a status line instead). The
-  // panel window DropArea never queues — this pending pair is transport
-  // for a gesture that happened before the panel existed. Closing the
-  // panel cancels a still-pending drop (onOpenedChanged).
+  // Drop-to-integrate: the bar widget converts its dropped URIs through
+  // Model.dropUriToPath and hands the usable path over in the summon
+  // payload; open() parks it here and tryConsumePendingDrop runs it once
+  // the store is idle (the panel's own DropArea path checks the same guard
+  // live and reports a busy drop with a status line). The panel window
+  // DropArea never queues — this pending pair is transport for a gesture
+  // that happened before the panel existed. Closing the panel cancels a
+  // still-pending drop (onOpenedChanged).
   property string pendingDropPath: ""
   property int pendingDropIgnored: 0
 
-  // desktop_id whose Remove button is armed for the second click (F3).
+  // desktop_id whose Remove button is armed for the second click.
   property string confirmRemoveId: ""
 
-  // Settings card (F8): opened by the header gear, mutually exclusive
-  // with the integrate picker. The edit* fields are working copies the
-  // card mutates; Save pushes them key by key through --set-setting and
-  // the store is re-read afterwards (reloadSettings).
+  // Settings card: opened by the header gear, mutually exclusive with the
+  // integrate picker. The edit* fields are working copies the card
+  // mutates; Save pushes them key by key through --set-setting and the
+  // store is re-read afterwards (loadSettingsCard).
   property bool settingsOpen: false
   // Session-only window mode: pinned turns the full-screen overlay into a
   // compact floating window sized to the card (never persisted).
@@ -275,14 +234,10 @@ Panel {
   property string sourceEditManager: ""
   property var sourceEditValues: ({})
   property bool sourceBusy: false
-  // Focus count over EVERY editable text field in the panel (the picker's
-  // path field, the source editor's dynamic fields). PanelKeyCatcher must
-  // hand raw keys to whichever field is typing (see formEditing), and it
-  // has to be blocked for as long as one holds focus: its Keys handler
-  // CONSUMES every key it is handed — a handler that only returns still
-  // accepts — so an unblocked catcher silently eats typed characters (the
-  // force-quit card exposed exactly that: it early-returns on single-letter
-  // text keys while it asks, and `blocked` was formEditing only).
+  // Focus count over EVERY editable text field in the panel. PanelKeyCatcher
+  // must hand raw keys to whichever field is typing (see formEditing) and be
+  // blocked while one holds focus: its Keys handler CONSUMES every key it is
+  // handed, so an unblocked catcher silently eats typed characters.
   property int textFieldFocusCount: 0
   // Mirrors the per-row manager Dropdown's popupOpen so formEditing can
   // keep blocking the key catcher while the popup (outside this item
@@ -300,8 +255,7 @@ Panel {
     return opts
   }
 
-  // Emitted by the [Integrate] button and the "i" shortcut; opens the
-  // inline picker below.
+  // Emitted by the [Integrate] button and the "i" shortcut.
   signal integrateRequested()
 
   readonly property var strings: Model.strings
@@ -345,17 +299,15 @@ Panel {
 
   function syncFromModel() {
     items = Model.state.items.slice()
-    // One snapshot of the operation state (ticket #42): the panel and the
-    // service read the same shape, so a second surface can never disagree
-    // about who owns a run.
+    // One snapshot of the operation state: the panel and the service read
+    // the same shape, so a second surface can never disagree about who
+    // owns a run.
     var ops = Model.snapshot()
     busyList = ops.busy.list
     busyIntegrate = ops.busy.integrate
     busyPick = ops.busy.pick
     busyRemove = ops.busy.remove
     busyUpdates = ops.busy.updates
-    // Per-row job views (ticket #11): mirror the adopted decisions into a
-    // reactive map — rows read jobStates[id] and nothing else.
     var jobs = {}
     for (var id in Model.state.jobStates) {
       jobs[id] = Model.state.jobStates[id].decision
@@ -364,13 +316,10 @@ Panel {
     jobsBusy = Model.anyJobActive()
     lastError = Model.state.lastError
     statusText = Model.state.status
-    // The pending apps a batch update would touch (issue #52): the header
-    // action is enabled exactly while this list is not empty.
     pendingIds = Model.pendingUpdateIds()
     // A bar-widget drop waits here for an idle store (see
-    // tryConsumePendingDrop): every busy flag flip announces itself
-    // through changed(), so the sync after the last in-flight call lands
-    // is the moment the pending preview can start.
+    // tryConsumePendingDrop): the sync after the last in-flight call
+    // lands is the moment the pending preview can start.
     tryConsumePendingDrop()
   }
 
@@ -388,7 +337,7 @@ Panel {
   function open(payloadJson) {
     Model.setMockMode(false)
     if (backendCommand.length > 0) Model.configureBackend(backendCommand)
-    // Bar-widget drop handoff (#21): the payload carries the file the user
+    // Bar-widget drop handoff: the payload carries the file the user
     // dropped on the bar icon (already converted and validated there).
     // Parked, not run: the cache-first refresh below may occupy the shared
     // backend process, and tryConsumePendingDrop waits that out.
@@ -407,10 +356,10 @@ Panel {
         || Date.now() - Model.state.lastSyncMs > staleAfterMs) {
       refresh()
     }
-    // Adopt whatever the on-disk job documents say right now — this is
-    // the fossil-spinner fix: state comes from disk on EVERY open, so a
-    // reload mid-download re-renders the running job (or its
-    // interruption) instead of resurrecting an in-memory flag.
+    // Adopt whatever the on-disk job documents say right now: state
+    // comes from disk on EVERY open, so a reload mid-download re-renders
+    // the running job (or its interruption) instead of resurrecting an
+    // in-memory flag.
     refreshJobStates()
     controller.show()
     Qt.callLater(function() {
@@ -436,14 +385,15 @@ Panel {
 
   function callBackend(args, options, onDone) {
     // Single flight on the shared Process: a second call started while one
-    // is in flight would overwrite runCtx, misroute the first call's
-    // output to this callback and wedge its busy flag. Fail the newcomer
-    // synthetically instead (same result shape as Backend.handleExit's
+    // is in flight would overwrite runCtx and misroute the first call's
+    // output. Fail the newcomer synthetically (same result shape as
+    // Backend.handleExit's timeout report) so the caller's normal failure
+    // path runs.
     // timeout report) so the caller's normal failure path runs.
     if (runCtx && runCtx.active === true) {
-      // A second call is a WAIT, never a failure (ticket #42): the caller's
-      // normal failure path would otherwise invent "Backend call failed
-      // (list)" and wipe the status line of the run that is still healthy.
+      // A second call is a WAIT, never a failure: the caller's normal
+      // failure path would otherwise invent "Backend call failed (list)"
+      // and wipe the status line of the run that is still healthy.
       onDone({ ok: false, exitCode: -1, stdout: "", stderr: "", json: null,
                timedOut: false, spawnFailed: false, error: "busy",
                wait: true })
@@ -458,16 +408,16 @@ Panel {
   // stdout, and the backend's own {"result":"error"} documents.
   //
   // `app` is the row this call concerned ({ id, name }) or null: an error
-  // about one app must name it (ticket #48), and only that same app's next
-  // outcome may replace it.
+  // about one app must name it, and only that same app's next outcome may
+  // replace it.
   function reportFailure(result, what, app) {
     var subject = app ? app.id : ""
     var detail = function(message) {
       return app ? Model.appErrorBanner(app.name, message) : message
     }
-    // Another operation owns the shared Process (ticket #42): say so quietly
-    // and leave whatever status the running operation set exactly as it is —
-    // this is a wait, not an outcome.
+    // Another operation owns the shared Process: say so quietly and leave
+    // whatever status the running operation set exactly as it is — this is
+    // a wait, not an outcome.
     if (result.wait === true) {
       Model.setTransientStatus(strings.operationBusy)
       return
@@ -592,23 +542,18 @@ Panel {
 
   // The Install button. Nothing runs until this is pressed — and what then
   // runs is a visible floating terminal presenting the exact (constant)
-  // command (sudo prompt included), never a hidden process. The user can
-  // Ctrl-C it. The runtime dir gets its cheap syntactic gate here; the
-  // prep step re-checks the filesystem before the terminal launches.
+  // command (sudo prompt included), never a hidden process. The runtime
+  // dir gets its cheap syntactic gate here; the prep step re-checks the
+  // filesystem before the terminal launches.
   //
   // Verify-then-start: the click does NOT spawn anything directly. It arms
   // installVerifyPending and probes; only a confirmed-missing answer
-  // (handleProbe → startPythonInstall) opens the terminal. The guarantee
-  // is bounded but real: a terminal only ever opens behind a fresh
-  // absence verdict, and a completed install is never followed by a
-  // redundant one. It does NOT dedupe against an earlier terminal still
-  // sitting at its sudo prompt — a post-timeout re-press probes missing
-  // again and can still open a second `pkg add` (the old
-  // concurrent-pacman-lock race survives in that corner). Single-flight
-  // nuance: if a probe is already in flight, probePython() early-returns
-  // and the pending flag rides on THAT probe's result; only in the rare
-  // case that probe already delivered does the click look inert —
-  // pressing again re-arms.
+  // (handleProbe → startPythonInstall) opens the terminal, so a terminal
+  // only ever opens behind a fresh absence verdict. It does NOT dedupe
+  // against an earlier terminal still sitting at its sudo prompt — a
+  // post-timeout re-press can still open a second `pkg add`. If a probe is
+  // already in flight, probePython() early-returns and the pending flag
+  // rides on THAT probe's result.
   function installPython() {
     if (root.installingPython) return
     if (!Model.pythonRuntimeDirUsable(root.runtimeDir)) {
@@ -679,30 +624,20 @@ Panel {
     })
   }
 
-  // F4: launch the AppImage binary detached. Ticket #35: the spawn goes
-  // through the backend's `--exec-with-scale` entry point —
+  // Launch through the backend's `--exec-with-scale` entry point —
   // [backendCommand..., "--exec-with-scale", image, ...args] — so the
   // panel launch renders at the focused monitor's scale exactly like a
-  // launcher click, and DESKTOPINTEGRATION=1 comes from the verb itself
-  // (execDetached cannot carry env vars). The scale tail and the #32
-  // env-prefixed argv both come from the backend's ONE launch-command
-  // builder (the listing's `launch_scale_argv` / `launch_argv` keys) —
-  // the launch assembly is never re-implemented in QML, and no shell
-  // ever sees the path: it arrives as a single argv token.
-  //
-  // The backend has already dropped the desktop field codes (%f %F %u %U
-  // %i %c %d %k) it knows the panel cannot fill. The fallback ladder for
-  // an older pairing (never in a paired release): the #32 launch_argv,
-  // then the bare path.
-  //
-  // Process semantics carry over: execDetached fully detaches the child,
-  // and the backend's handover is `os.execve` — the detached pid BECOMES
-  // the app (exec keeps the pid), so nothing of the panel outlives the
-  // spawn and there is no watchdog to outlive either. A failed backend
-  // start (missing image, exec error) is indistinguishable from the
-  // ticket-#32 spawn failure it replaces: spawn success says nothing
-  // about the AppImage runtime, and the settle listing below still
-  // judges it.
+  // launcher click; DESKTOPINTEGRATION=1 comes from the verb itself. The
+  // scale tail and the env-prefixed argv come from the backend's ONE
+  // launch-command builder (the listing's `launch_scale_argv` /
+  // `launch_argv` keys) — the launch assembly is never re-implemented in
+  // QML, and no shell ever sees the path: it arrives as a single argv
+  // token. The backend has already dropped the desktop field codes the
+  // panel cannot fill; the fallback ladder for an older pairing is
+  // launch_argv, then the bare path. execDetached fully detaches the
+  // child, and the backend hands over with os.execve — the detached pid
+  // BECOMES the app — so spawn success says nothing about the AppImage
+  // runtime; the settle listing below still judges it.
   function launchArgvFor(item) {
     if (backendCommand.length > 0 && item.launchScaleArgv
         && item.launchScaleArgv.length > 0) {
@@ -731,9 +666,9 @@ Panel {
     if (!root.pinned) root.requestClose()
   }
 
-  // F3: first click arms the inline confirmation, second click runs
-  // --remove keyed on the desktop_id (the stable identifier — names can
-  // repeat when two versions coexist, CONTRACT.md).
+  // First click arms the inline confirmation, second click runs --remove
+  // keyed on the desktop_id (the stable identifier — names can repeat when
+  // two versions coexist, CONTRACT.md).
   function requestRemove(item) {
     if (!item) return
     // A row whose detached update job is still downloading/replacing is
@@ -770,9 +705,9 @@ Panel {
     })
   }
 
-  // F2: run --integrate on the chosen path. Outcome handling per
-  // CONTRACT.md: "integrated" (success), "already-integrated" (exit 0,
-  // shown as success with different copy) and {"result":"error"}.
+  // Run --integrate on the chosen path. Outcome handling per CONTRACT.md:
+  // "integrated", "already-integrated" (exit 0, success with different
+  // copy) and {"result":"error"}.
   function integratePath(path) {
     var trimmed = String(path || "").trim()
     if (trimmed === "") return
@@ -787,14 +722,13 @@ Panel {
     Model.setStatus(strings.integrateWorking)
     syncFromModel()
     // A GitHub release URL install downloads the whole AppImage first;
-    // give it the long transfer budget so the watchdog doesn't reap a
-    // big download. Local paths keep the fast extract budget. Only the
-    // URL run streams progress documents (the backend's emitter exists
-    // for URL targets only), so only it attaches the #59 line reader:
-    // each complete stdout line goes through Model.noteIntegrateProgress,
-    // which ignores everything that is not a progress document — the
-    // result document on the same stream still reaches the outcome
-    // handling below through the full stdout text.
+    // give it the long transfer budget. Local paths keep the fast extract
+    // budget. Only the URL run streams progress documents (the backend's
+    // emitter exists for URL targets only), so only it attaches the stdout
+    // line reader: each complete line goes through
+    // Model.noteIntegrateProgress, which ignores everything that is not a
+    // progress document — the result document on the same stream still
+    // reaches the outcome handling below through the full stdout text.
     var isUrl = /^https?:\/\//i.test(trimmed)
     var options = {
       timeoutMs: isUrl ? integrateUrlTimeoutMs : integrateTimeoutMs
@@ -823,9 +757,9 @@ Panel {
     })
   }
 
-  // F6: sweep every configured source. The offline error document arrives
-  // as exit 1 + {"result":"error"} and reportFailure below surfaces its
-  // own message ("Internet connection not available" and friends).
+  // Sweep every configured source. The offline error document arrives as
+  // exit 1 + {"result":"error"} and reportFailure below surfaces its own
+  // message ("Internet connection not available" and friends).
   function checkUpdates() {
     if (Model.state.mockMode) return
     if (backendCommand.length === 0) {
@@ -858,29 +792,22 @@ Panel {
     })
   }
 
-  // F7: one-click update as a DETACHED BACKGROUND JOB. The click only
-  // spawns: `--update --async` answers job-started (exit 0) or an error
-  // document (exit 1 — e.g. the active-job refusal) within milliseconds.
-  // A running app is the one exception: updateItem is reached through
-  // requestUpdate, which shows the #27 confirm card instead of spawning
-  // (a stale `running` flag is harmless in both directions — see there).
-  // The spawn runs on its OWN Process/Timer pair (updateSpawnProc below)
+  // One-click update as a DETACHED BACKGROUND JOB. The click only spawns:
+  // `--update --async` answers job-started (exit 0) or an error document
+  // (exit 1 — e.g. the active-job refusal) within milliseconds, and the
+  // transfer runs outside this panel's process tree, reaching the row
+  // through its job document. The spawn runs on its OWN Process/Timer pair
   // with the default 15 s watchdog — never through callBackend, whose
   // single flight would synthetically fail the spawn whenever the shared
-  // short-call pair is busy (a 10 s re-list poll, a 120 s --list-updates
-  // check). The transfer itself runs outside this panel's process tree
-  // and reaches the row through its job document. No confirm — the
-  // backend replaces the AppImage where it sits; the running-app guard
-  // and "up-to-date" now surface as terminal job documents, not
-  // spawn-time results.
-  // The row's Update action (ticket #27): a running app asks first. The
-  // `running` flag comes from the last --list-installed poll, so it can be
-  // stale — deliberately not probed at click time. Stale-but-running (the
-  // flag says true, nothing runs any more) only grants a close the backend
-  // finds nothing to do with; stale-but-not-running (the flag says false,
-  // the app actually runs) is caught by the backend: without the grant a
-  // non-TTY caller gets `skipped-running`, whose banner asks for another
-  // Update press — by then the poll has caught up and the card appears.
+  // short-call pair is busy. A running app is the one exception:
+  // requestUpdate shows the confirm card instead of spawning. The
+  // `running` flag comes from the last --list-installed poll and can be
+  // stale — deliberately not probed at click time. Stale-but-running only
+  // grants a close the backend finds nothing to do with; stale-but-not-
+  // running is caught by the backend: without the grant a non-TTY caller
+  // gets `skipped-running`, whose banner asks for another Update press —
+  // by then the poll has caught up and the card appears. No confirm
+  // otherwise — the backend replaces the AppImage where it sits.
   function requestUpdate(item) {
     if (!item || item.id === "") return
     if (root.jobActive(item.id)) return
@@ -914,15 +841,13 @@ Panel {
     root.updateItem({ id: id, name: name }, true)
   }
 
-  // ---- "Update all" (issue #52) --------------------------------------------
+  // ---- "Update all" ---------------------------------------------------------
   //
-  // One action for every pending app. The click OPENS the consent card
-  // and starts nothing: the card names the apps it would update and the
-  // processes it would close, and only the explicit accept spawns the
-  // jobs. An app with no pending release is never named and never
-  // closed; an app whose verdict is false (the backend would refuse the
-  // install) is never offered either — Model.pendingUpdateIds applies
-  // the badge's own rule.
+  // One action for every pending app. The click OPENS the consent card and
+  // starts nothing; only the explicit accept spawns the jobs. An app with
+  // no pending release, or whose verdict is false (the backend would
+  // refuse the install), is never named and never closed —
+  // Model.pendingUpdateIds applies the badge's own rule.
   function requestUpdateAll() {
     var ids = Model.pendingUpdateIds()
     if (ids.length === 0) return
@@ -1057,7 +982,7 @@ Panel {
     updateSpawnCtx = ctx && ctx.active ? ctx : null
   }
 
-  // ---- background update jobs: document reads + adoption (ticket #11) -------
+  // ---- background update jobs: document reads + adoption ---------------------
 
   // True while THIS row renders an active job (spinner + progress). The
   // only source is the adopted document view — never a click flag.
@@ -1114,8 +1039,7 @@ Panel {
 
   // Store one adopted decision and surface any non-active outcome. The
   // desktopId check keeps a document that names another app from ever
-  // dressing this row (paranoia: the read path was built from the row's
-  // own id, but the check is JobDocs's stated adoption contract).
+  // dressing this row (the check is JobDocs's stated adoption contract).
   function adoptJob(id, parsed) {
     if (parsed.decision.desktopId !== "" && parsed.decision.desktopId !== id) {
       parsed = root.idleParsed()
@@ -1160,8 +1084,8 @@ Panel {
         Model.setStatus(d.message)
       }
     } else if (d.state === "error") {
-      // G: the error line also carries the closed-app clause when the job
-      // closed the app and THEN failed (force_quit on an error document)
+      // The error line also carries the closed-app clause when the job
+      // closed the app and THEN failed (force_quit on an error document).
       Model.setError(Model.jobErrorBanner(d, strings.backendFailed), id)
     } else { // interrupted: dead updater or a heartbeat stale past 120 s
       Model.setError(strings.jobInterrupted, id)
@@ -1185,7 +1109,7 @@ Panel {
     return label
   }
 
-  // ---- settings card (F8 cadence) -------------------------------------------
+  // ---- settings card ----------------------------------------------------------
 
   function toggleSettings() {
     if (settingsOpen) {
@@ -1280,13 +1204,13 @@ Panel {
     })
   }
 
-  // F9 editor: seed the manager dropdown (empty = no source configured —
+  // Editor: seed the manager dropdown (empty = no source configured —
   // the user must pick before Save) and blank field values, then pre-fill
-  // the stored source asynchronously via --get-update-source (--list-installed
-  // carries the manager name only, never its config). Clicking the same
-  // row's gear again toggles the editor closed — the unsaved working values
-  // die with it (closeSourceEditor drops them); a different row's gear
-  // keeps the switch-over behaviour below.
+  // the stored source asynchronously via --get-update-source
+  // (--list-installed carries the manager name only, never its config).
+  // Clicking the same row's gear again toggles the editor closed — the
+  // unsaved working values die with it (closeSourceEditor drops them); a
+  // different row's gear keeps the switch-over behaviour below.
   function openSourceEditor(item) {
     if (!item) return
     if (root.sourceEditId === item.id) {
@@ -1432,7 +1356,7 @@ Panel {
     })
   }
 
-  // ---- integrate picker (F2 fallback: no Quickshell file dialog) -----------
+  // ---- integrate picker --------------------------------------------------------
 
   function openPicker() {
     // The two inline cards would fight for width and keyboard focus; the
@@ -1443,8 +1367,6 @@ Panel {
     // picker starts at the plain path field.
     clearPreview()
     pickerOpen = true
-    // The Downloads quick-picks rebuild inside IntegratePicker when the
-    // card's open flag flips (the old openPicker/rebuildPickerFiles pair).
   }
 
   function closePicker() {
@@ -1457,9 +1379,9 @@ Panel {
     clearPreview()
   }
 
-  // Preview lifecycle (#18). clearPreview resets all card state; it never
-  // calls the backend or touches the store — dismissing has zero side
-  // effects, by contract.
+  // Preview lifecycle. clearPreview resets all card state; it never calls
+  // the backend or touches the store — dismissing has zero side effects,
+  // by contract.
   function clearPreview() {
     previewOpen = false
     busyPreview = false
@@ -1529,7 +1451,7 @@ Panel {
   function confirmPreview() {
     if (!root.previewOpen || root.busyPreview) return
     // A browse in flight owns the backend the integrate command would
-    // share (#19's pick-busy invariant, applied to the keyboard's confirm
+    // share (the pick-busy invariant, applied to the keyboard's confirm
     // path too — the Go button is already disabled during a pick).
     if (Model.state.busy.integrate || Model.state.busy.pick) return
     clearPreview()
@@ -1567,7 +1489,7 @@ Panel {
   }
 
 
-  // F2 browse: run --pick-file through the shared watchdog plumbing. The
+  // Browse: run --pick-file through the shared watchdog plumbing. The
   // backend orchestrates a crash-isolated native dialog (portal first,
   // zenity fallback) under its own 600 s whole-operation deadline; result
   // mapping per CONTRACT.md — picked (exit 0 + path) fills the field,
@@ -1596,15 +1518,14 @@ Panel {
           Model.clearStatus()
           pickerPath = pick.path
           // A preview computed for the previous path is stale the moment
-          // the fill lands (#18 confirm-before-integrate, browse flavor):
+          // the fill lands (confirm-before-integrate, browse flavor):
           // drop it so Confirm can never install anything other than what
           // is on screen. The picked path then rides the same preview flow
           // as a drop or a Downloads quick-pick — seedDropPreview's
           // mechanics minus openPicker (the card is already open): fill
           // the field, request the offline preview, Confirm stays the only
-          // install path (ticket #19 acceptance). Same-trimmed fills keep
-          // the shown card via requestPreview's own guard, matching the
-          // field's onEdited rule.
+          // install path. Same-trimmed fills keep the shown card via
+          // requestPreview's own guard, matching the field's onEdited rule.
           if (root.previewOpen && pick.path.trim() !== root.previewInput) {
             root.dismissPreview()
           }
@@ -1633,14 +1554,13 @@ Panel {
   }
 
   // Put focus into the picker's path field so a picked path can be
-  // integrated with Enter right away (the field and its loader live in
-  // IntegratePicker.qml since ticket #55). Defensive: a browse that
+  // integrated with Enter right away. Defensive: a browse that
   // outlived the card is a quiet store update.
   function focusPickerField() {
     pickerCard.focusField()
   }
 
-  // ---- drop-to-integrate (#21) ------------------------------------------------
+  // ---- drop-to-integrate --------------------------------------------------------
   //
   // Two entries, one flow. The panel window's DropArea (live drop) and the
   // bar widget's summon-payload handoff both end in seedDropPreview, which
@@ -1649,12 +1569,12 @@ Panel {
   // directly, Confirm stays the only install path.
 
   // True while the shared backend process or a picker-owning flow is busy —
-  // the same states during which Go/Browse/Downloads are disabled (#18/#19
-  // guards). A drop racing any of them is IGNORED with a status line,
-  // never queued: a field fill mid-call could only produce an answer the
-  // stale-drop logic would have to throw away (the same reasoning that
-  // disables Browse during a preview), and every flag here is
-  // watchdog-bounded, so "drop again" is always short-lived advice.
+  // the same states during which Go/Browse/Downloads are disabled. A drop
+  // racing any of them is IGNORED with a status line, never queued: a
+  // field fill mid-call could only produce an answer the stale-drop logic
+  // would have to throw away (the same reasoning that disables Browse
+  // during a preview), and every flag here is watchdog-bounded, so
+  // "drop again" is always short-lived advice.
   function dropBusy() {
     return Model.isBusy() || root.busyPreview || root.settingsBusy || root.sourceBusy
   }
@@ -1810,12 +1730,11 @@ Panel {
     onTriggered: Backend.handleTimeout(root.runCtx)
   }
 
-  // Dedicated spawn pair for --update --async (F7): the click must never
-  // queue behind the shared backendProc's single flight — a 10 s re-list
-  // poll or a 120 s --list-updates check in flight would synthetically
-  // fail the spawn (a spurious error banner and a lost click). Same
-  // declarative wiring as backendProc; the default 15 s watchdog bounds
-  // only the spawn itself, never the detached transfer.
+  // Dedicated spawn pair for --update --async: the click must never queue
+  // behind the shared backendProc's single flight — a 10 s re-list poll or
+  // a 120 s --list-updates check in flight would synthetically fail the
+  // spawn. Same declarative wiring as backendProc; the default 15 s
+  // watchdog bounds only the spawn itself, never the detached transfer.
   Process {
     id: updateSpawnProc
     command: []
@@ -1977,7 +1896,7 @@ Panel {
     onTriggered: root.probePython()
   }
 
-  // ---- background update jobs: the reader plumbing (ticket #11) --------------
+  // ---- background update jobs: the reader plumbing ----------------------------
   // One reusable FileView drains the document queue: pumpJobReads points
   // it at one job document at a time (a path change aborts any in-flight
   // read, so the sequential queue never races on the instance), and the
@@ -2186,9 +2105,9 @@ Panel {
         // The confirm step owns Escape first: Esc dismisses the preview
         // back to the picker with zero side effects; a second Esc (no
         // preview showing) closes the panel as before. The force-quit
-        // card (ticket #27) outranks both: Esc cancels it, nothing runs.
-        // The "Update all" card (issue #52) is modal in the same way:
-        // Esc dismisses it and no job is spawned.
+        // card outranks both: Esc cancels it, nothing runs. The
+        // "Update all" card is modal in the same way: Esc dismisses it
+        // and no job is spawned.
         onCloseRequested: {
           if (root.forceQuitId !== "") root.dismissForceQuit()
           else if (root.updateAllOpen) root.dismissUpdateAll()
@@ -2226,8 +2145,6 @@ Panel {
           spacing: Style.spacing.md
 
           // ---- Header: title, counts, actions --------------------------
-          // Extracted to CardHeader.qml (ticket #55): the flags it renders
-          // and every action it reports stay here.
           CardHeader {
             id: cardHeader
             pickerOpen: root.pickerOpen
@@ -2300,9 +2217,7 @@ Panel {
             }
           }
 
-          // ---- Force-quit confirm card (ticket #27) ---------------------
-          // Extracted to ForceQuitCard.qml (ticket #55): the pinned trio
-          // and the confirm handler (the --kill-running grant) stay here.
+          // ---- Force-quit confirm card -----------------------------------
           ForceQuitCard {
             id: forceQuitCard
             forceQuitId: root.forceQuitId
@@ -2319,10 +2234,7 @@ Panel {
             onDismissed: root.dismissForceQuit()
           }
 
-          // ---- "Update all" consent card (issue #52) -------------------
-          // Extracted to UpdateAllCard.qml (ticket #55): the pinned app
-          // list, the derived wording (updateAllSummary) and the batch
-          // spawn queue stay here.
+          // ---- "Update all" consent card ---------------------------------
           UpdateAllCard {
             id: updateAllCard
             updateAllOpen: root.updateAllOpen
@@ -2339,10 +2251,7 @@ Panel {
             onDismissed: root.dismissUpdateAll()
           }
 
-          // ---- Python dependency card (authorized install) --------------
-          // Extracted to PythonDependencyCard.qml (ticket #55): the probe/
-          // install state and the authorized-install bridge stay here; the
-          // card renders them and reports the button press.
+          // ---- Python dependency card (authorized install) ----------------
           PythonDependencyCard {
             id: pythonCard
             pythonVisible: root.pythonStateKnown && root.pythonMissing
@@ -2355,12 +2264,7 @@ Panel {
             onInstallRequested: root.installPython()
           }
 
-          // ---- Integrate picker (F2) ------------------------------------
-          // Extracted to IntegratePicker.qml (ticket #55): the picker
-          // state, the preview flow and every backend call stay here; the
-          // card renders them and reports intent through signals. The
-          // Downloads quick-pick sources and the Loader-gated URL field
-          // moved with it.
+          // ---- Integrate picker -------------------------------------------
           IntegratePicker {
             id: pickerCard
             pickerOpen: root.pickerOpen
@@ -2407,11 +2311,7 @@ Panel {
             }
           }
 
-          // ---- Settings card (F8 cadence only — per-app sources are on each row) -----
-          // Extracted to SettingsCard.qml (ticket #55): the working-copy
-          // state, the --set-setting save chain and the store re-read stay
-          // here; anyFieldFocused replaces the direct loader read in
-          // formEditing below.
+          // ---- Settings card (cadence only — per-app sources are on each row) ----
           SettingsCard {
             id: settingsCard
             settingsOpen: root.settingsOpen
@@ -2503,8 +2403,8 @@ Panel {
                   AppRow {
                     // Explicit assignment, never a `required` property:
                     // this Qt does not auto-initialize required delegate
-                    // properties, so every row failed to instantiate and
-                    // the list rendered empty (2026-10-27).
+                    // properties, so every row fails to instantiate
+                    // without it.
                     modelData: root.items[index]
                     jobActive: root.jobActive(modelData.id)
                     progressLabel: root.jobProgressLabel(modelData.id)
@@ -2552,7 +2452,7 @@ Panel {
       }
     }
 
-    // ---- drop-to-integrate (#21): the whole window is a drop target -----
+    // ---- drop-to-integrate: the whole window is a drop target ----------
     // Dropping an AppImage opens the picker seeded with the file and
     // straight into the preview flow (handleDropUris — never an install).
     // keys restricts the target to real file drags (text/uri-list), so a

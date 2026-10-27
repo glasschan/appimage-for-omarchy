@@ -3,10 +3,9 @@ import qs.Commons
 import qs.Ui
 import "lib/Model.js" as Model
 
-// Force-quit confirm card (ticket #27) — extracted from Panel.qml
-// (ticket #55). Pure view: the panel owns the pinned trio (id, name, pid
-// count), the confirm handler and the --kill-running grant; this card
-// renders the ask and reports the two buttons.
+// Force-quit confirm card. Pure view: the panel owns the pinned trio
+// (id, name, pid count), the confirm handler and the --kill-running
+// grant; this card renders the ask and reports the two buttons.
 //
 // Shown instead of spawning when Update lands on a row the last listing
 // said runs. It names the app and how many processes the confirm will

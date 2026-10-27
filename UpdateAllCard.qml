@@ -2,10 +2,9 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// "Update all" consent card (issue #52) — extracted from Panel.qml
-// (ticket #55). Pure view: the panel owns the pinned app list, the derived
-// wording (Model.updateAllSummary) and the batch spawn queue; this card
-// renders the ask and reports the two buttons.
+// "Update all" consent card. Pure view: the panel owns the pinned app
+// list, the derived wording (Model.updateAllSummary) and the batch spawn
+// queue; this card renders the ask and reports the two buttons.
 //
 // Opened by the header's Update-all action; it starts NOTHING by itself.
 // The card names the apps the batch would update and the processes it
@@ -60,7 +59,7 @@ BorderSurface {
     Text {
       text: updateAllCard.appsLine
       // desktop-entry names are attacker-controlled: never let
-      // Text rich-detect them (adversarial review, 0.11.0)
+      // Text rich-detect them
       textFormat: Text.PlainText
       color: updateAllCard.foreground
       font.family: updateAllCard.fontFamily

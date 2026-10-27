@@ -7,13 +7,14 @@ import qs.Commons as Commons
 // Clipboard-safe single-line text field for plugin forms (qs.Ui.TextField
 // drop-in with a value/edited pair instead of a text/onTextChanged pair).
 //
-// Review #11415 round 3: Qt 6.12 automatically retrieves foreign clipboard
+// Qt 6.12 automatically retrieves foreign clipboard
+// drop-in with a value/edited pair instead of a text/onTextChanged pair).
 // text on every clipboard change for any QQuickTextInput with readOnly:
 // false — no paste action, no aggregate byte limit, no overall deadline —
 // so a hostile clipboard provider can stall or exhaust the shared Omarchy
 // shell process while any editable input is alive, even inside an open
-// card. `readOnly` is the only switch for that hook (omarchy#15083), so
-// this field is PERMANENTLY readOnly and layers its own editing on top:
+// card. `readOnly` is the only switch for that hook, so this field is
+// PERMANENTLY readOnly and layers its own editing on top:
 //
 //   - typing/Backspace/Delete mutate `text` programmatically (allowed on
 //     a readOnly TextInput) and report through `edited()`;

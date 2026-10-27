@@ -2,16 +2,16 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// Settings card (F8 cadence) — extracted from Panel.qml (ticket #55).
-// Pure view: the working-copy state (editEnabled/editInterval/editDelay),
-// the --set-setting save chain and the store re-read stay in Panel.qml;
-// this card renders them and reports the toggle and the Save press.
+// Settings card (update-check cadence). Pure view: the working-copy
+// state (editEnabled/editInterval/editDelay), the --set-setting save
+// chain and the store re-read stay in Panel.qml; this card renders them
+// and reports the toggle and the Save press.
 //
 // The cadence number fields stay Loader-gated on the card's visibility
 // (defense in depth for the no-native-editable-input rule): the inner
 // SpinBox TextInput exists only while the card is open, and its SpinBox
-// field is hard-flipped to `editable: false` on load (review #11415 round
-// 3 — value changes go through the spin buttons only).
+// field is hard-flipped to `editable: false` on load — value changes go
+// through the spin buttons only.
 BorderSurface {
   id: settingsCard
 
@@ -58,7 +58,7 @@ BorderSurface {
       font.bold: true
     }
 
-    // ---- update-check cadence (F8) --------------------------------
+    // ---- update-check cadence ---------------------------------------
     PanelSectionHeader {
       text: settingsCard.strings.settingsUpdateChecks
       foreground: settingsCard.foreground
@@ -122,12 +122,10 @@ BorderSurface {
     }
   }
 
-  // The cadence fields (F8): Loader-created so no text input exists while
-  // the card is hidden (defense in depth — see the SafeTextField note in
-  // Panel.qml for the round-3 rule: no native editable input may exist
-  // even while the card is open, so the field type itself carries the
-  // guarantee; the Loader gates keep dead instances from piling up at
-  // all). Round 3 of review #11415: the SpinBox contentItem is a native
+  // The cadence fields: Loader-created so no text input exists while the
+  // card is hidden (defense in depth — no native editable input may exist
+  // even while the card is open; the Loader gates keep dead instances
+  // from piling up at all). The SpinBox contentItem is a native
   // TextInput that arms the Qt 6.12 clipboard hook while editable —
   // `editable: false` is the one switch that flips it readOnly; value
   // changes go through the spin buttons only.

@@ -2,9 +2,8 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// Header: title, counts, actions — extracted from Panel.qml (ticket #55).
-// Pure view: every flag it renders and every action it reports stay owned
-// by Panel.qml.
+// Header: title, counts, actions. Pure view: every flag it renders and
+// every action it reports stay owned by Panel.qml.
 //
 // The shell Button has no image slot (its iconText is a Nerd Font glyph),
 // so each action supplies the tabler icon in an inner Row while Button
@@ -137,9 +136,9 @@ Item {
       onClicked: cardHeader.refreshClicked()
     }
 
-    // F6 as an icon-only header button (tooltip carries the
-    // caption the row buttons would show); same Button+ThemeIcon
-    // row pattern as Integrate/Refresh above.
+    // Icon-only header button (tooltip carries the caption the row
+    // buttons would show); same Button+ThemeIcon row pattern as
+    // Integrate/Refresh above.
     Button {
       id: checkUpdatesButton
       text: ""
@@ -173,12 +172,11 @@ Item {
       onClicked: cardHeader.checkUpdatesClicked()
     }
 
-    // "Update all" (issue #52): one action for every pending
-    // app, next to the check-updates action and reusing the
-    // row's arrow-up icon. The click only OPENS the consent
-    // card — nothing is spawned until the user accepts it. The
-    // button is enabled exactly while at least one app has a
-    // pending release the backend would accept.
+    // "Update all": one action for every pending app, next to the
+    // check-updates action and reusing the row's arrow-up icon. The
+    // click only OPENS the consent card — nothing is spawned until the
+    // user accepts it. The button is enabled exactly while at least one
+    // app has a pending release the backend would accept.
     Button {
       id: updateAllButton
       text: ""

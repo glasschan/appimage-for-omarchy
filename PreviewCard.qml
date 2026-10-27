@@ -3,10 +3,9 @@ import qs.Commons
 import qs.Ui
 import "lib/Model.js" as Model
 
-// Confirm-before-integrate preview card (#18) — extracted from Panel.qml
-// (ticket #55). Rendered inside IntegratePicker.qml (it lives in the
-// picker card's column); the panel owns the preview state and the
-// confirm/dismiss handlers.
+// Confirm-before-integrate preview card. Rendered inside
+// IntegratePicker.qml (it lives in the picker card's column); the panel
+// owns the preview state and the confirm/dismiss handlers.
 //
 // Rendered from Model.parsePreviewJson's defensive mapping (unknown keys
 // tolerated, null app/destination normalize to empty). The

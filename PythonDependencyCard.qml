@@ -2,15 +2,14 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// Python dependency card (authorized install) — extracted from Panel.qml
-// (ticket #55). Pure view: the panel owns the probe/install state and the
-// backend bridge; this card renders it and reports the button press.
+// Python dependency card (authorized install). Pure view: the panel
+// owns the probe/install state and the backend bridge; this card renders
+// it and reports the button press.
 //
 // Shown only after the probe positively confirmed python3 is absent. The
 // button never installs anything by itself: it opens omarchy's floating
-// terminal presenting `/usr/bin/omarchy pkg add python` so the user watches
-// and authorizes every step (hyprmoncfg's plugin-managed-dependency
-// pattern).
+// terminal presenting `/usr/bin/omarchy pkg add python` so the user
+// watches and authorizes every step.
 BorderSurface {
   id: pythonCard
 

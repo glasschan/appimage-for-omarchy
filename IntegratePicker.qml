@@ -4,19 +4,17 @@ import qs.Commons
 import qs.Ui
 import "lib/Model.js" as Model
 
-// Integrate picker (F2 fallback: no Quickshell file dialog) — extracted
-// from Panel.qml (ticket #55). Pure view: the panel owns the picker state
-// (open/path/busy flags), the preview flow and every backend call; this
-// card renders it and reports the user's intent through signals. The
-// Downloads quick-pick sources and their folder models live here (they
-// feed nothing but the picker's own list).
+// Integrate picker (Quickshell ships no file dialog). Pure view: the
+// panel owns the picker state (open/path/busy flags), the preview flow
+// and every backend call; this card renders it and reports the user's
+// intent through signals. The Downloads quick-pick sources and their
+// folder models live here (they feed nothing but the picker's own list).
 //
 // The URL field is Loader-gated on the card's visibility and is a
 // SafeTextField: no native editable input may exist even while the card
-// is open (review #11415 round 3) — the field type carries the guarantee;
-// the Loader keeps dead instances from piling up. `value` mirrors the
-// panel's pickerPath; Enter previews the current path (#18
-// confirm-before-integrate).
+// is open — the field type carries the guarantee; the Loader keeps dead
+// instances from piling up. `value` mirrors the panel's pickerPath;
+// Enter previews the current path (confirm-before-integrate).
 BorderSurface {
   id: pickerCard
 
@@ -42,9 +40,8 @@ BorderSurface {
   property color foreground
   property color dim
   // Declared for the embedded PreviewCard (it binds `urgent:
-  // pickerCard.urgent`); the panel passes root.urgent. Missing after the
-  // component extraction, which left the preview card's urgent colour
-  // undefined at runtime.
+  // pickerCard.urgent`); the panel passes root.urgent. Undeclared here,
+  // the binding would resolve to undefined.
   property color urgent
   property string fontFamily
   property real controlHeight
@@ -89,8 +86,7 @@ BorderSurface {
   radius: Style.cornerRadius
 
   // Rebuild the Downloads quick-picks whenever the card opens and when a
-  // folder listing changes (the panel's openPicker()/rebuildPickerFiles
-  // pair before the extraction).
+  // folder listing changes.
   onPickerOpenChanged: if (pickerOpen) rebuildPickerFiles()
 
   // FolderListModel.filePath comes back as a plain path on some Qt builds
@@ -176,9 +172,9 @@ BorderSurface {
         id: pickerBrowseButton
         text: pickerCard.busyPick ? pickerCard.strings.pickerBrowsing
           : pickerCard.strings.pickerBrowse
-        // Locked with Go/Downloads while a preview runs (#18):
-        // a fill mid-preview-call could only produce an answer
-        // the stale-drop has to throw away.
+        // Locked with Go/Downloads while a preview runs: a fill
+        // mid-preview-call could only produce an answer the stale-drop
+        // has to throw away.
         enabled: !pickerCard.pickerBusy
         anchors.verticalCenter: parent.verticalCenter
         foreground: pickerCard.foreground
@@ -189,9 +185,9 @@ BorderSurface {
         onClicked: pickerCard.browseClicked()
       }
 
-      // The row's primary action tracks the flow's step (#18):
-      // Go previews a fresh path, Confirm confirms the shown
-      // preview; both show their in-flight copy while busy.
+      // The row's primary action tracks the flow's step: Go previews a
+      // fresh path, Confirm confirms the shown preview; both show their
+      // in-flight copy while busy.
       Button {
         id: pickerGoButton
         text: pickerCard.busyIntegrate ? pickerCard.strings.integrateWorking
@@ -209,7 +205,7 @@ BorderSurface {
       }
     }
 
-    // ---- Preview card (#18) — PreviewCard.qml, ticket #55 ----------
+    // ---- Preview card -------------------------------------------------
     PreviewCard {
       previewOpen: pickerCard.previewOpen
       previewDoc: pickerCard.previewDoc
@@ -266,10 +262,9 @@ BorderSurface {
             fontFamily: pickerCard.fontFamily
             fontSize: Style.font.caption
             enabled: !pickerCard.pickerBusy
-            // Quick-picks ride the same confirm flow: seed the
-            // field so the preview (and a later Confirm) name
-            // the exact file, then preview — never integrate
-            // directly.
+            // Quick-picks ride the same confirm flow: seed the field so
+            // the preview (and a later Confirm) name the exact file, then
+            // preview — never integrate directly.
             onClicked: pickerCard.quickPicked(modelData.path)
           }
         }
@@ -287,14 +282,12 @@ BorderSurface {
     }
   }
 
-  // The integrate-picker URL field (F2): Loader-created so no text input
-  // exists while the card is hidden (defense in depth — see the
-  // SafeTextField note above for the round-3 rule: no native editable
-  // input may exist even while the card is open, so the field type itself
-  // carries the guarantee; the Loader gates keep dead instances from
-  // piling up at all). The picker field is a SafeTextField: `value`
+  // The integrate-picker URL field: Loader-created so no text input
+  // exists while the card is hidden (defense in depth — the SafeTextField
+  // type itself carries the no-native-editable-input guarantee, the
+  // Loader gates keep dead instances from piling up at all). `value`
   // mirrors pickerPath, `edited` writes it back, Enter previews the
-  // current path (#18 confirm-before-integrate).
+  // current path (confirm-before-integrate).
   Component {
     id: pickerFieldComp
 
