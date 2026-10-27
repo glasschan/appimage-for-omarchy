@@ -41,6 +41,11 @@ BorderSurface {
   property var strings
   property color foreground
   property color dim
+  // Declared for the embedded PreviewCard (it binds `urgent:
+  // pickerCard.urgent`); the panel passes root.urgent. Missing after the
+  // component extraction, which left the preview card's urgent colour
+  // undefined at runtime.
+  property color urgent
   property string fontFamily
   property real controlHeight
 
@@ -246,10 +251,14 @@ BorderSurface {
         spacing: Style.spacing.xxs
 
         Repeater {
+          id: quickPickRepeater
           model: pickerCard.pickerFiles
 
           Button {
-            required property var modelData
+            // Plain property + explicit assignment — required delegate
+            // properties are not auto-initialized here (see the comment
+            // on AppRow's modelData).
+            property var modelData: quickPickRepeater.model[index]
             width: pickCol.width
             text: modelData.name
             foreground: pickerCard.foreground

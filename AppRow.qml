@@ -24,8 +24,12 @@ import "lib/Model.js" as Model
 Column {
   id: rowOuter
 
-  // The listing item (Repeater-required).
-  required property var modelData
+  // The listing item. NOT a `required` property: this component is the
+  // Repeater's delegate and this Qt does not auto-initialize required
+  // delegate properties — every row failed to instantiate ("Cannot
+  // create delegate", an empty list) until Panel.qml assigned it
+  // explicitly (`modelData: root.items[index]`).
+  property var modelData
 
   // Rendered state (owned by Panel.qml). jobActive is THIS row's active
   // background job (per-app single flight); progressLabel is the live
@@ -477,6 +481,7 @@ Column {
       }
 
       Repeater {
+        id: sourceFieldsRepeater
         // The model is global (the panel's sourceEditManager), so
         // without the row-visibility gate every other row's
         // hidden editor card would instantiate the same
@@ -489,7 +494,10 @@ Column {
         }
 
         Loader {
-          required property var modelData
+          // Plain property + explicit assignment (see the modelData
+          // note on rowOuter): required delegate properties are never
+          // auto-initialized here.
+          property var modelData: sourceFieldsRepeater.model[index]
           width: sourceEditCol.width
           sourceComponent: modelData.type === "bool"
             ? sourceBoolFieldComp : sourceStringFieldComp

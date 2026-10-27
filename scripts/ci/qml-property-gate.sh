@@ -262,6 +262,44 @@ else
   FAILED="qml-property-gate"
 fi
 
+# Rule 2: no `required property` anywhere in the plugin's QML. A required
+# property on a Repeater/ListView delegate is only auto-initialized by some
+# Qt versions' delegate machinery — on this shell's Qt the delegate fails to
+# instantiate ("Required property modelData was not initialized" →
+# "Cannot create delegate"), and since qml-compile-check compiles without
+# instantiating, the panel shipped green with an EMPTY APP LIST
+# (2026-10-27, AppRow.qml's modelData). Delegate data must arrive through a
+# plain property the instantiation site assigns explicitly.
+if python3 - <<'PY'
+import sys
+from pathlib import Path
+
+ROOT = Path.cwd()
+QML = sorted(ROOT.glob('*.qml'))
+errors = []
+for path in QML:
+    for lineno, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith('//') or stripped.startswith('*'):
+            continue
+        if stripped.startswith('required property'):
+            errors.append(f'{path.name}:{lineno}')
+            print(f'::error::[qml-no-required-prop] {path.name}:{lineno}: '
+                  'required properties are never auto-initialized on this '
+                  'Qt (delegate instantiation fails, qml-compile-check cannot '
+                  'see it) — declare a plain property and assign it at the '
+                  'instantiation site')
+if errors:
+    print(f'\nqml-no-required-prop: FAIL ({len(errors)} error(s))')
+    sys.exit(1)
+print('PASS: qml-no-required-prop (every component property is explicitly assigned)')
+PY
+then
+  :
+else
+  FAILED="qml-no-required-prop"
+fi
+
 if [ -n "$FAILED" ]; then
   printf 'FAIL: %s\n' "$FAILED"
   exit 1

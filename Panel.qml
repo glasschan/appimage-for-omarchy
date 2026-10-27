@@ -2376,6 +2376,7 @@ Panel {
             strings: root.strings
             foreground: root.foreground
             dim: root.dim
+            urgent: root.urgent
             fontFamily: root.fontFamily
             controlHeight: root.controlHeight
             homeDir: root.homeDir
@@ -2500,7 +2501,11 @@ Panel {
                   model: root.items
 
                   AppRow {
-                    required property var modelData
+                    // Explicit assignment, never a `required` property:
+                    // this Qt does not auto-initialize required delegate
+                    // properties, so every row failed to instantiate and
+                    // the list rendered empty (2026-10-27).
+                    modelData: root.items[index]
                     jobActive: root.jobActive(modelData.id)
                     progressLabel: root.jobProgressLabel(modelData.id)
                     confirmRemoveId: root.confirmRemoveId
