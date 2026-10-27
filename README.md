@@ -369,6 +369,36 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.11.1
+
+- **The monoliths are split.** `Panel.qml` (3883 lines) extracts its eight
+  card and row components — `AppRow`, `CardHeader`, `PreviewCard`,
+  `IntegratePicker`, `SettingsCard`, `UpdateAllCard`, `ForceQuitCard`,
+  `PythonDependencyCard` — every one at the repo root and declared in both
+  QML gates; `cli.py` (2582 → 231 lines) becomes a dispatch facade over
+  per-verb modules under `backend/omarchy_appimage/commands/`; `provider.py`
+  (1197 → 59) becomes a composition root over `provider_*.py` and
+  `install_writes.py`. No behaviour change; the security-gates scan now
+  recurses, so split modules stay scanned. (#55–#57)
+- **Integrating from a URL reports progress.** `--integrate <url> --json`
+  emits progress documents — downloading (percent, or bytes when the server
+  sends no length), verifying, installing — ahead of the unchanged result
+  document, and the panel's status line follows the transfer instead of one
+  static "Integrating…"; the 600 s watchdog and the interrupted-run
+  self-heal are untouched. (#30 spec, #58–#60)
+- **Launches match the monitor's scale.** A new `--exec-with-scale` runs an
+  AppImage with `GDK_SCALE` derived from the focused monitor (one bounded
+  `hyprctl` query, nearest-whole rounding, never-fail fallback, `exec`
+  handover). Fresh and updated desktop entries and the panel's Launch
+  button all route through it, so XWayland apps stop rendering 2× on
+  scale-1 displays. (#31 spec, #32–#36)
+- **The app list renders again.** The split shipped one delegate regression:
+  this Qt never auto-initializes `required` delegate properties, so every
+  row failed to instantiate and the panel drew an empty list. Delegate data
+  is now assigned explicitly, a new `qml-no-required-prop` gate rule forbids
+  the pattern outright, and the picker's preview card gets its `urgent`
+  colour back.
+
 ### 0.11.0
 
 - **The update verdict has one owner.** Every completed check — the
