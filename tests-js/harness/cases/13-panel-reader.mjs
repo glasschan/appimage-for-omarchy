@@ -1,5 +1,7 @@
 // -- #11 panel-reader additions: path rules + adoption plumbing ---------------
 
+import { readFileSync } from "node:fs"
+
 import { JobDocs, Model, cap, check } from "../core.mjs"
 import { at, jobDoc } from "../jobs.mjs"
 
@@ -130,5 +132,40 @@ export function run() {
     check("jobActive/anyJobActive false once the view settles",
       Model.jobActive("kept.desktop") === false && Model.anyJobActive() === false)
     unsubJobs()
+  }
+
+  // ---- the Quickshell 0.3.2 FileView hang (2026-10-28 dead-feedback bug) ----
+  //
+  // An async preload of a MISSING document never delivers onLoaded or
+  // onLoadFailed on this Quickshell: the read hangs until the 5 s watchdog
+  // retires it, so the panel's queue drained at 5 s per absent document
+  // and no decision — progress, done or error — ever reached a row (an
+  // update ran to completion while the panel showed nothing). The
+  // service's old blockLoading + text() idiom was worse: text() handed
+  // back the PREVIOUS file's content, which the desktopId guard turned
+  // into silent skips. Both readers must therefore waitForJob() inline,
+  // right after pointing the view at a document. Pinned from disk so
+  // deleting either call re-arms the hang with every other check green;
+  // the FileView canary in scripts/ci/qml-compile-check.sh guards the
+  // Quickshell semantics themselves.
+  {
+    // Comment lines are stripped first: a commented-out call must not
+    // satisfy the pin (plant-proven — the naive source match passed with
+    // the real call commented out).
+    const stripComments = (src) => src.split("\n")
+      .filter((line) => !line.trim().startsWith("//")).join("\n")
+    const panelJobsSrc = stripComments(readFileSync(
+      new URL("../../../PanelJobs.qml", import.meta.url), "utf8"))
+    const serviceSrc = stripComments(readFileSync(
+      new URL("../../../Service.qml", import.meta.url), "utf8"))
+    check("the panel job reader completes its FileView read inline",
+      /jobFileView\.path = path[\s\S]{0,900}jobFileView\.waitForJob\(\)/.test(panelJobsSrc),
+      "pumpJobReads must call jobFileView.waitForJob() right after the path assignment")
+    check("the service job reader completes its FileView read inline",
+      /jobView\.waitForJob\(\)[\s\S]{0,80}var text = String\(jobView\.text\(\) \|\| ""\)/.test(serviceSrc),
+      "adoptJobDocument must waitForJob() before text()")
+    check("the service job view preloads (blockLoading reads stale content)",
+      /id: jobView[^}]*preload: true/.test(serviceSrc)
+        && !/id: jobView[^}]*blockLoading/.test(serviceSrc))
   }
 }

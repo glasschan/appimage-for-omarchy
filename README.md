@@ -369,6 +369,22 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.11.5
+
+- **Update feedback works again.** On Quickshell 0.3.2 an async
+  `FileView` read of a missing file never completes — `onLoaded` and
+  `onLoadFailed` never fire — so the panel's job-document reader hung on
+  every absent document, the 5 s watchdog retired reads one by one, and
+  no decision (live progress, done, error) ever reached a row. A real
+  update ran to completion while the panel showed nothing at all. Both
+  readers (the panel's and the service's) now complete every read inline
+  with `waitForJob()`; the service's old `blockLoading` + `text()` idiom
+  — which handed back the previous file's content — is gone with it.
+  Rows now show the live download progress, the settled "updated"
+  banner, and failure banners as designed. The Quickshell semantics the
+  readers rely on are pinned by harness disk checks and a new FileView
+  canary in `scripts/ci/qml-compile-check.sh`.
+
 ### 0.11.4
 
 - **The icon display gate is per candidate.** The listing now reports

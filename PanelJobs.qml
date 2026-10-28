@@ -57,6 +57,16 @@ Item {
     // retired it without adopting anything.
     jobFileView.path = ""       // force a re-read even when the previous
     jobFileView.path = path     // read pointed at this same document
+    // Complete the read inline. Without waitForJob() this Quickshell
+    // (0.3.2) never delivers onLoaded/onLoadFailed for a MISSING
+    // document — the operation hangs until the watchdog retires it, the
+    // queue drains at 5 s per absent document, and no decision (active,
+    // done, error) ever reaches a row: the 2026-10-28 dead-feedback bug,
+    // where an update ran to completion while the panel showed nothing.
+    // The handlers below stay the only adoption sites; this only makes
+    // them actually fire (pinned by tests-js case 13 and the FileView
+    // canary in scripts/ci/qml-compile-check.sh).
+    jobFileView.waitForJob()
   }
 
   // The "no document" parse result (file missing, or an id that cannot

@@ -39,8 +39,10 @@ import "lib/JobDocs.js" as JobDocs
 // cycle per shell session. This is the only thing QML notifies about:
 // sweep announcements stay backend-owned (--fetch-updates' own dedup'd
 // notify-send). Job reads are synchronous FileView reads of tiny local
-// JSON documents, strictly best-effort, and always run AFTER the next
-// check is armed — adoption can never delay, block or break the sweep.
+// JSON documents (preload + waitForJob — see PanelJobs.qml: without it a
+// missing document's load never completes on this Quickshell), strictly
+// best-effort, and always run AFTER the next check is armed — adoption
+// can never delay, block or break the sweep.
 Item {
   id: root
 
@@ -302,6 +304,12 @@ Item {
     if (stem === "") return
     jobView.path = ""       // force a re-read even when the previous
     jobView.path = jobsDir + "/" + stem + ".json"  // candidate had this path
+    // Inline completion — same contract as PanelJobs.pumpJobReads. The
+    // previous blockLoading + text() idiom read the PREVIOUS file's
+    // content on this Quickshell (the desktopId guard turned that into a
+    // silent skip, so terminal notifications never fired), and a missing
+    // document's async load never completes at all without waitForJob().
+    jobView.waitForJob()
     var text = String(jobView.text() || "")
     // `null`, not `true`: this service cannot probe a pid either (the
     // third JobDocs state — "the caller cannot probe, lean on the
@@ -495,15 +503,18 @@ Item {
     onTriggered: Backend.handleTimeout(root.listCtx)
   }
 
-  // Single-slot reader for job documents. These are tiny
-  // local JSON files, so adoption reads them synchronously (blockLoading)
-  // and stays plain JS — no timers, no callback chains, nothing left
-  // running between checks. A failed/missing read yields empty text and
-  // is skipped silently, so printErrors stays off.
+  // Single-slot reader for job documents. These are tiny local JSON
+  // files, so adoption reads them synchronously (preload + waitForJob in
+  // adoptJobDocument) and stays plain JS — no timers, no callback chains,
+  // nothing left running between checks. A failed/missing read yields
+  // empty text and is skipped silently, so printErrors stays off.
+  // blockLoading is deliberately NOT used: on this Quickshell it defers
+  // loads past the text() call and hands back the previous file's
+  // content.
   FileView {
     id: jobView
     path: ""
-    blockLoading: true
+    preload: true
     printErrors: false
   }
 
