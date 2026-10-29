@@ -86,7 +86,13 @@ class Config:
         cls.refresh()
         h = cls.get_app_hash(el)
         data = dict(data)
-        data['name'] = el.name
+        # el.name is the default only: on the update path the element IS the
+        # downloaded file (``<tmp>/update.appimage``), so its name is the
+        # literal "update" and overwriting with it recorded
+        # ``name = update`` for every updated app. A caller that knows the
+        # real name (commit_install, from the desktop entry it just wrote)
+        # passes it in `data` and it wins here.
+        data.setdefault('name', el.name)
         data['file_path'] = el.file_path
         cls.parser[f'app.{h}'] = data
         cls.write()

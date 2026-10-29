@@ -1,6 +1,5 @@
 import QtQuick
 import Quickshell.Io
-import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
 
 // python3 dependency controller for Panel.qml (authorized install).
@@ -20,12 +19,12 @@ Item {
 
   // One probe run through the same Backend.run plumbing as every backend
   // call: settles python presence, and while an authorized install runs,
-  // reads the terminal's marker files (Model.pythonProbeArgv). Cheap
+  // reads the terminal's marker files (panel.modelApi.pythonProbeArgv). Cheap
   // enough to re-run on every panel open and every poll tick.
   function probePython() {
     if (panel.probeCtx && panel.probeCtx.active) return
     var ctx = Backend.run(pythonProbeProc, pythonProbeTimer,
-      Model.pythonProbeArgv(panel.pythonFailureMarker, panel.pythonCompleteMarker,
+      panel.modelApi.pythonProbeArgv(panel.pythonFailureMarker, panel.pythonCompleteMarker,
         panel.installingPython),
       {}, {}, function(result) {
         panel.probeCtx = null
@@ -40,7 +39,7 @@ Item {
   // missing, refresh() early-returns and the install card owns the screen,
   // so a racing spawn failure's banner is cleared here rather than stacked.
   function handleProbe(exitCode, output) {
-    var outcome = Model.pythonProbeOutcome(exitCode, output, panel.installingPython)
+    var outcome = panel.modelApi.pythonProbeOutcome(exitCode, output, panel.installingPython)
     // Verify-then-start: a pending Install press is answered by this probe
     // alone. Only a confirmed-missing verdict backed by a REAL exit may
     // start the install; any other outcome stands down — "present" falls
@@ -72,7 +71,7 @@ Item {
       // message the timeout just posted.
       var wasMissing = panel.pythonMissing
       panel.pythonMissing = true
-      if (!wasMissing) Model.clearError()
+      if (!wasMissing) panel.modelApi.clearError()
       panel.syncFromModel()
       return
     }
@@ -84,7 +83,7 @@ Item {
       pythonInstallTimeout.stop()
       pythonSlowPoll.stop()
       if (recovered) {
-        Model.setStatus(panel.strings.pythonReady)
+        panel.modelApi.setStatus(panel.strings.pythonReady)
         panel.syncFromModel()
         panel.refresh()
       }
@@ -96,7 +95,7 @@ Item {
     // Defensive: a canceled/failed verdict also retires the slow poll so a
     // dead attempt cannot keep probing behind the error banner.
     pythonSlowPoll.stop()
-    Model.setError(outcome === "canceled"
+    panel.modelApi.setError(outcome === "canceled"
       ? panel.strings.pythonInstallCanceled : panel.strings.pythonInstallFailed)
     panel.syncFromModel()
   }
@@ -117,8 +116,8 @@ Item {
   // rides on THAT probe's result.
   function installPython() {
     if (panel.installingPython) return
-    if (!Model.pythonRuntimeDirUsable(panel.runtimeDir)) {
-      Model.setError(panel.strings.pythonNoRuntimeDir)
+    if (!panel.modelApi.pythonRuntimeDirUsable(panel.runtimeDir)) {
+      panel.modelApi.setError(panel.strings.pythonNoRuntimeDir)
       panel.syncFromModel()
       return
     }
@@ -137,9 +136,9 @@ Item {
   // attempt's verdict; the terminal command clears them again defensively.
   function startPythonInstall() {
     panel.installingPython = true
-    Model.clearError()
+    panel.modelApi.clearError()
     panel.syncFromModel()
-    pythonInstallPrepProc.command = Model.pythonInstallPrepArgv(panel.runtimeDir)
+    pythonInstallPrepProc.command = panel.modelApi.pythonInstallPrepArgv(panel.runtimeDir)
     pythonInstallPrepProc.running = true
     // Prep watchdog: nothing else bounds the prep step (the install
     // timeout only arms after prep success), so a hung prep would leave
@@ -193,7 +192,7 @@ Item {
       // and stand down without ever opening the terminal.
       if (exitCode === 5) {
         panel.installingPython = false
-        Model.setError(panel.strings.pythonNoRuntimeDir)
+        panel.modelApi.setError(panel.strings.pythonNoRuntimeDir)
         panel.syncFromModel()
         return
       }
@@ -201,11 +200,11 @@ Item {
         // The terminal never opened here, so the terminal-focused install
         // copy would be a lie — this message says nothing was changed.
         panel.installingPython = false
-        Model.setError(panel.strings.pythonInstallPrepFailed)
+        panel.modelApi.setError(panel.strings.pythonInstallPrepFailed)
         panel.syncFromModel()
         return
       }
-      pythonInstallerProc.command = Model.pythonInstallArgv()
+      pythonInstallerProc.command = panel.modelApi.pythonInstallArgv()
       pythonInstallerProc.startDetached()
       pythonPoll.restart()
       pythonInstallTimeout.restart()
@@ -225,7 +224,7 @@ Item {
       if (!pythonInstallPrepProc.running) return
       pythonInstallPrepProc.running = false
       panel.installingPython = false
-      Model.setError(panel.strings.pythonInstallPrepFailed)
+      panel.modelApi.setError(panel.strings.pythonInstallPrepFailed)
       panel.syncFromModel()
     }
   }
@@ -248,7 +247,7 @@ Item {
       if (!panel.installingPython) return
       panel.installingPython = false
       pythonPoll.stop()
-      Model.setError(panel.strings.pythonInstallWaiting)
+      panel.modelApi.setError(panel.strings.pythonInstallWaiting)
       panel.syncFromModel()
       // The terminal can outlive the panel's patience: hand recovery to a
       // slow probe — but only while the panel is open. A timeout firing on

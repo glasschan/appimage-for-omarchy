@@ -23,6 +23,27 @@ from .provider_types import (AppImageListElement, AppImageUpdateLogic,
 from .utils import atomic_write, extract_terminal_arguments, run_command
 
 
+def _recorded_app_name(entry, version, dest_appimage_file: str) -> str:
+    """The app name apps.ini records for an install/update.
+
+    The element's own name is not usable on the update path (the element IS
+    the downloaded file, so its name is the temp file's basename), so the
+    name comes from the desktop entry the commit just wrote, minus the
+    `` (<version>)`` suffix the KEEP update logic appends."""
+    name = ''
+    if entry is not None:
+        try:
+            name = (entry.getName() or '').strip()
+        except Exception:
+            name = ''
+    suffix = f' ({version})' if version else ''
+    if suffix and name.endswith(suffix):
+        name = name[:-len(suffix)].strip()
+    if name == '':
+        name = os.path.splitext(os.path.basename(dest_appimage_file or ''))[0]
+    return name
+
+
 class InstallMixin:
     def plan_destination(self, source_basename: str, desktop_name,
                          version: str) -> dict:
@@ -325,6 +346,15 @@ class InstallMixin:
         el.desktop_file_path = plan.dest_desktop_file_path
         el.installed_status = InstalledStatus.INSTALLED
 
+        # Record the name the desktop entry now carries — NOT el.name,
+        # which on the update path is the downloaded file's basename
+        # ("update"). install_file appends " (<version>)" under the KEEP
+        # logic, so exactly that suffix is dropped again; anything else stays
+        # (an app really named "Foo (Fork)" survives). The listing falls back
+        # to this name when an app's desktop entry is unreadable, so
+        # "update" would otherwise surface as an app called "update".
+        plan.app_config['name'] = _recorded_app_name(
+            el.desktop_entry, plan.version, plan.dest_appimage_file)
         Config.set_app_config(el, plan.app_config)
 
         if plan.remove_original:

@@ -407,5 +407,77 @@ class BeforeReplaceOrderingTests(InstallPlanTestCase):
         self.assertFalse(os.path.exists(Config.path()))
 
 
+class RecordedAppNameTests(unittest.TestCase):
+    """apps.ini must never record the download's basename.
+
+    On the update path the install element IS the downloaded file
+    (``<tmp>/update.appimage``), so ``el.name`` is the literal "update" and
+    every update used to record ``name = update``. The name now comes from
+    the desktop entry the commit wrote.
+    """
+
+    @staticmethod
+    def _entry(name):
+        return SimpleNamespace(getName=lambda: name)
+
+    def test_the_keep_version_suffix_is_dropped(self):
+        from omarchy_appimage.provider_install import _recorded_app_name
+        self.assertEqual(
+            _recorded_app_name(self._entry('Demo App (2.0)'), '2.0', ''),
+            'Demo App')
+
+    def test_another_parenthetical_survives(self):
+        from omarchy_appimage.provider_install import _recorded_app_name
+        self.assertEqual(
+            _recorded_app_name(self._entry('Foo (Fork)'), '2.0', ''),
+            'Foo (Fork)')
+
+    def test_a_versionless_entry_keeps_its_name(self):
+        from omarchy_appimage.provider_install import _recorded_app_name
+        self.assertEqual(
+            _recorded_app_name(self._entry('Terax'), '', ''), 'Terax')
+
+    def test_an_empty_entry_name_falls_back_to_the_installed_file(self):
+        from omarchy_appimage.provider_install import _recorded_app_name
+        self.assertEqual(
+            _recorded_app_name(self._entry(''), None,
+                               '/apps/biscuit.appimage'),
+            'biscuit')
+
+    def test_a_supplied_name_wins_over_the_element_name(self):
+        from omarchy_appimage.ini_config import Config
+        el = SimpleNamespace(name='update',
+                             file_path='/apps/demo.appimage')
+        with self._isolated_config():
+            Config.set_app_config(el, {'name': 'Demo App'})
+            self.assertEqual(
+                Config.get_app_config(el)['name'], 'Demo App')
+
+    def test_the_element_name_is_still_the_default(self):
+        from omarchy_appimage.ini_config import Config
+        el = SimpleNamespace(name='Demo App',
+                             file_path='/apps/demo.appimage')
+        with self._isolated_config():
+            Config.set_app_config(el, {'default_exec_arguments': ''})
+            self.assertEqual(
+                Config.get_app_config(el)['name'], 'Demo App')
+
+    @staticmethod
+    def _isolated_config():
+        import contextlib, tempfile
+        @contextlib.contextmanager
+        def cm():
+            with tempfile.TemporaryDirectory() as tmp:
+                original = Config.path
+                Config.path = staticmethod(
+                    lambda: os.path.join(tmp, 'apps.ini'))
+                try:
+                    yield
+                finally:
+                    Config.path = original
+        return cm()
+
+
+
 if __name__ == '__main__':
     unittest.main()

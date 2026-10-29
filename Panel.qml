@@ -79,6 +79,15 @@ Panel {
     || (homeDir + "/.local/state")) + "/io.github.glasschan.appimage/jobs"
   // desktop_id → adopted decision (JobDocs shape); row bindings read
   // jobStates[id]; jobsBusy gates the job polls.
+  // The panel's OWN Model namespace, handed to the controllers
+  // (PanelJobs/PanelUpdates/PanelIntegrate/PanelSourceEditor/PanelPython).
+  // This shell loads a QML *type* (a sibling .qml file instantiated by name)
+  // with its own copy of an imported `.pragma library` script: PanelJobs
+  // writing Model.adoptJobDecision landed in a store this panel never read,
+  // so no row ever showed an update's progress and no job banner ever
+  // appeared (reported 2026-10-29). Every controller therefore reaches the
+  // store THROUGH this reference, never through its own import.
+  readonly property var modelApi: Model
   property var jobStates: ({})
   property bool jobsBusy: false
   // Sequential single-document read state for jobFileView: at most one

@@ -1,6 +1,5 @@
 import QtQuick
 import Quickshell.Io
-import "lib/Model.js" as Model
 import "lib/JobDocs.js" as JobDocs
 
 // Background update-job controller for Panel.qml. Non-visual: owns the
@@ -91,9 +90,9 @@ Item {
       return
     }
     panel.jobStartGraces[id] = 0
-    Model.adoptJobDecision(id, parsed.decision)
+    panel.modelApi.adoptJobDecision(id, parsed.decision)
     panel.syncFromModel()
-    var entry = Model.jobEntry(id)
+    var entry = panel.modelApi.jobEntry(id)
     surfaceJobOutcome(id, parsed, entry ? entry.consumed : 0)
   }
 
@@ -107,28 +106,32 @@ Item {
     var seen = parsed.heartbeat > 0
       ? consumed === parsed.heartbeat : consumed === -1
     if (seen) return
-    Model.markJobConsumed(id, parsed.heartbeat > 0 ? parsed.heartbeat : -1)
+    panel.modelApi.markJobConsumed(
+      id, parsed.heartbeat > 0 ? parsed.heartbeat : -1)
     if (d.state === "done") {
       // This app reached an outcome, so an older error about it is spent.
-      Model.noteOutcome(id)
+      panel.modelApi.noteOutcome(id)
       // "updated" changed the AppImage (and its desktop entry's version):
       // re-list so names, versions and manager columns stay truthful.
       if (d.status === "updated") {
-        Model.setStatus(Model.jobDoneBanner(d, ""))
+        panel.modelApi.setStatus(panel.modelApi.jobDoneBanner(d, ""))
         panel.refresh()
       } else if (d.status === "up-to-date") {
-        Model.setStatus(Model.jobDoneBanner(d, panel.strings.upToDate))
+        panel.modelApi.setStatus(
+          panel.modelApi.jobDoneBanner(d, panel.strings.upToDate))
       } else if (d.status === "skipped-running") {
-        Model.setStatus(d.message !== "" ? d.message : panel.strings.skippedRunning)
+        panel.modelApi.setStatus(
+          d.message !== "" ? d.message : panel.strings.skippedRunning)
       } else if (d.message !== "") {
-        Model.setStatus(d.message)
+        panel.modelApi.setStatus(d.message)
       }
     } else if (d.state === "error") {
       // The error line also carries the closed-app clause when the job
       // closed the app and THEN failed (force_quit on an error document).
-      Model.setError(Model.jobErrorBanner(d, panel.strings.backendFailed), id)
+      panel.modelApi.setError(
+        panel.modelApi.jobErrorBanner(d, panel.strings.backendFailed), id)
     } else { // interrupted: dead updater or a heartbeat stale past 120 s
-      Model.setError(panel.strings.jobInterrupted, id)
+      panel.modelApi.setError(panel.strings.jobInterrupted, id)
     }
     panel.syncFromModel()
   }

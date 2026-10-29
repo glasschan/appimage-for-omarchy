@@ -1,6 +1,5 @@
 import QtQuick
 import Quickshell.Io
-import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
 import "lib/JobDocs.js" as JobDocs
 
@@ -69,15 +68,15 @@ Item {
   // starts nothing; only the explicit accept spawns the jobs. An app with
   // no pending release, or whose verdict is false (the backend would
   // refuse the install), is never named and never closed —
-  // Model.pendingUpdateIds applies the badge's own rule.
+  // panel.modelApi.pendingUpdateIds applies the badge's own rule.
   function requestUpdateAll() {
-    var ids = Model.pendingUpdateIds()
+    var ids = panel.modelApi.pendingUpdateIds()
     if (ids.length === 0) return
     // Only one consent card at a time (see requestUpdate).
     dismissForceQuit()
     var apps = []
     for (var i = 0; i < ids.length; i++) {
-      var item = Model.findItem(ids[i])
+      var item = panel.modelApi.findItem(ids[i])
       if (!item) continue
       apps.push({ id: item.id, name: item.name,
                   running: item.running === true,
@@ -119,7 +118,7 @@ Item {
     if (panel.updateAllQueue.length === 0) return
     if (panel.updateSpawnCtx && panel.updateSpawnCtx.active === true) return
     var id = String(panel.updateAllQueue.shift())
-    var item = Model.findItem(id)
+    var item = panel.modelApi.findItem(id)
     if (!item) {
       pumpUpdateAll()
       return
@@ -144,7 +143,7 @@ Item {
       return
     }
     if (panel.backendCommand.length === 0) {
-      Model.setError(panel.strings.backendMissing)
+      panel.modelApi.setError(panel.strings.backendMissing)
       panel.syncFromModel()
       pumpUpdateAll()
       return
@@ -156,8 +155,8 @@ Item {
       pumpUpdateAll()
       return
     }
-    Model.clearError()
-    Model.setStatus(Model.formatCount(item.name, panel.strings.updating))
+    panel.modelApi.clearError()
+    panel.modelApi.setStatus(panel.modelApi.formatCount(item.name, panel.strings.updating))
     panel.syncFromModel()
     var args = ["--update", item.id, "--yes", "--json", "--async"]
     if (killRunning === true) args.push("--kill-running")
@@ -176,11 +175,11 @@ Item {
           // document decision and replaces this, so the spinner can
           // never outlive its document.
           panel.jobStartGraces[item.id] = Date.now()
-          Model.adoptJobDecision(item.id,
+          panel.modelApi.adoptJobDecision(item.id,
             JobDocs.provisionalActiveDecision(item.id))
         } else {
           // job-started is the only success shape --async reports.
-          Model.setError(Model.appErrorBanner(item.name,
+          panel.modelApi.setError(panel.modelApi.appErrorBanner(item.name,
             panel.strings.backendFailed + " (update)"), item.id)
         }
       } else {

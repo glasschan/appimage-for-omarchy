@@ -1,5 +1,4 @@
 import QtQuick
-import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
 
 // Per-app update-source editor controller for Panel.qml (the F9 inline
@@ -86,7 +85,7 @@ Item {
   }
 
   function rebuildSourceEditValues() {
-    var mgr = Model.managersByName()[panel.sourceEditManager]
+    var mgr = panel.modelApi.managersByName()[panel.sourceEditManager]
     var values = {}
     if (mgr) {
       for (var i = 0; i < mgr.fields.length; i++) {
@@ -115,7 +114,7 @@ Item {
     if (panel.sourceBusy || panel.sourceEditId === "" || panel.sourceEditManager === "") return
     var args = ["--set-update-source", panel.sourceEditId, "--manager",
                 panel.sourceEditManager, "--json"]
-    var mgr = Model.managersByName()[panel.sourceEditManager]
+    var mgr = panel.modelApi.managersByName()[panel.sourceEditManager]
     if (mgr) {
       for (var i = 0; i < mgr.fields.length; i++) {
         var field = mgr.fields[i]
@@ -129,13 +128,13 @@ Item {
       }
     }
     panel.sourceBusy = true
-    Model.clearError()
+    panel.modelApi.clearError()
     panel.syncFromModel()
     panel.callBackend(args, null, function(result) {
       panel.sourceBusy = false
       if (result.ok) {
-        Model.setStatus(panel.strings.sourceSaved)
-        Model.clearError()
+        panel.modelApi.setStatus(panel.strings.sourceSaved)
+        panel.modelApi.clearError()
         closeSourceEditor()
       } else {
         panel.reportFailure(result, "set-update-source")
@@ -149,14 +148,14 @@ Item {
   function unsetSource() {
     if (panel.sourceBusy || panel.sourceEditId === "") return
     panel.sourceBusy = true
-    Model.clearError()
+    panel.modelApi.clearError()
     panel.syncFromModel()
     panel.callBackend(["--set-update-source", panel.sourceEditId, "--unset", "--json"], null,
         function(result) {
       panel.sourceBusy = false
       if (result.ok) {
-        Model.setStatus(panel.strings.sourceUnsetDone)
-        Model.clearError()
+        panel.modelApi.setStatus(panel.strings.sourceUnsetDone)
+        panel.modelApi.clearError()
         closeSourceEditor()
       } else {
         panel.reportFailure(result, "set-update-source")

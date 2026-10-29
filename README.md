@@ -369,6 +369,25 @@ auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
 
+### 0.12.0
+
+- **Update feedback reaches the panel again.** This shell loads a QML
+  *type* (a sibling `.qml` file instantiated by name) with its own copy of
+  an imported `.pragma library` script: the panel's own `Model.js` and the
+  one `PanelJobs.qml`/`PanelUpdates.qml`/`PanelIntegrate.qml`/
+  `PanelSourceEditor.qml`/`PanelPython.qml` saw were different objects, and
+  identical in URL and name. Every adopted job decision therefore landed
+  in a store the panel never rendered, so a click on Update (or Update
+  all) silently ran the job in the background with no progress, no
+  "updated" banner, no failure banner, and no consent card for the batch.
+  The panel now binds its own namespace to a `modelApi` property and every
+  controller reaches the store through it — one instance, one truth.
+- **`apps.ini` no longer records `name = update`.** The update path builds
+  its element from the downloaded file (`<tmp>/update.appimage`), and that
+  basename used to become the recorded app name. The record now takes the
+  name from the desktop entry the install just wrote, minus the
+  ` (<version>)` suffix the KEEP update logic appends.
+
 ### 0.11.5
 
 - **Update feedback works again.** On Quickshell 0.3.2 an async

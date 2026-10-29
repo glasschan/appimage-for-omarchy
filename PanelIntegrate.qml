@@ -1,5 +1,4 @@
 import QtQuick
-import "lib/Model.js" as Model
 
 // Integrate controller for Panel.qml: the picker/preview/drop cluster.
 // Non-visual wiring — the picker card itself stays in the panel's visual
@@ -28,7 +27,7 @@ Item {
     // the card must not be dismissed out from under the pending dialog.
     // Idempotent-open paths (openPicker, settings toggling back) are
     // unaffected; the dialog itself is bounded by the pick watchdog.
-    if (Model.state.busy.pick) return
+    if (panel.modelApi.state.busy.pick) return
     panel.pickerOpen = false
     clearPreview()
   }
@@ -50,16 +49,16 @@ Item {
   function requestPreview(path) {
     var trimmed = String(path || "").trim()
     if (trimmed === "") return
-    if (Model.state.busy.integrate || panel.busyPreview) return
+    if (panel.modelApi.state.busy.integrate || panel.busyPreview) return
     if (panel.backendCommand.length === 0) {
-      Model.setError(panel.strings.backendMissing)
+      panel.modelApi.setError(panel.strings.backendMissing)
       panel.syncFromModel()
       return
     }
     // Same input, card already showing it: nothing to refresh (this is
     // also what a second Enter on the focused field lands on).
     if (panel.previewOpen && panel.previewInput === trimmed) return
-    Model.clearError()
+    panel.modelApi.clearError()
     panel.busyPreview = true
     panel.syncFromModel()
     panel.callBackend(["--preview-integrate", trimmed, "--json"],
@@ -74,15 +73,15 @@ Item {
         return
       }
       if (result.ok) {
-        var parsed = Model.parsePreviewJson(result.stdout)
+        var parsed = panel.modelApi.parsePreviewJson(result.stdout)
         if (parsed.ok) {
           panel.previewDoc = parsed.preview
           panel.previewInput = trimmed
           panel.previewOpen = true
-          Model.clearError()
+          panel.modelApi.clearError()
         } else {
           clearPreview()
-          Model.setError(parsed.error)
+          panel.modelApi.setError(parsed.error)
         }
       } else {
         clearPreview()
@@ -107,7 +106,7 @@ Item {
     // A browse in flight owns the backend the integrate command would
     // share (the pick-busy invariant, applied to the keyboard's confirm
     // path too — the Go button is already disabled during a pick).
-    if (Model.state.busy.integrate || Model.state.busy.pick) return
+    if (panel.modelApi.state.busy.integrate || panel.modelApi.state.busy.pick) return
     clearPreview()
     panel.integratePath(panel.pickerPath)
   }
@@ -151,24 +150,24 @@ Item {
   // backend failure. A busy browse is a no-op (and the Go/Downloads paths
   // are disabled meanwhile), so the dialog can never stack.
   function browseForFile() {
-    if (Model.state.busy.pick) return
-    if (Model.state.busy.integrate) return
+    if (panel.modelApi.state.busy.pick) return
+    if (panel.modelApi.state.busy.integrate) return
     if (panel.backendCommand.length === 0) {
-      Model.setError(panel.strings.backendMissing)
+      panel.modelApi.setError(panel.strings.backendMissing)
       panel.syncFromModel()
       return
     }
-    Model.clearError()
-    Model.setBusy("pick", true)
-    Model.setStatus(panel.strings.pickerBrowsing)
+    panel.modelApi.clearError()
+    panel.modelApi.setBusy("pick", true)
+    panel.modelApi.setStatus(panel.strings.pickerBrowsing)
     panel.syncFromModel()
     panel.callBackend(["--pick-file", "--json"], { timeoutMs: panel.pickTimeoutMs },
         function(result) {
-      Model.setBusy("pick", false)
+      panel.modelApi.setBusy("pick", false)
       if (result.ok) {
-        var pick = Model.parsePickJson(result.stdout)
+        var pick = panel.modelApi.parsePickJson(result.stdout)
         if (pick.result === "picked" && pick.path !== "") {
-          Model.clearStatus()
+          panel.modelApi.clearStatus()
           panel.pickerPath = pick.path
           // A preview computed for the previous path is stale the moment
           // the fill lands (confirm-before-integrate, browse flavor):
@@ -188,15 +187,15 @@ Item {
           return
         }
         if (pick.result === "cancelled") {
-          Model.setStatus(panel.strings.pickCanceled)
+          panel.modelApi.setStatus(panel.strings.pickCanceled)
         } else if (pick.result === "unavailable") {
           // The backend's own copy wins; the local string is the fallback.
           // Status, not error: the path field keeps working exactly as
           // before (this is today's UX, not a failure).
-          Model.setStatus(pick.message !== "" ? pick.message
+          panel.modelApi.setStatus(pick.message !== "" ? pick.message
             : panel.strings.pickerUnavailable)
         } else {
-          Model.setError(pick.result === "error" && pick.error !== ""
+          panel.modelApi.setError(pick.result === "error" && pick.error !== ""
             ? pick.error : panel.strings.pickerPickFailed)
         }
       } else {
@@ -229,7 +228,7 @@ Item {
   // during a preview), and every flag here is watchdog-bounded, so
   // "drop again" is always short-lived advice.
   function dropBusy() {
-    return Model.isBusy() || panel.busyPreview || panel.settingsBusy || panel.sourceBusy
+    return panel.modelApi.isBusy() || panel.busyPreview || panel.settingsBusy || panel.sourceBusy
   }
 
   // The shared handoff. openPicker() closes the settings/source cards and
@@ -241,26 +240,26 @@ Item {
     openPicker()
     panel.pickerPath = path
     if (ignored > 0) {
-      Model.setStatus(ignored === 1 ? panel.strings.dropIgnoredOne
-        : Model.formatCount(ignored, panel.strings.dropIgnoredMany))
+      panel.modelApi.setStatus(ignored === 1 ? panel.strings.dropIgnoredOne
+        : panel.modelApi.formatCount(ignored, panel.strings.dropIgnoredMany))
     }
     requestPreview(path)
   }
 
   // Panel DropArea entry: convert the dropped URI list (typed result —
-  // see Model.dropUriToPath), report rejections as a status with the
+  // see panel.modelApi.dropUriToPath), report rejections as a status with the
   // picker untouched, refuse busy races, otherwise run the flow.
   function handleDropUris(uris) {
-    var conv = Model.dropUriToPath(uris)
+    var conv = panel.modelApi.dropUriToPath(uris)
     if (!conv.ok) {
       // reason "empty" means nothing usable was dropped at all — silent.
-      if (conv.reason === "not-file") Model.setStatus(panel.strings.dropNotFile)
-      else if (conv.reason === "no-appimage") Model.setStatus(panel.strings.dropNoAppImage)
+      if (conv.reason === "not-file") panel.modelApi.setStatus(panel.strings.dropNotFile)
+      else if (conv.reason === "no-appimage") panel.modelApi.setStatus(panel.strings.dropNoAppImage)
       panel.syncFromModel()
       return
     }
     if (dropBusy()) {
-      Model.setStatus(panel.strings.dropBusy)
+      panel.modelApi.setStatus(panel.strings.dropBusy)
       panel.syncFromModel()
       return
     }
