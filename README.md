@@ -33,9 +33,8 @@ moments — raises its own banner; when the backend's best-effort probe
 reports the fuse2 runtime library (`libfuse.so.2`) missing, that banner adds
 one text-only line naming it as the most common cause. No command, no
 button: the hint names the library and nothing more, and a `present` or
-`unknown` probe never adds it. A quit the user made themselves is not a
-launch failure: the check has a short window, and a longer gap retires the
-verdict silently instead of blaming the launch.
+`unknown` probe never adds it. An unpinned launch closes the panel, so
+nothing can observe the launch afterwards and no failure is claimed.
 Status messages auto-clear after 5 s; errors stay until dismissed. A
 backend call that overruns its watchdog reports a timeout — never a
 misleading "python3 missing" hint.
@@ -388,12 +387,12 @@ published.
   "Already integrated". Only apps the installed listing reports count now;
   everything else installs normally.
 - **A normal quit no longer reads as a failed launch.** The launch verdict
-  is armed on the click and settled by the next listing that starts after
-  it — but that click closes the panel and destroys the 1.5 s settle
-  timer, so the verdict could wait until the *next* open, long after the
-  app had been launched, used and quit. A present, non-running row then
-  raised "did not start." The verdict now retires silently past its 30 s
-  window instead of blaming a healthy launch.
+  was armed on every click, but an unpinned click immediately closes the
+  panel and destroys the 1.5 s settle timer, so nothing could judge the
+  launch. The verdict then waited for the *next* open, and a present,
+  non-running row raised "did not start." after the app had already been
+  launched, used and quit. The verdict is now armed only while the panel
+  stays open (pinned) and dropped when it closes.
 
 ### 0.12.0
 
