@@ -7,42 +7,32 @@ import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
 
 // Bar entry for the AppImage plugin: a tabler cube-unfolded icon plus the
-// installed count, and an urgent tint once updates are pending. The icon
-// doubles as a drop-to-integrate target: dropping an AppImage here
-// summons the panel seeded with the file and straight into the preview
-// flow — never an install (see the DropArea below).
+// installed count, with an urgent tint once updates are pending. Dropping an
+// AppImage here summons the panel seeded with the file and straight into the
+// preview flow; a drop never installs.
 //
-// This plugin declares both "bar-widget" and "panel" kinds, so the panel
-// is owned by the shell's panel loader (summon path) rather than hosted
-// inside this widget — the same shape omarchy.menu uses. The button asks
-// the shell to summon/hide it, and the lifecycle members below keep the
-// bar's widget shape contract (Bar.findPanelWidget and the popout
-// coordinator read open/close/opened/popoutSwitchClosing off this root).
+// This plugin declares both "bar-widget" and "panel" kinds, so the panel is
+// owned by the shell's panel loader rather than hosted inside this widget. The
+// lifecycle members below keep the bar's widget shape contract.
 BarWidget {
   id: root
   moduleName: "io.github.glasschan.appimage"
 
-  // Tabler icon name for the bar mark (icons/cube-unfolded.svg via ThemeIcon);
-  // the icon follows the bar's foreground/urgent colors, so no theme
-  // knowledge lives here.
-
   // Mirrored from the shared Model store; Model has no property-change
-  // notifications (it is a plain JS library), so a subscription copies
-  // the counts into reactive properties whenever the store changes.
+  // notifications (it is a plain JS library), so a subscription copies the
+  // counts into reactive properties whenever the store changes.
   property int installedCount: 0
   property int updateCount: 0
   property var unsubscribe: null
 
-  // Current Backend.run context for the one-shot startup sync (null
-  // while idle); the Process/Timer handlers below feed it back into
-  // lib/Backend.js.
+  // Current Backend.run context for the one-shot startup sync (null while
+  // idle).
   property var syncCtx: null
 
   property bool popoutSwitchClosing: false
 
-  // Drop affordance (#21): while a file drag hovers the widget, the icon
-  // and count tint with the theme accent (the same "this will act" color
-  // the panel's controls use). BarWidget.qml owns the DropArea below.
+  // Drop affordance: while a file drag hovers the widget, the icon and count
+  // tint with the theme accent.
   readonly property bool dropHover: barDropArea.containsDrag
 
   // Badge urgency follows the theme's urgent color; nothing is hardcoded.
@@ -50,18 +40,15 @@ BarWidget {
     ? bar.urgent
     : (bar ? bar.barForeground : Color.foreground)
 
-  // The tint the icon and the count share (single-sourced so the two can
-  // never drift): a drag hovering the widget wins over the badge urgency
-  // — the accent IS the affordance — otherwise the normal WidgetButton
-  // active/foreground chain.
+  // The tint the icon and the count share, so the two can never drift. A
+  // hovering drag wins over badge urgency.
   readonly property color effectiveDropColor: dropHover ? Color.accent
     : (button.active && button.useActiveColor ? button.activeColor : button.foreground)
 
   // The bar host injects no manifest, so the canonical third-party plugin
-  // install location (~/.config/omarchy/plugins/<id>, PluginRegistry.qml)
-  // is the best guess for the backend script at login. The panel later
-  // reconfigures the store from its injected manifest.__sourceDir, which
-  // is authoritative; this only seeds the badge count early.
+  // install location is the best guess for the backend script at login. The
+  // panel later reconfigures the store from its injected manifest.__sourceDir,
+  // which is authoritative; this only seeds the badge count early.
   readonly property string homeDir: Quickshell.env("HOME") || ""
   readonly property string backendScript: homeDir + "/.config/omarchy/plugins/"
     + moduleName + "/backend/main.py"
@@ -99,8 +86,8 @@ BarWidget {
     if (host) host.toggle(moduleName, "{}")
   }
 
-  // The bar prefers this over plain close() when swapping popouts; the
-  // flag mirrors Ui.Panel's contract for whoever reads it back off us.
+  // The bar prefers this over plain close() when swapping popouts; the flag
+  // mirrors Ui.Panel's contract for whoever reads it back off us.
   function closeForPopoutSwitch() {
     popoutSwitchClosing = true
     close()
@@ -109,11 +96,9 @@ BarWidget {
 
   // ---- one-shot startup sync -----------------------------------------------
   //
-  // A bar surface exists per monitor but a single backend probe at login
-  // is enough (claimStartupSync is engine-wide): it fills the store so
-  // the badge starts truthful and the first panel open renders from
-  // cache. Failures are silent here — the panel's refresh owns error
-  // reporting (with the python3 hint), and a dev checkout that is not
+  // A bar surface exists per monitor but a single backend probe at login is
+  // enough (claimStartupSync is engine-wide). Failures are silent here: the
+  // panel's refresh owns error reporting, and a dev checkout that is not
   // installed under ~/.config/omarchy/plugins must not raise alarms.
 
   function startupSync() {
@@ -146,22 +131,18 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // The tabler cube-unfolded icon and the count render in barContent below, so
-    // the built-in text label is off; the width follows that row with the
-    // same margins WidgetButton would give a label, and hasVisualContent
-    // stays true now that `text` is empty.
+    // The tabler icon and the count render in barContent below, so the built-in
+    // text label is off; the width follows that row with the same margins
+    // WidgetButton would give a label.
     text: ""
     labelVisible: false
     hasVisualContent: true
     implicitWidth: Math.max(12, barContent.implicitWidth + button.scaledHorizontalMargin * 2)
-    // WidgetButton paints `active` in bar.urgent — the
-    // "updates pending" badge treatment.
+    // WidgetButton paints `active` in bar.urgent: the "updates pending" badge.
     active: root.updateCount > 0
     useActiveColor: root.updateCount > 0
     horizontalMargin: 8.5
-    // Tooltip mirrors the badge's urgency: once update sweeps fill the
-    // store, the actionable number (pending updates) wins over the
-    // installed count.
+    // The actionable number (pending updates) wins over the installed count.
     tooltipText: root.updateCount > 0
       ? Model.formatCount(root.updateCount, Model.strings.updatesAvailable)
       : (root.installedCount > 0
@@ -199,18 +180,11 @@ BarWidget {
 
   // ---- drop-to-integrate ----------------------------------------------------
   //
-  // A file drag dropped on the bar icon opens the integrate picker with
-  // the file prefilled and straight into the preview flow — a drop NEVER
-  // installs (the panel's Confirm stays the only install path). The URIs
-  // are converted and validated HERE through Model.dropUriToPath (pure,
-  // harness-pinned): only a usable .AppImage path is handed on, riding the
-  // summon payload ({drop_path, drop_ignored}) to Panel.open, whose
-  // tryConsumePendingDrop runs the flow once the panel's backend is idle.
-  // A rejected drop (web address, no AppImage in the selection) summons
-  // nothing — the drag simply does not register. keys restricts the
-  // target to real file drags (text/uri-list), so a dragged web address
-  // never even lights the accent affordance above; URL-text drops are out
-  // of scope by the spec.
+  // A file dropped on the bar icon opens the integrate picker with the file
+  // prefilled and straight into the preview flow. The URIs are converted and
+  // validated HERE through Model.dropUriToPath (pure): only a usable .AppImage
+  // path is handed on, riding the summon payload ({drop_path, drop_ignored}).
+  // keys restricts the target to real file drags (text/uri-list).
   DropArea {
     id: barDropArea
     anchors.fill: parent

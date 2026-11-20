@@ -2,16 +2,12 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// "Update all" consent card. Pure view: the panel owns the pinned app
-// list, the derived wording (Model.updateAllSummary) and the batch spawn
-// queue; this card renders the ask and reports the two buttons.
+// "Update all" consent card. Pure view: the panel owns the pinned app list,
+// the derived wording (Model.updateAllSummary) and the batch spawn queue.
 //
-// Opened by the header's Update-all action; it starts NOTHING by itself.
-// The card names the apps the batch would update and the processes it
-// would close (the listing's `running_pids`; a count that is not
-// determinable keeps the count-free sentence). Enter confirms, Esc cancels
-// (PanelKeyCatcher wiring in Panel.qml); Cancel spawns nothing and closes
-// no app.
+// Opened by the header's Update-all action; it starts NOTHING by itself. It
+// names the apps the batch would update and the processes it would close. Enter
+// confirms, Esc cancels; Cancel spawns nothing and closes no app.
 BorderSurface {
   id: updateAllCard
 
@@ -20,9 +16,9 @@ BorderSurface {
   property bool updateAllOpen: false
   property string appsLine: ""
   property string processLine: ""
-  // Confirm is enabled exactly while the batch still has pending apps
-  // (the panel's pendingIds): the card can outlive a slow spawn — never
-  // stack a second job for an app that is already updating.
+  // Confirm is enabled exactly while the batch still has pending apps: the card
+  // can outlive a slow spawn, so never stack a second job for an app that is
+  // already updating.
   property bool confirmEnabled: false
   property var strings
   property color foreground
@@ -31,7 +27,6 @@ BorderSurface {
   property string fontFamily
   property real controlHeight
 
-  // Enter on the key catcher → confirmed(); Esc/Cancel → dismissed().
   signal confirmed()
   signal dismissed()
 
@@ -58,8 +53,8 @@ BorderSurface {
 
     Text {
       text: updateAllCard.appsLine
-      // desktop-entry names are attacker-controlled: never let
-      // Text rich-detect them
+      // desktop-entry names are attacker-controlled: never let Text
+      // rich-detect them
       textFormat: Text.PlainText
       color: updateAllCard.foreground
       font.family: updateAllCard.fontFamily
@@ -83,8 +78,6 @@ BorderSurface {
 
       Button {
         text: updateAllCard.strings.updateAllConfirm
-        // The card can outlive a slow spawn: never stack a
-        // second job for an app that is already updating.
         enabled: updateAllCard.confirmEnabled
         foreground: updateAllCard.foreground
         accent: updateAllCard.urgent

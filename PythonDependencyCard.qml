@@ -2,14 +2,13 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// Python dependency card (authorized install). Pure view: the panel
-// owns the probe/install state and the backend bridge; this card renders
-// it and reports the button press.
+// Python dependency card (authorized install). Pure view: the panel owns the
+// probe/install state and the backend bridge.
 //
-// Shown only after the probe positively confirmed python3 is absent. The
-// button never installs anything by itself: it opens omarchy's floating
-// terminal presenting `/usr/bin/omarchy pkg add python` so the user
-// watches and authorizes every step.
+// Shown only after the probe positively confirmed python3 is absent. The button
+// never installs anything by itself: it opens omarchy's floating terminal
+// presenting `/usr/bin/omarchy pkg add python`, so the user watches and
+// authorizes every step.
 BorderSurface {
   id: pythonCard
 
@@ -22,8 +21,8 @@ BorderSurface {
   property string fontFamily
   property real controlHeight
 
-  // The panel's installPython() (verify-then-start) — nothing runs until
-  // the user presses this.
+  // The panel's installPython() (verify-then-start): nothing runs until the
+  // user presses this.
   signal installRequested()
 
   width: parent.width

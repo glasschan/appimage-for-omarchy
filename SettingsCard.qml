@@ -2,16 +2,13 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// Settings card (update-check cadence). Pure view: the working-copy
-// state (editEnabled/editInterval/editDelay), the --set-setting save
-// chain and the store re-read stay in Panel.qml; this card renders them
-// and reports the toggle and the Save press.
+// Settings card (update-check cadence). Pure view: the working-copy state, the
+// --set-setting save chain and the store re-read stay in Panel.qml.
 //
-// The cadence number fields stay Loader-gated on the card's visibility
-// (defense in depth for the no-native-editable-input rule): the inner
-// SpinBox TextInput exists only while the card is open, and its SpinBox
-// field is hard-flipped to `editable: false` on load — value changes go
-// through the spin buttons only.
+// The cadence number fields stay Loader-gated on the card's visibility: the
+// inner SpinBox TextInput exists only while the card is open, and its field is
+// hard-flipped to `editable: false` on load, so value changes go through the
+// spin buttons only.
 BorderSurface {
   id: settingsCard
 
@@ -30,9 +27,8 @@ BorderSurface {
   // Save pressed.
   signal saveRequested()
 
-  // Whether either cadence field's inner editor holds focus — Panel's
-  // key-catcher guard (formEditing) reads this instead of the loader item
-  // it used before the extraction.
+  // Whether either cadence field's inner editor holds focus (Panel's
+  // key-catcher guard reads this).
   readonly property bool anyFieldFocused:
     (settingsNumbersLoader.item
      ? settingsNumbersLoader.item.anyFieldFocused : false)
@@ -80,8 +76,8 @@ BorderSurface {
         anchors.verticalCenter: parent.verticalCenter
       }
 
-      // Caller-owned value: `checked` binds to the working copy
-      // and toggled() flips it (ToggleSwitch's own contract).
+      // Caller-owned value: `checked` binds to the working copy and toggled()
+      // flips it.
       ToggleSwitch {
         id: settingsToggle
         checked: settingsCard.editEnabled
@@ -122,13 +118,10 @@ BorderSurface {
     }
   }
 
-  // The cadence fields: Loader-created so no text input exists while the
-  // card is hidden (defense in depth — no native editable input may exist
-  // even while the card is open; the Loader gates keep dead instances
-  // from piling up at all). The SpinBox contentItem is a native
-  // TextInput that arms the Qt 6.12 clipboard hook while editable —
-  // `editable: false` is the one switch that flips it readOnly; value
-  // changes go through the spin buttons only.
+  // The cadence fields: Loader-created so no text input exists while the card
+  // is hidden. The SpinBox contentItem is a native TextInput that arms the Qt
+  // 6.12 clipboard hook while editable; `editable: false` is the switch that
+  // flips it readOnly.
   Component {
     id: settingsNumbersComp
 

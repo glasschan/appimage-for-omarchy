@@ -3,23 +3,18 @@ import qs.Commons
 import qs.Ui
 import "lib/Model.js" as Model
 
-// Confirm-before-integrate preview card. Rendered inside
-// IntegratePicker.qml (it lives in the picker card's column); the panel
-// owns the preview state and the confirm/dismiss handlers.
+// Confirm-before-integrate preview card. Rendered inside IntegratePicker.qml;
+// the panel owns the preview state and the confirm/dismiss handlers.
 //
 // Rendered from Model.parsePreviewJson's defensive mapping (unknown keys
-// tolerated, null app/destination normalize to empty). The
-// reduced-assurance line is deliberately prominent — bold and
-// urgent-colored: informing BEFORE the download is the whole point of the
-// preview. Enter confirms, Escape goes back (PanelKeyCatcher wiring in
-// Panel.qml).
+// tolerated). The reduced-assurance line is deliberately prominent, bold and
+// urgent-colored, because informing BEFORE the download is the whole point of
+// the preview. Enter confirms, Escape goes back.
 BorderSurface {
   id: previewCard
 
   // Rendered state (owned by Panel.qml). appLine/destinationLine are the
-  // panel's previewAppLine()/previewDestinationLine() results — an empty
-  // appName means the backend could not know yet, and the panel's copy
-  // says so instead of showing blank.
+  // panel's previewAppLine()/previewDestinationLine() results.
   property bool previewOpen: false
   property var previewDoc: null
   property bool busyIntegrate: false

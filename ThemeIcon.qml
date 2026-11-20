@@ -1,21 +1,18 @@
 import QtQuick
 import Quickshell.Io
 
-// Tabler icon (icons/<name>.svg, MIT — see icons/LICENSE-TABLER.md) drawn
-// in any theme color.
+// Tabler icon (icons/<name>.svg, MIT, see icons/LICENSE-TABLER.md) drawn in
+// any theme color.
 //
-// Qt's SVG rasterizer paints `currentColor` as black and has no hook to
-// hand it the surrounding QML color, so the bundled file is read at
-// runtime (FileView, blocking — the icons are a few hundred bytes each),
-// `currentColor` is swapped for `color`, and the result is fed to a plain
-// Image as a utf8 data URL. The icon stays vector until rasterization (at
-// `size * sourceScale`, so small bar strokes stay crisp) and re-tints
-// automatically whenever the bound color changes — no shader, no cached
-// per-color files, no light/dark icon twins.
+// Qt's SVG rasterizer paints `currentColor` as black and has no hook to hand
+// it the surrounding QML color, so the bundled file is read at runtime
+// (FileView, blocking, icons are a few hundred bytes each), `currentColor`
+// is swapped for `color`, and the result is fed to a plain Image as a utf8
+// data URL. The icon stays vector until rasterization at `size * sourceScale`
+// and re-tints whenever the bound color changes.
 //
-// `strokeWidth` optionally overrides the SVG's stroke-width (tabler ships
-// 2 on a 24-unit canvas); 1.5–1.75 reads better below ~20px and at display
-// sizes than the default 2.
+// `strokeWidth` optionally overrides the SVG's stroke-width (tabler ships 2 on
+// a 24-unit canvas); 1.5 to 1.75 reads better below ~20px.
 Item {
   id: root
 
@@ -23,8 +20,7 @@ Item {
   property string name: ""
   // Stroke color; bind it to the theme or state color the icon must follow.
   property color color: "#000000"
-  // Painted canvas size. Tabler art fills the box edge to edge, so this
-  // is the visual size, not a font line box.
+  // Painted canvas size. Tabler art fills the box edge to edge.
   property real size: 16
   // Stroke width on the SVG's 24-unit canvas; values <= 0 keep the file's.
   property real strokeWidth: 0
@@ -37,15 +33,14 @@ Item {
   FileView {
     id: file
     path: Qt.resolvedUrl("icons/" + root.name + ".svg")
-    // Synchronous first read: the bar widget loads at login and must not
-    // flash an empty slot while a tiny file loads.
+    // Synchronous first read: the bar widget loads at login and must not flash
+    // an empty slot while a tiny file loads.
     blockLoading: true
     watchChanges: false
     printErrors: false
   }
 
-  // Raw SVG text (empty until the first read; `name` is constant per site
-  // in practice, but the reload keeps a dynamic name correct anyway).
+  // Raw SVG text (empty until the first read).
   property string svgText: ""
 
   function reload() {

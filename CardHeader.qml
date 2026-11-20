@@ -2,14 +2,13 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// Header: title, counts, actions. Pure view: every flag it renders and
-// every action it reports stay owned by Panel.qml.
+// Header: title, counts, actions. Pure view: every flag it renders and every
+// action it reports stay owned by Panel.qml.
 //
-// The shell Button has no image slot (its iconText is a Nerd Font glyph),
-// so each action supplies the tabler icon in an inner Row while Button
-// keeps owning every state visual (hover, focus, fills); the width
-// override mirrors Button's own label-based sizing math over that row.
-// The caption lives in the tooltip, like the icon-only row buttons.
+// The shell Button has no image slot (its iconText is a Nerd Font glyph), so
+// each action supplies the tabler icon in an inner Row while Button keeps
+// owning every state visual. The width override mirrors Button's own
+// label-based sizing math over that row. The caption lives in the tooltip.
 Item {
   id: cardHeader
 
@@ -28,10 +27,10 @@ Item {
   property string fontFamily
   property real controlHeight
 
-  // The [Integrate] button toggles the picker (open or cancel);
-  // refresh/check-updates run their verbs; update-all opens the consent
-  // card; pin flips the overlay into a floating window; settings toggles
-  // the settings card. All handled by the panel.
+  // The [Integrate] button toggles the picker; refresh/check-updates run their
+  // verbs; update-all opens the consent card; pin flips the overlay into a
+  // floating window; settings toggles the settings card. All handled by the
+  // panel.
   signal integrateClicked()
   signal refreshClicked()
   signal checkUpdatesClicked()
@@ -136,9 +135,8 @@ Item {
       onClicked: cardHeader.refreshClicked()
     }
 
-    // Icon-only header button (tooltip carries the caption the row
-    // buttons would show); same Button+ThemeIcon row pattern as
-    // Integrate/Refresh above.
+    // Icon-only header button (tooltip carries the caption); same
+    // Button+ThemeIcon row pattern as Integrate/Refresh above.
     Button {
       id: checkUpdatesButton
       text: ""
@@ -172,11 +170,9 @@ Item {
       onClicked: cardHeader.checkUpdatesClicked()
     }
 
-    // "Update all": one action for every pending app, next to the
-    // check-updates action and reusing the row's arrow-up icon. The
-    // click only OPENS the consent card — nothing is spawned until the
-    // user accepts it. The button is enabled exactly while at least one
-    // app has a pending release the backend would accept.
+    // "Update all": one action for every pending app, reusing the row's
+    // arrow-up icon. The click only OPENS the consent card; nothing is spawned
+    // until the user accepts it.
     Button {
       id: updateAllButton
       text: ""
@@ -212,8 +208,8 @@ Item {
       onClicked: cardHeader.updateAllClicked()
     }
 
-    // Pin toggle: flips the overlay into a compact floating
-    // window (session-only) so other apps stay clickable.
+    // Pin toggle: flips the overlay into a compact floating window
+    // (session-only).
     Button {
       id: pinButton
       text: ""

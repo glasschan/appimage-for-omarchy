@@ -5,44 +5,17 @@ import "lib/Model.js" as Model
 import "lib/Backend.js" as Backend
 import "lib/JobDocs.js" as JobDocs
 
-// Background update checker.
+// Background update checker. The plugin declares the "service" kind, so the
+// shell instantiates this once at startup and destroys it when the plugin is
+// disabled; nothing here is per-monitor.
 //
-// The plugin declares the "service" kind, so the shell instantiates this
-// document once at startup (shell.qml ensureService injects shell, manifest
-// and omarchyPath when the properties exist) and destroys it when the
-// plugin is disabled — nothing here is per-monitor.
+// A single repeat:false Timer arms each --fetch-updates, and every fetch
+// completion rearms exactly once (see fetch()). Results go through
+// Model.applyUpdates so the bar badge updates engine-wide. Failures are
+// silent: the panel owns user-facing errors.
 //
-// Scheduling: read --settings once, then a single repeat:false Timer arms
-// the first --fetch-updates after the configured login delay and each next
-// check one interval after the previous one finished. Every fetch
-// completion rearms exactly once (see fetch()); a tick that fires while a
-// sweep is still running repaths on the short floor instead of dying, so
-// the service can never stall. Re-reading settings rides on
-// Model.settingsRevision (the store subscription is the only notification
-// channel a JS library has) so a panel-side save reschedules the running
-// timer. When checks are disabled the timer is stopped: idle cost is zero
-// — no polling Timers, no running Processes between checks.
-//
-// Results go through Model.applyUpdates so the bar badge updates
-// engine-wide. A sweep reporting an app the store never saw (integrated
-// after the startup sync ran) triggers one --list-installed self-heal so
-// the badge counts it without anyone opening the panel. Failures are
-// silent (console.warn): the panel owns user-facing errors, and the
-// backend already sent the desktop notification itself when the sweep
-// found something.
-//
-// Background job adoption: when the startup settings read
-// lands and at the end of every completed sweep, the service reads the
-// background update-job documents (lib/JobDocs.js) for the apps the
-// store knows and surfaces their finished outcomes — done, error,
-// interrupted — as desktop notifications via notify-send, once per job
-// cycle per shell session. This is the only thing QML notifies about:
-// sweep announcements stay backend-owned (--fetch-updates' own dedup'd
-// notify-send). Job reads are synchronous FileView reads of tiny local
-// JSON documents (preload + waitForJob — see PanelJobs.qml: without it a
-// missing document's load never completes on this Quickshell), strictly
-// best-effort, and always run AFTER the next check is armed — adoption
-// can never delay, block or break the sweep.
+// Job adoption (lib/JobDocs.js) runs after the next check is armed, so it can
+// never delay the sweep.
 Item {
   id: root
 
@@ -55,9 +28,8 @@ Item {
   readonly property string moduleName: manifest && manifest.id
     ? String(manifest.id) : "io.github.glasschan.appimage"
 
-  // argv for the backend CLI — the same derivation as Panel.qml but
-  // self-contained: the service loads before any panel, so it falls back
-  // to the canonical install location like BarWidget.qml does.
+  // argv for the backend CLI: the service loads before any panel, so it
+  // falls back to the canonical install location like BarWidget.qml does.
   readonly property var backendCommand: {
     var configured = Model.state.backendCommand
     if (configured && configured.length > 0) return configured
@@ -66,35 +38,30 @@ Item {
     return ["python3", homeDir + "/.config/omarchy/plugins/" + moduleName + "/backend/main.py"]
   }
 
-  // Update sweeps download release metadata at least; give them the same
-  // room the panel's check gets.
+  // Update sweeps download release metadata; give them the same room the
+  // panel's check gets.
   readonly property int fetchTimeoutMs: 120000
-  // Floor for any scheduled delay: delayMinutes 0 means "check as soon as
-  // the shell has settled", not "spawn python during shell startup".
+  // Floor for any scheduled delay: 0 minutes means "check soon", not "spawn
+  // python during shell startup".
   readonly property int minScheduleMs: 60000
 
-  // In-flight Backend.run contexts (null while idle); the Process and Timer
-  // handlers below feed them back into lib/Backend.js. One Process/Timer
-  // pair each for the sweep, the startup settings read and the badge
-  // self-heal list, so concurrent backend calls can never stomp each
-  // other's context.
+  // In-flight Backend.run contexts (null while idle), fed back by the Process
+  // and Timer handlers below. One pair each so concurrent backend calls can
+  // never stomp each other's context.
   property var fetchCtx: null
   property var settingsCtx: null
   property var listCtx: null
 
-  // False until the first --settings answer (or its failure) lands; guards
-  // the revision subscription so the startup write doesn't double-schedule.
+  // False until the first --settings answer lands; guards the revision
+  // subscription so the startup write doesn't double-schedule.
   property bool settingsLoaded: false
   property int seenSettingsRevision: -1
   property var unsubscribe: null
 
   // Background job adoption. jobsDir mirrors the backend's
-  // plugin_state_dir()/jobs layout (constants.py honours XDG_STATE_HOME
-  // with the same ~/.local/state default). jobSurfaced is the
-  // once-per-session acknowledgement memory (desktop id → the outcome
-  // state@job-cycle already surfaced for it this shell session — see
-  // surfaceJobDecision); notifyCtx/notifyQueue carry the single
-  // in-flight notify-send and its bounded queue.
+  // plugin_state_dir()/jobs layout. jobSurfaced maps desktop id to the
+  // state@job-cycle already surfaced this shell session (see
+  // surfaceJobDecision); notifyQueue carries the bounded notify-send backlog.
   property var notifyCtx: null
   property var notifyQueue: []
   property var jobSurfaced: ({})
@@ -121,16 +88,13 @@ Item {
     checkTimer.restart()
   }
 
-  // The single tail for every completed fetch: arm the next check one
-  // interval out (disabled settings stop the timer instead).
+  // The single tail for every completed fetch.
   function scheduleNext() {
     reschedule(false)
   }
 
-  // Short-floor repath for a tick that could not run: the previous sweep
-  // is still in flight, or a panel-initiated sweep owns the single flight.
-  // This check is delayed, not lost — the normal interval resumes from the
-  // next completion's scheduleNext().
+  // Short-floor repath for a tick that could not run because the previous
+  // sweep is still in flight: the check is delayed, not lost.
   function scheduleRetry() {
     checkTimer.stop()
     checkTimer.interval = root.minScheduleMs
@@ -138,8 +102,8 @@ Item {
   }
 
   // One-shot settings read at startup. On failure the store's tolerant
-  // defaults (360/5/on) stand and we still schedule — a dev checkout
-  // without an installed backend must stay quiet, same as the bar.
+  // defaults stand and we still schedule, so a dev checkout without an
+  // installed backend stays quiet.
   function loadSettings() {
     var ctx = Backend.run(settingsProc, settingsTimer, backendCommand,
       ["--settings", "--json"], {}, function(result) {
@@ -147,17 +111,11 @@ Item {
         if (result.ok) {
           var parsed = Model.parseSettingsJson(result.stdout)
           if (parsed.ok) {
-            // Revision bump routes through syncFromModel (which skips
-            // scheduling while settingsLoaded is still false); then the
-            // first check arms with the login delay, not the interval.
+            // The revision bump routes through syncFromModel; settingsLoaded
+            // stays false until now so the first check gets the login delay.
             Model.applySettings(parsed.settings)
             settingsLoaded = true
             reschedule(true)
-            // Startup job adoption: surface what a previous
-            // session's background jobs left behind without waiting for
-            // the first sweep. Runs after the rearm; a no-op when the
-            // store's installed list has not landed yet (the first
-            // sweep's own adoption pass covers that case).
             checkJobs()
             return
           }
@@ -171,24 +129,20 @@ Item {
     settingsCtx = ctx && ctx.active ? ctx : null
   }
 
-  // F8 sweep. --fetch-updates exits 0 even offline (offline:true, empty
-  // updates); an offline answer must NOT clear the badge, so only a real
-  // online result reaches applyUpdates. Never notifies: the backend sent
-  // the desktop notification (with its own dedup) before this returns.
+  // --fetch-updates exits 0 even offline (offline:true, empty updates); an
+  // offline answer must NOT clear the badge, so only a real online result
+  // reaches applyUpdates. Never notifies: the backend sent the desktop
+  // notification itself before this returns.
   //
   // INVARIANT: every fetch completion rearms exactly once. fetch() ends in
   // exactly one scheduleRetry() (tick could not run), or it spawns one run
-  // whose onDone ends in exactly one scheduleNext() — lib/Backend.js fires
-  // onDone exactly once per run (exit, watchdog timeout, or its synchronous
-  // no-backend-command failure) and checkTimer is a single one-shot Timer,
-  // so restart() can never stack two pending shots. No path skips the
-  // rearm: one that did would silently kill the service, because nothing
-  // else arms checkTimer — a settings-save reschedule only re-times the
-  // pending shot.
+  // whose onDone ends in exactly one scheduleNext(). Nothing else arms
+  // checkTimer, so a path that skipped the rearm would silently kill the
+  // service.
   function fetch() {
     if (fetchCtx || !Model.claimUpdateCheck("service")) {
-      // Either our own sweep is still running (a settings save re-timed
-      // checkTimer mid-flight) or a panel-initiated sweep owns the flight.
+      // Our own sweep is still running or a panel-initiated sweep owns the
+      // flight.
       scheduleRetry()
       return
     }
@@ -198,8 +152,8 @@ Item {
         Model.releaseUpdateCheck("service")
         if (result.ok) {
           var parsed = Model.parseUpdatesJson(result.stdout)
-          // An offline empty list says nothing about newly integrated
-          // apps, so the badge self-heal runs on real online results only.
+          // An offline empty list says nothing about newly integrated apps,
+          // so the self-heal runs on real online results only.
           if (parsed.ok && !parsed.offline) {
             Model.applyUpdates(parsed.updates)
             selfHealBadge(parsed.updates)
@@ -209,25 +163,19 @@ Item {
             result.error, Backend.elide(result.stderr || result.stdout))
         }
         scheduleNext()
-        // End-of-sweep job adoption. Strictly after
-        // scheduleNext(): the next check is already armed before any
-        // job document is touched, so adoption — however weird the
-        // state dir looks — can never delay or derail the sweep cadence.
+        // Adoption runs strictly after the rearm, so it can never delay the
+        // sweep cadence.
         checkJobs()
       })
-    // A synchronous onDone (no-backend-command) has already rearmed by the
-    // time this line runs; ctx.active is false then, fetchCtx stays null.
+    // A synchronous onDone (no-backend-command) has already rearmed; ctx.active
+    // is false then, fetchCtx stays null.
     fetchCtx = ctx && ctx.active ? ctx : null
   }
 
   // Badge self-heal: applyUpdates only merges into ids the store already
-  // holds, and that list comes from the startup sync — an app integrated
-  // after the shell started stayed badge-blind until someone opened the
-  // panel. When a sweep reports an id the store lacks, one short-lived
-  // --list-installed refreshes the list and the sweep's items are
-  // re-applied so the new app's pending update is counted (at most one
-  // extra process, and only when new apps actually appeared). The heal owns
-  // no timer: the fetch's scheduleNext() already covered the rearm.
+  // holds from the startup sync, so an app integrated after the shell started
+  // stayed badge-blind until someone opened the panel. One --list-installed
+  // refresh fixes that. The heal owns no timer; the fetch already rearmed.
   function selfHealBadge(updates) {
     var unknown = false
     for (var i = 0; i < updates.length; i++) {
@@ -255,27 +203,19 @@ Item {
     listCtx = ctx && ctx.active ? ctx : null
   }
 
-  // ---- background job adoption --------------------------------------------------
+  // ---- background job adoption ---------------------------------------------
   //
-  // Reads the background update-job documents the detached --update
-  // --async runner publishes (backend/CONTRACT.md, "Job documents";
-  // parse/adoption: lib/JobDocs.js) and surfaces their finished outcomes
-  // once per job cycle per shell session. Called from the two hooks
-  // above only — the startup settings read and the end of a completed
-  // sweep — never from a timer of its own.
+  // Reads the background update-job documents (backend/CONTRACT.md, writer
+  // backend/omarchy_appimage/jobs.py, parser lib/JobDocs.js) and surfaces
+  // their finished outcomes once per job cycle per shell session. Called only
+  // from the startup settings read and the end of a completed sweep, never
+  // from its own timer.
   //
-  // Read mechanism: no directory listing. Quickshell 0.3's Io module has
-  // no Dir type, and the candidate set is known anyway: a job document
-  // only exists for an app that has a desktop id, and every such app is
-  // in Model.state.items (the bar's startup sync and the sweeps keep
-  // that list fresh). Iterating those ids means the paths we open are
-  // derived from backend-provided ids instead of raw directory entries,
-  // and idle cost stays zero — nothing watches the jobs dir between
-  // checks.
+  // No directory listing: Quickshell 0.3's Io module has no Dir type. The
+  // candidate set is Model.state.items, so paths derive from backend-provided
+  // ids, never raw directory entries.
   function checkJobs() {
-    // A service feature like the sweeps themselves: with auto-checks
-    // disabled the service stays completely idle (the panel still shows
-    // job state when opened).
+    // With auto-checks disabled the service stays completely idle.
     if (!Model.state.settings.enabled) return
     var items = Model.state.items
     if (!items || items.length === 0) return
@@ -283,7 +223,7 @@ Item {
       try {
         adoptJobDocument(String((items[i] && items[i].id) || ""))
       } catch (e) {
-        // Insurance only — the helpers below are written never to throw.
+        // The helpers below never throw; this is insurance only.
         console.warn("appimage service: job adoption skipped:", e)
       }
     }
@@ -291,51 +231,39 @@ Item {
 
   // One candidate app: validate the id, read its document, adopt it.
   function adoptJobDocument(desktopId) {
-    // Job documents exist only for real desktop ids (the document's file
-    // name is the id's stem — jobs.py job_document_path). Model falls
-    // back to the AppImage path when the backend reports a null id, and
-    // such an app can never have a document.
+    // Job documents exist only for real desktop ids (the file stem is the id
+    // minus ".desktop"); a null id falls back to the AppImage path and can
+    // never have a document.
     if (!/\.desktop$/.test(desktopId)) return
-    // Shared stem rule (lib/JobDocs.js jobDocumentStem, mirror of
-    // jobs.py _job_stem): the path we open is always one flat component
-    // inside the jobs dir — never a traversal. The .desktop-suffix
-    // expectation stays at this call site; the helper owns the stem rule.
+    // Shared stem rule (lib/JobDocs.js jobDocumentStem, mirror of jobs.py
+    // _job_stem): the path is always one flat component inside the jobs dir,
+    // never a traversal.
     var stem = JobDocs.jobDocumentStem(desktopId)
     if (stem === "") return
     jobView.path = ""       // force a re-read even when the previous
     jobView.path = jobsDir + "/" + stem + ".json"  // candidate had this path
-    // Inline completion — same contract as PanelJobs.pumpJobReads. The
-    // previous blockLoading + text() idiom read the PREVIOUS file's
-    // content on this Quickshell (the desktopId guard turned that into a
-    // silent skip, so terminal notifications never fired), and a missing
-    // document's async load never completes at all without waitForJob().
+    // Inline completion, same contract as PanelJobs.pumpJobReads: without
+    // waitForJob() a missing document's async load never completes on this
+    // Quickshell, and blockLoading hands back the PREVIOUS file's content.
     jobView.waitForJob()
     var text = String(jobView.text() || "")
-    // `null`, not `true`: this service cannot probe a pid either (the
-    // third JobDocs state — "the caller cannot probe, lean on the
-    // heartbeat rule alone"). Passing `true` asserted a liveness probe
-    // that does not exist and made pidDead unreachable.
+    // `null`, not `true`: QML cannot probe a pid, so pass the "caller cannot
+    // probe" verdict and let the heartbeat rule decide; `true` would make
+    // pidDead unreachable.
     var adopted = JobDocs.adoptDocument(text, null, Date.now())
-    // Missing/unreadable (empty text — includes documents the janitor
-    // aged out, which vanish silently per the contract) or corrupt:
-    // skip silently, exactly like the rest of the service's failures.
+    // Missing, aged out or corrupt: skip silently like the rest of the
+    // service's failures.
     if (adopted.parseError !== "") return
-    // Act only on a document that really belongs to the app we meant to
-    // read; the parse layer is tolerant by design, the id check is ours.
+    // Act only on a document that belongs to the app we meant to read; the
+    // parse layer is tolerant, the id check is ours.
     if (String(adopted.decision.desktopId) !== desktopId) return
     surfaceJobDecision(adopted.decision, desktopId)
   }
 
-  // The notification decision, deduplicated once per job cycle per shell
-  // session: jobSurfaced[desktopId] holds the outcome state plus the job
-  // cycle it was surfaced for (state + "@" + the document's started
-  // stamp), so re-reading the same terminal document on later sweeps is
-  // free, a shell restart re-notifies once (the accepted semantics —
-  // "once only, or until acknowledged"), the same outcome across
-  // DIFFERENT job cycles is news each time (a retry that fails again
-  // notifies again; a second completed update announces again), and a
-  // retry or a resumed job (its document goes ACTIVE again) clears the
-  // record so the genuinely new terminal outcome can surface once more.
+  // Notify once per job cycle per shell session: jobSurfaced[desktopId] holds
+  // the outcome state plus the job cycle (state@started) already surfaced. A
+  // different cycle is news again, and an active document clears the record
+  // so a retry's outcome surfaces again.
   function surfaceJobDecision(decision, desktopId) {
     var state = decision.state
     if (state === "active") {
@@ -348,11 +276,8 @@ Item {
     var name = jobAppName(desktopId)
     if (state === "done") {
       // Only a genuinely installed release is news: up-to-date and
-      // skipped-running are answers to an update the user started in
-      // the panel, where the status row already showed them. The whole
-      // body is elided at the same bound as the error path — the
-      // document-controlled version/message strings never own the
-      // notification's size.
+      // skipped-running were answers to an update the user started in the
+      // panel, where the status row already showed them.
       if (decision.status !== "updated") return
       notifyDesktop("AppImage updated",
         Backend.elide(decision.newVersion !== ""
@@ -377,15 +302,11 @@ Item {
     return desktopId.substring(0, desktopId.length - 8)
   }
 
-  // Desktop notifications for job outcomes: notify-send with the same
-  // best-effort argv shape the backend's --fetch-updates announcement
-  // uses (app name 'AppImage for Omarchy', expire-time 5000). Pure argv
-  // through the shared Backend.run seam — title and body travel as
-  // single arguments, nothing is ever interpolated into a shell. A
-  // missing binary or non-zero exit is a console.warn, never an error.
-  // Several outcomes can land in one adoption pass, so notifications
-  // queue behind the single in-flight send; the queue is bounded and
-  // beyond it drops (the panel still shows the state).
+  // Notify-send through the shared Backend.run seam: title and body travel as
+  // single argv arguments, never through a shell. A missing binary or non-zero
+  // exit is a console.warn. Notifications queue behind the single in-flight
+  // send; the queue is bounded and beyond it drops, since the panel still
+  // shows the state.
   function notifyDesktop(title, body) {
     if (notifyCtx) {
       if (notifyQueue.length >= 8) return
@@ -475,8 +396,7 @@ Item {
     onTriggered: Backend.handleTimeout(root.settingsCtx)
   }
 
-  // Short-call pair for the badge self-heal's --list-installed (same
-  // wiring as settingsProc; a heal can overlap a fetch's own completion).
+  // Short-call pair for the badge self-heal's --list-installed.
   Process {
     id: listProc
     command: []
@@ -503,14 +423,10 @@ Item {
     onTriggered: Backend.handleTimeout(root.listCtx)
   }
 
-  // Single-slot reader for job documents. These are tiny local JSON
-  // files, so adoption reads them synchronously (preload + waitForJob in
-  // adoptJobDocument) and stays plain JS — no timers, no callback chains,
-  // nothing left running between checks. A failed/missing read yields
-  // empty text and is skipped silently, so printErrors stays off.
-  // blockLoading is deliberately NOT used: on this Quickshell it defers
-  // loads past the text() call and hands back the previous file's
-  // content.
+  // Single-slot reader for job documents. Adoption reads them synchronously
+  // (preload + waitForJob) and stays plain JS. blockLoading is deliberately
+  // NOT used: on this Quickshell it defers loads past text() and hands back
+  // the previous file's content.
   FileView {
     id: jobView
     path: ""
@@ -518,10 +434,8 @@ Item {
     printErrors: false
   }
 
-  // Fire-and-forget pair for job-outcome notifications: the
-  // same wiring as listProc. notify-send produces nothing we parse —
-  // the handlers only feed the shared Backend.run ctx machinery, so a
-  // runaway binary is killed by the watchdog like any other call.
+  // Fire-and-forget pair for job-outcome notifications, same wiring as
+  // listProc; a runaway notify-send is killed by the watchdog like any call.
   Process {
     id: notifyProc
     command: []

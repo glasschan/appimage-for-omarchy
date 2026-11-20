@@ -4,38 +4,28 @@ import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 
-// Clipboard-safe single-line text field for plugin forms (qs.Ui.TextField
-// drop-in with a value/edited pair instead of a text/onTextChanged pair).
+// Clipboard-safe single-line text field for plugin forms (a qs.Ui.TextField
+// drop-in with a value/edited pair instead of text/onTextChanged).
 //
-// Qt 6.12 automatically retrieves foreign clipboard
-// drop-in with a value/edited pair instead of a text/onTextChanged pair).
-// text on every clipboard change for any QQuickTextInput with readOnly:
-// false — no paste action, no aggregate byte limit, no overall deadline —
-// so a hostile clipboard provider can stall or exhaust the shared Omarchy
-// shell process while any editable input is alive, even inside an open
-// card. `readOnly` is the only switch for that hook, so this field is
+// Qt 6.12 automatically retrieves foreign clipboard text on every clipboard
+// change for any QQuickTextInput with readOnly: false. No paste action, no
+// aggregate byte limit, no deadline, so a hostile clipboard provider can stall
+// or exhaust the shared Omarchy shell process while any editable input is
+// alive. `readOnly` is the only switch for that hook, so this field is
 // PERMANENTLY readOnly and layers its own editing on top:
 //
-//   - typing/Backspace/Delete mutate `text` programmatically (allowed on
-//     a readOnly TextInput) and report through `edited()`;
-//   - paste runs a BOUNDED, fail-closed wl-paste: text/plain MIME only,
-//     1 s timeout, streamed byte cap (pasteMaxChars) that kills the
-//     helper mid-stream; a non-zero exit or an oversize payload inserts
-//     nothing at all;
-//   - navigation/selection/copy (arrows, Home/End, Ctrl+A, Ctrl+C) keep
-//     the native readOnly behavior; cut and middle-click paste are
-//     no-ops on a readOnly input.
+//   - typing/Backspace/Delete mutate `text` programmatically (allowed on a
+//     readOnly TextInput) and report through `edited()`;
+//   - paste runs a BOUNDED, fail-closed wl-paste: text/plain MIME only, 1 s
+//     timeout, streamed byte cap that kills the helper mid-stream;
+//   - navigation/selection/copy keep the native readOnly behavior.
 //
-// Accepted tradeoffs (recorded): no IME preedit/dead keys (readOnly
-// disables the input-method path), no native cut, no multi-line paste
-// (embedded newlines paste as spaces).
+// Accepted tradeoffs: no IME preedit/dead keys, no native cut, no multi-line
+// paste (embedded newlines paste as spaces).
 //
-// Consumers bind `value` — never written by the field — and write their
-// model from `edited(value)`; the value → text sync then re-asserts the
-// display on external model changes. This mirrors the kit NumberField's
-// value/modified pair and keeps declarative `value:` bindings alive
-// (programmatic edits only ever touch the internal `text`, which nothing
-// outside binds).
+// Consumers bind `value` (never written by the field) and write their model
+// from `edited(value)`; the value to text sync re-asserts the display on
+// external model changes, which keeps declarative `value:` bindings alive.
 TextField {
   id: root
 
@@ -44,12 +34,11 @@ TextField {
   readOnly: true
 
   // Theme plumbing, mirroring qs.Ui.TextField so this field really is a
-  // drop-in for it: `foreground` paints the text, `accent` tints the
-  // selection. Panel.qml assigns both, and a QML assignment to a property
-  // the type does not declare is a COMPILE error (not a warning) — it takes
-  // the whole panel down, and the omarchy shell swallows the load error
-  // (shell.qml calls `errorString()` as a function), so the panel just
-  // never appears. Keep this list in sync with what the panel assigns.
+  // drop-in: `foreground` paints the text, `accent` tints the selection. A QML
+  // assignment to a property the type does not declare is a COMPILE error that
+  // takes the whole panel down, and the omarchy shell swallows the load error,
+  // so the panel just never appears. Keep this list in sync with what the
+  // panel assigns.
   property color foreground: Commons.Color.foreground
   property color accent: Commons.Color.accent
 
@@ -87,8 +76,7 @@ TextField {
     // Focus navigation must never leak into the field as a tab character.
     if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) return
     // Other modifier combos keep the native readOnly behavior (arrows,
-    // Home/End, Ctrl+A select-all, Ctrl+C copy); cut and native paste are
-    // already no-ops under readOnly.
+    // Home/End, Ctrl+A select-all, Ctrl+C copy).
     if (mods & (Qt.ControlModifier | Qt.MetaModifier | Qt.AltModifier)) return
     if (event.key === Qt.Key_Backspace) { _backspace(); event.accepted = true; return }
     if (event.key === Qt.Key_Delete) { _deleteForward(); event.accepted = true; return }
@@ -96,8 +84,8 @@ TextField {
   }
 
   onValueChanged: {
-    // External model change re-asserts the display; the cursor rides to
-    // the end because this is a programmatic sync, not typing.
+    // External model change re-asserts the display; the cursor rides to the end
+    // because this is a programmatic sync, not typing.
     if (text !== value) {
       text = value
       cursorPosition = text.length
@@ -152,10 +140,8 @@ TextField {
   function _pasteFromClipboard() {
     if (pasteProc.running) return
     _pasteBytes = 0
-    // Absolute paths only (house rule). /usr/bin/timeout bounds the helper
-    // to 1 s; --type text/plain fails closed on non-text clipboards
-    // (MIME prefix match, no fallback type), --no-newline avoids the
-    // trailing-newline rewrite of plain `wl-paste`.
+    // /usr/bin/timeout bounds the helper to 1 s; --type text/plain fails closed
+    // on non-text clipboards, --no-newline avoids the trailing-newline rewrite.
     pasteProc.command = ["/usr/bin/timeout", "1",
                          "/usr/bin/wl-paste", "--no-newline", "--type", "text/plain"]
     pasteProc.running = true
@@ -168,8 +154,8 @@ TextField {
       id: pasteStdout
       waitForEnd: true
       onRead: function(data) {
-        // Streamed fail-close: kill the helper the moment the payload
-        // exceeds the cap instead of buffering an unbounded clipboard.
+        // Streamed fail-close: kill the helper the moment the payload exceeds
+        // the cap.
         root._pasteBytes += data.length
         if (root._pasteBytes > root.pasteMaxChars) pasteProc.running = false
       }
@@ -177,8 +163,7 @@ TextField {
 
     onExited: function(exitCode) {
       // Fail closed on every abnormal path: timeout kill, missing helper,
-      // non-text clipboard (wl-paste exit != 0), or a stream we killed at
-      // the cap. A clean empty payload inserts nothing.
+      // non-text clipboard, or a stream we killed at the cap.
       if (exitCode !== 0) return
       if (root._pasteBytes > root.pasteMaxChars) return
       var out = pasteStdout.text

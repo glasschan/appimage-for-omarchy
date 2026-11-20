@@ -4,17 +4,14 @@ import qs.Commons
 import qs.Ui
 import "lib/Model.js" as Model
 
-// Integrate picker (Quickshell ships no file dialog). Pure view: the
-// panel owns the picker state (open/path/busy flags), the preview flow
-// and every backend call; this card renders it and reports the user's
-// intent through signals. The Downloads quick-pick sources and their
-// folder models live here (they feed nothing but the picker's own list).
+// Integrate picker (Quickshell ships no file dialog). Pure view: the panel
+// owns the picker state, the preview flow and every backend call; this card
+// renders it and reports the user's intent through signals. The Downloads
+// quick-pick sources and their folder models live here.
 //
 // The URL field is Loader-gated on the card's visibility and is a
-// SafeTextField: no native editable input may exist even while the card
-// is open — the field type carries the guarantee; the Loader keeps dead
-// instances from piling up. `value` mirrors the panel's pickerPath;
-// Enter previews the current path (confirm-before-integrate).
+// SafeTextField: no native editable input may exist even while the card is
+// open. `value` mirrors the panel's pickerPath; Enter previews the current path.
 BorderSurface {
   id: pickerCard
 
@@ -26,53 +23,48 @@ BorderSurface {
   property bool busyPreview: false
   property bool previewOpen: false
   property var previewDoc: null
-  // Combined picker-owning busy state (the panel's pickerBusy): Browse,
-  // Go and the Downloads quick-picks all disable on exactly this.
+  // Combined picker-owning busy state (the panel's pickerBusy): Browse, Go
+  // and the Downloads quick-picks all disable on exactly this.
   property bool pickerBusy: false
-  // Injected HOME (the panel's homeDir) — the quick-pick sources hang off
-  // it.
+  // Injected HOME (the panel's homeDir); the quick-pick sources hang off it.
   property string homeDir: ""
-  // The preview card's derived lines (the panel's
-  // previewAppLine()/previewDestinationLine()).
+  // The preview card's derived lines.
   property string previewAppLine: ""
   property string previewDestinationLine: ""
   property var strings
   property color foreground
   property color dim
-  // Declared for the embedded PreviewCard (it binds `urgent:
-  // pickerCard.urgent`); the panel passes root.urgent. Undeclared here,
-  // the binding would resolve to undefined.
+  // Declared for the embedded PreviewCard, which binds `urgent` to it; the
+  // panel passes root.urgent. Undeclared, the binding would resolve to
+  // undefined.
   property color urgent
   property string fontFamily
   property real controlHeight
 
-  // The path field's text was edited (the panel stores it and drops a
-  // stale preview — same-trimmed edits keep the shown card).
+  // The path field's text was edited (the panel stores it and drops a stale
+  // preview).
   signal pathEdited(string value)
-  // Enter on the path field: preview the current path.
   signal previewRequested()
-  // Browse button: the backend's crash-isolated --pick-file dialog.
+  // Browse: the backend's crash-isolated --pick-file dialog.
   signal browseClicked()
-  // Go button: preview a fresh path, or confirm the shown preview.
+  // Go: preview a fresh path, or confirm the shown preview.
   signal goClicked()
   // A Downloads quick-pick was pressed: seed the field with its path and
-  // preview (never integrate directly).
+  // preview.
   signal quickPicked(string path)
-  // Confirm/Esc/Cancel on the embedded preview card.
   signal previewConfirmed()
   signal previewDismissed()
-  // Focus deltas from the Loader-created field (the key catcher's focus
-  // count — the panel accumulates across every editable field).
+  // Focus deltas from the Loader-created field (the panel's key catcher
+  // accumulates a focus count).
   signal fieldFocusChanged(int delta)
 
-  // Whether the Loader-created field holds focus (Panel's formEditing
-  // reads this instead of the loader item it used before the extraction).
+  // Whether the Loader-created field holds focus (Panel's formEditing reads
+  // this).
   readonly property bool fieldFocused:
     fieldLoader.item ? fieldLoader.item.activeFocus : false
 
-  // Put focus into the path field (a picked path should be confirmable
-  // with Enter right away). Defensive: a browse that outlived the card is
-  // a quiet store update.
+  // Put focus into the path field so a picked path can be confirmed with Enter
+  // right away.
   function focusField() {
     var field = fieldLoader.item
     if (field) field.forceActiveFocus()
@@ -85,12 +77,12 @@ BorderSurface {
   borderSpec: Border.flat(Util.alpha(Color.accent, 0.35), Math.max(1, Style.normalBorderWidth))
   radius: Style.cornerRadius
 
-  // Rebuild the Downloads quick-picks whenever the card opens and when a
-  // folder listing changes.
+  // Rebuild the Downloads quick-picks whenever the card opens and when a folder
+  // listing changes.
   onPickerOpenChanged: if (pickerOpen) rebuildPickerFiles()
 
-  // FolderListModel.filePath comes back as a plain path on some Qt builds
-  // and as a file:// URL on others; normalize to a local path.
+  // FolderListModel.filePath comes back as a plain path on some Qt builds and
+  // as a file:// URL on others; normalize to a local path.
   function pickerUrlToPath(value) {
     var s = String(value || "")
     if (s.indexOf("file://") === 0) {
@@ -172,9 +164,8 @@ BorderSurface {
         id: pickerBrowseButton
         text: pickerCard.busyPick ? pickerCard.strings.pickerBrowsing
           : pickerCard.strings.pickerBrowse
-        // Locked with Go/Downloads while a preview runs: a fill
-        // mid-preview-call could only produce an answer the stale-drop
-        // has to throw away.
+        // Locked with Go/Downloads while a preview runs: a fill mid-call could
+        // only produce an answer the stale-drop has to throw away.
         enabled: !pickerCard.pickerBusy
         anchors.verticalCenter: parent.verticalCenter
         foreground: pickerCard.foreground
@@ -251,9 +242,8 @@ BorderSurface {
           model: pickerCard.pickerFiles
 
           Button {
-            // Plain property + explicit assignment — required delegate
-            // properties are not auto-initialized here (see the comment
-            // on AppRow's modelData).
+            // Plain property + explicit assignment: required delegate properties
+            // are not auto-initialized here (see AppRow's modelData comment).
             property var modelData: quickPickRepeater.model[index]
             width: pickCol.width
             text: modelData.name
@@ -262,9 +252,8 @@ BorderSurface {
             fontFamily: pickerCard.fontFamily
             fontSize: Style.font.caption
             enabled: !pickerCard.pickerBusy
-            // Quick-picks ride the same confirm flow: seed the field so
-            // the preview (and a later Confirm) name the exact file, then
-            // preview — never integrate directly.
+            // Quick-picks ride the same confirm flow: seed the field so the
+            // preview (and a later Confirm) name the exact file.
             onClicked: pickerCard.quickPicked(modelData.path)
           }
         }
@@ -282,12 +271,9 @@ BorderSurface {
     }
   }
 
-  // The integrate-picker URL field: Loader-created so no text input
-  // exists while the card is hidden (defense in depth — the SafeTextField
-  // type itself carries the no-native-editable-input guarantee, the
-  // Loader gates keep dead instances from piling up at all). `value`
-  // mirrors pickerPath, `edited` writes it back, Enter previews the
-  // current path (confirm-before-integrate).
+  // The integrate-picker URL field: Loader-created so no text input exists
+  // while the card is hidden. `value` mirrors pickerPath, `edited` writes it
+  // back, Enter previews the current path.
   Component {
     id: pickerFieldComp
 
@@ -303,9 +289,8 @@ BorderSurface {
       value: pickerCard.pickerPath
       onEdited: function(v) { pickerCard.pathEdited(v) }
       onAccepted: pickerCard.previewRequested()
-      // Same count as the editor fields: the key catcher stays blocked
-      // while this field types, whatever card is on screen (see
-      // textFieldFocusCount in Panel.qml).
+      // Same count as the editor fields: the key catcher stays blocked while
+      // this field types.
       onActiveFocusChanged: pickerCard.fieldFocusChanged(activeFocus ? 1 : -1)
     }
   }

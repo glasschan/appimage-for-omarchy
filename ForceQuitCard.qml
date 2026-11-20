@@ -3,16 +3,13 @@ import qs.Commons
 import qs.Ui
 import "lib/Model.js" as Model
 
-// Force-quit confirm card. Pure view: the panel owns the pinned trio
-// (id, name, pid count), the confirm handler and the --kill-running
-// grant; this card renders the ask and reports the two buttons.
+// Force-quit confirm card. Pure view: the panel owns the pinned trio (id,
+// name, pid count), the confirm handler and the --kill-running grant.
 //
-// Shown instead of spawning when Update lands on a row the last listing
-// said runs. It names the app and how many processes the confirm will
-// close (the listing's `running_pids`; a count of 0 — unknown — keeps the
-// count-free sentence). Enter confirms, Esc cancels (PanelKeyCatcher
-// wiring in Panel.qml); Cancel spawns nothing and leaves the row as it
-// was.
+// Shown instead of spawning when Update lands on a row the last listing said
+// runs. It names the app and how many processes the confirm will close (a
+// count of 0, unknown, keeps the count-free sentence). Enter confirms, Esc
+// cancels; Cancel spawns nothing.
 BorderSurface {
   id: forceQuitCard
 
@@ -20,8 +17,8 @@ BorderSurface {
   property string forceQuitId: ""
   property string forceQuitName: ""
   property int forceQuitPids: 0
-  // Whether THIS app's background job is active (the panel's jobActive()
-  // on the pinned id): the confirm button never stacks a second job.
+  // Whether THIS app's background job is active: the confirm button never
+  // stacks a second job.
   property bool jobActive: false
   property var strings
   property color foreground
@@ -70,8 +67,8 @@ BorderSurface {
 
       Button {
         text: forceQuitCard.strings.forceQuitConfirm
-        // The confirm card can outlive its row's job-start reply
-        // (a slow backend): never stack a second job by hand.
+        // The confirm card can outlive its row's job-start reply, so never
+        // stack a second job by hand.
         enabled: !forceQuitCard.jobActive
         foreground: forceQuitCard.foreground
         accent: forceQuitCard.urgent

@@ -3,13 +3,11 @@ import Quickshell.Io
 import "lib/Backend.js" as Backend
 import "lib/JobDocs.js" as JobDocs
 
-// Update controller for Panel.qml: the row Update flow, the force-quit
-// consent card and the "Update all" batch. Non-visual wiring — the pinned
-// consent-card state (forceQuitId/Name/Pids, updateAllOpen/Apps/Queue)
-// and the spawn context (updateSpawnCtx) stay on the panel. The spawn
-// runs on the DEDICATED Process/Timer pair owned here: routing it through
-// the shared short-call pair would let any in-flight re-list or update
-// check synthetically fail the click.
+// Update controller for Panel.qml: the row Update flow, the force-quit consent
+// card and the "Update all" batch. Non-visual wiring; the consent-card state and
+// the spawn context stay on the panel. The spawn runs on the DEDICATED
+// Process/Timer pair owned here, because the shared short-call pair would let an
+// in-flight re-list or update check synthetically fail the click.
 Item {
   id: updatesCtl
 
@@ -17,25 +15,18 @@ Item {
   property var panel
 
   // One-click update. The click only spawns: `--update --async` answers
-  // job-started (exit 0) or an error document (exit 1 — e.g. the
-  // active-job refusal) within milliseconds, and the transfer runs
-  // outside this panel's process tree, reaching the row through its job
-  // document. The default 15 s watchdog bounds only the spawn. A running
-  // app is the one exception: the confirm card is shown instead of
-  // spawning. The `running` flag comes from the last --list-installed
-  // poll and can be stale — deliberately not probed at click time.
-  // Stale-but-running only grants a close the backend finds nothing to do
-  // with; stale-but-not-running is caught by the backend (`skipped-
-  // running` banner asks for another Update press, by then the poll has
-  // caught up and the card appears). No confirm otherwise — the backend
-  // replaces the AppImage where it sits.
+  // job-started (exit 0) or an error document (exit 1) within milliseconds, and
+  // the transfer runs outside this panel's process tree, reaching the row
+  // through its job document. A running app is the one exception: the confirm
+  // card is shown instead. The `running` flag comes from the last listing and
+  // can be stale: stale-but-running only grants a close the backend finds
+  // nothing to do with; stale-but-not-running is caught by the backend.
   function requestUpdate(item) {
     if (!item || item.id === "") return
     if (panel.jobActive(item.id)) return
     if (item.running === true) {
-      // Only one consent card at a time: the row's force-quit card
-      // replaces the batch card (and the other way round), so the
-      // keyboard and the eye never face two asks at once.
+      // Only one consent card at a time: the row's force-quit card replaces
+      // the batch card and the other way round.
       dismissUpdateAll()
       panel.forceQuitId = item.id
       panel.forceQuitName = item.name !== "" ? item.name : item.id
@@ -51,9 +42,8 @@ Item {
     panel.forceQuitPids = 0
   }
 
-  // Confirm: run exactly the async job, now with the --kill-running grant
-  // (the backend closes the app at job start and again right before the
-  // atomic replace; its force_quit record feeds the done banner).
+  // Confirm: run exactly the async job, now with the --kill-running grant (the
+  // backend closes the app at job start and again before the atomic replace).
   function confirmForceQuit() {
     var id = panel.forceQuitId
     var name = panel.forceQuitName
@@ -66,9 +56,8 @@ Item {
   //
   // One action for every pending app. The click OPENS the consent card and
   // starts nothing; only the explicit accept spawns the jobs. An app with
-  // no pending release, or whose verdict is false (the backend would
-  // refuse the install), is never named and never closed —
-  // panel.modelApi.pendingUpdateIds applies the badge's own rule.
+  // no pending release, or whose verdict is false, is never named and never
+  // closed.
   function requestUpdateAll() {
     var ids = panel.modelApi.pendingUpdateIds()
     if (ids.length === 0) return
@@ -94,11 +83,9 @@ Item {
     panel.updateAllQueue = []
   }
 
-  // Accept: one background job per app, in the same single-flight spawn
-  // the row's Update button uses (--update --async). The consent card is
-  // the --kill-running grant: the user accepted that running apps are
-  // closed. Each app gets its OWN job, so the backend's per-app claim
-  // still refuses a second update of the same app.
+  // Accept: one background job per app through --update --async. The consent
+  // card is the --kill-running grant. Each app gets its OWN job, so the
+  // backend's per-app claim still refuses a second update of the same app.
   function confirmUpdateAll() {
     if (!panel.updateAllOpen) return
     var apps = panel.updateAllApps
@@ -127,17 +114,14 @@ Item {
   }
 
   function updateItem(item, killRunning) {
-    // Every exit path pumps the "Update all" queue: the batch advances
-    // one app per finished spawn, and a refused spawn must not stall the
-    // apps behind it.
+    // Every exit path pumps the "Update all" queue, so a refused spawn must
+    // not stall the apps behind it.
     if (!item || item.id === "") {
       pumpUpdateAll()
       return
     }
     // Per-app single flight: a row with an active job refuses here (the
-    // button is disabled too; the backend refuses a second job for the
-    // same app regardless). Other rows are never blocked — different
-    // apps update in parallel.
+    // button is disabled too; the backend refuses a second job regardless).
     if (panel.jobActive(item.id)) {
       pumpUpdateAll()
       return
@@ -148,9 +132,9 @@ Item {
       pumpUpdateAll()
       return
     }
-    // Single flight on the spawn pair itself: a second --update --async
-    // while one spawn is still answering would overwrite updateSpawnCtx
-    // and misroute the first reply (same guard as callBackend's).
+    // Single flight on the spawn pair itself: a second --update --async while
+    // one spawn is still answering would overwrite updateSpawnCtx and misroute
+    // the first reply.
     if (panel.updateSpawnCtx && panel.updateSpawnCtx.active === true) {
       pumpUpdateAll()
       return
@@ -168,12 +152,10 @@ Item {
       if (result.ok) {
         var doc = Backend.parseJson(result.stdout)
         if (doc && doc.result === "job-started") {
-          // The row may spin before the job's first document write
-          // lands: adopt a provisional active decision and read the
-          // real document right away. Every later state — including
-          // "the job died before writing anything" — arrives as a
-          // document decision and replaces this, so the spinner can
-          // never outlive its document.
+          // The row may spin before the job's first document write lands: adopt
+          // a provisional active decision and read the real document right
+          // away. Every later state replaces this, so the spinner can never
+          // outlive its document.
           panel.jobStartGraces[item.id] = Date.now()
           panel.modelApi.adoptJobDecision(item.id,
             JobDocs.provisionalActiveDecision(item.id))
@@ -183,32 +165,29 @@ Item {
             panel.strings.backendFailed + " (update)"), item.id)
         }
       } else {
-        // Refusals arrive as error documents — the backend's own message
-        // (the active-job refusal names the pid) surfaces verbatim.
+        // Refusals arrive as error documents; the backend's own message
+        // surfaces verbatim.
         panel.reportFailure(result, "update", item)
       }
       panel.syncFromModel()
-      // Converge the row with whatever its job document says now — the
-      // refusal case too, where the already-running job's document is
-      // exactly what the row should show.
+      // Converge the row with whatever its job document says now; in the
+      // refusal case the already-running job's document is what the row should
+      // show.
       panel.queueJobRead(item.id)
       panel.pumpJobReads()
-      // The spawn pair is free again: the next pending app of an
-      // "Update all" batch may start.
+      // The spawn pair is free again: the next pending app of an "Update all"
+      // batch may start.
       pumpUpdateAll()
     })
-    // A synchronous onDone (no-backend-command) has already finished by
-    // the time this line runs; ctx.active is false then, the ctx stays
-    // null — same convention as probePython.
+    // A synchronous onDone (no-backend-command) has already finished; ctx.active
+    // is false then, the ctx stays null.
     panel.updateSpawnCtx = ctx && ctx.active ? ctx : null
   }
 
   // Dedicated spawn pair for --update --async: the click must never queue
-  // behind the shared backendProc's single flight — a 10 s re-list poll or
-  // a 120 s --list-updates check in flight would synthetically fail the
-  // spawn. Same declarative wiring as the panel's backendProc; the default
-  // 15 s watchdog bounds only the spawn itself, never the detached
-  // transfer.
+  // behind the shared backendProc's single flight, which would synthetically
+  // fail the spawn. The default 15 s watchdog bounds only the spawn, never the
+  // detached transfer.
   Process {
     id: updateSpawnProc
     command: []
