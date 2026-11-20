@@ -27,13 +27,15 @@ badge turns urgent and counts them.
 Errors are never silent: a hung backend or invalid JSON surfaces as a
 dismissible banner in the panel, and a missing `python3` swaps the panel
 body for an authorized-install card (see *Install → Python dependency*).
-A launch that never comes up — checked against the process list after a
-short grace, since a spawn either starts or dies within moments — raises
-its own banner; when the backend's best-effort probe reports the fuse2
-runtime library (`libfuse.so.2`) missing, that banner adds one text-only
-line naming it as the most common cause. No command, no button: the hint
-names the library and nothing more, and a `present` or `unknown` probe
-never adds it.
+A launch that never comes up — checked against the process list
+shortly after the click, since a spawn either starts or dies within
+moments — raises its own banner; when the backend's best-effort probe
+reports the fuse2 runtime library (`libfuse.so.2`) missing, that banner adds
+one text-only line naming it as the most common cause. No command, no
+button: the hint names the library and nothing more, and a `present` or
+`unknown` probe never adds it. A quit the user made themselves is not a
+launch failure: the check has a short window, and a longer gap retires the
+verdict silently instead of blaming the launch.
 Status messages auto-clear after 5 s; errors stay until dismissed. A
 backend call that overruns its watchdog reports a timeout — never a
 misleading "python3 missing" hint.
@@ -368,6 +370,30 @@ named after the plugin id), and publishes a GitHub Release with
 auto-generated notes. Running the workflow manually (`workflow_dispatch`)
 is a dry run: the zip is uploaded as a build artifact and nothing is
 published.
+
+### 0.12.1
+
+- **Closed-panel notices are dismissed with the panel.** In-panel status
+  lines and error banners live in the engine-wide store, which outlives the
+  panel QML object. A notice still showing when the panel closed was
+  re-mirrored on every reopen — and a status line could never clear itself,
+  because its 5 s auto-hide timer died with the panel. Closing the panel now
+  dismisses both. An integrate that dies with the panel keeps its own
+  interruption explanation.
+- **A removed app can be added back.** `already_integrated` compared the
+  picked file's bytes against every AppImage in the managed folder, so a
+  leftover with no desktop entry behind it — an app whose `.desktop` file
+  was removed, a stale `apps.ini` record, or the managed copy the user
+  re-picked — matched itself and blocked the integrate with
+  "Already integrated". Only apps the installed listing reports count now;
+  everything else installs normally.
+- **A normal quit no longer reads as a failed launch.** The launch verdict
+  is armed on the click and settled by the next listing that starts after
+  it — but that click closes the panel and destroys the 1.5 s settle
+  timer, so the verdict could wait until the *next* open, long after the
+  app had been launched, used and quit. A present, non-running row then
+  raised "did not start." The verdict now retires silently past its 30 s
+  window instead of blaming a healthy launch.
 
 ### 0.12.0
 

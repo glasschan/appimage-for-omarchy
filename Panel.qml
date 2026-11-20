@@ -847,6 +847,21 @@ Panel {
   function readDropPayload(payloadJson) { return integrateCtl.readDropPayload(payloadJson) }
   function tryConsumePendingDrop() { return integrateCtl.tryConsumePendingDrop() }
 
+  // In-panel notices (status line and error banner) are VISIT-scoped, not
+  // store-scoped (reported 2026-11-20): the store outlives this QML object,
+  // so a notice left showing at close was re-mirrored on every reopen.
+  // Worse for a status line — its auto-hide timer dies with the panel, so it
+  // could never clear itself and came back on every visit. Both are
+  // dismissed when the panel closes; the destruction path calls this before
+  // it raises its own integrateInterrupted notice, which is deliberately
+  // later.
+  function dismissNotices() {
+    statusTimer.stop()
+    if (Model.state.status === "" && Model.state.lastError === "") return
+    Model.clearStatus()
+    Model.clearError()
+  }
+
   Component.onCompleted: {
     // Release flags a DESTROYED panel instance left behind. Only a fresh
     // instance can run this: closing the panel unloads this whole QML
@@ -870,7 +885,9 @@ Panel {
     // SIGTERM). A killed integrate can never write its own outcome, so say
     // so: the next open explains the vanished download instead of showing
     // a stuck spinner. The flags themselves are released by open()'s
-    // releaseOrphanedRuns().
+    // releaseOrphanedRuns(). Any notice the visit still showed is dropped
+    // FIRST, so only the interruption explanation can survive the reload.
+    dismissNotices()
     if (Model.state.busy.integrate) {
       Model.setError(strings.integrateInterrupted)
     }
@@ -893,6 +910,9 @@ Panel {
       // Same rule for the #27 confirm card: a force-quit decision belongs
       // to the visit that asked for it, never to a later open.
       root.dismissForceQuit()
+      // In-panel notices die with the visit: see dismissNotices().
+      root.dismissNotices()
+      syncFromModel()
     }
   }
 

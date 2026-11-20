@@ -293,20 +293,93 @@ class ListingMixin:
         logging.info('re-pointed desktop entry at the current plugin '
                      'directory: %s', desktop_path)
 
-    def is_installed(self, el: AppImageListElement) -> bool:
-        if el.file_path and os.path.exists(self._get_appimages_default_destination_path()):
-            default_folder = self._get_appimages_default_destination_path()
-            for file_name in os.listdir(default_folder):
-                installed_path = os.path.join(default_folder, file_name)
+    def _integrated_appimage_paths(self) -> set:
+        """Real paths of the AppImages an installed desktop entry backs.
 
-                if self.can_install_file(installed_path):
-                    try:
-                        if filecmp.cmp(installed_path, el.file_path,
-                                       shallow=False):
-                            el.file_path = installed_path
-                            return True
-                    except OSError as e:
-                        logging.debug('compare failed: %s', e)
+        Read-only on purpose: `is_installed` also runs on the preview path,
+        which must never write (CONTRACT.md), so this does not go through
+        list_installed() and its entry repairs. Both shapes count: an
+        apps.ini record whose desktop file is still on disk, and a desktop
+        entry whose TryExec names an AppImage (an install older than the
+        records, or one whose apps.ini entry was lost)."""
+        paths = set()
+        dangling = set()
+        for _section_key, rec in Config.iter_app_records():
+            desktop_path = rec.get('desktop_file_path', '')
+            appimage_path = (rec.get('appimage_path', '')
+                             or rec.get('file_path', ''))
+            if not appimage_path:
+                continue
+            if desktop_path and os.path.exists(desktop_path):
+                paths.add(os.path.realpath(appimage_path))
+            elif desktop_path:
+                dangling.add(desktop_path)
+        if not os.path.isdir(self.user_desktop_files_path):
+            return paths
+        for file_name in os.listdir(self.user_desktop_files_path):
+            desktop_path = os.path.join(self.user_desktop_files_path,
+                                        file_name)
+            # A stale record's desktop file is gone, so it cannot be this
+            # one; skip nothing else, the listing is the authority either way.
+            if not os.path.isfile(desktop_path) or desktop_path in dangling:
+                continue
+            try:
+                entry = DesktopEntry(path=desktop_path)
+                exec_location = entry.getTryExec()
+            except Exception as e:
+                logging.debug('is_installed: %s unreadable: %s',
+                              desktop_path, e)
+                continue
+            if exec_location:
+                paths.add(os.path.realpath(exec_location))
+        return paths
+
+    def is_installed(self, el: AppImageListElement) -> bool:
+        """True when this element's bytes are an app the plugin integrates.
+
+        A content match inside the managed folder is not enough (reported
+        2026-11-20): the folder also holds leftovers that were never (or no
+        longer) integrated — an AppImage whose .desktop file was removed, or
+        the very file the user re-picked. Claiming "already integrated" for
+        those made a removed app impossible to add back. Only a file a
+        desktop entry backs can match, and a file that is one of those is
+        installed by definition.
+        """
+        if not el.file_path:
+            return False
+
+        integrated_real = self._integrated_appimage_paths()
+        if not integrated_real:
+            return False
+
+        real_source = os.path.realpath(el.file_path)
+        if real_source in integrated_real:
+            return True
+
+        default_folder = self._get_appimages_default_destination_path()
+        if not os.path.exists(default_folder):
+            return False
+        for file_name in os.listdir(default_folder):
+            installed_path = os.path.join(default_folder, file_name)
+            try:
+                real_candidate = os.path.realpath(installed_path)
+            except OSError:
+                continue
+            # Never compare a file with itself: the source IS the candidate
+            # when the user re-picked the managed copy, and a bare leftover
+            # would otherwise always match.
+            if real_candidate == real_source:
+                continue
+            if real_candidate not in integrated_real:
+                continue
+            if self.can_install_file(installed_path):
+                try:
+                    if filecmp.cmp(installed_path, el.file_path,
+                                   shallow=False):
+                        el.file_path = installed_path
+                        return True
+                except OSError as e:
+                    logging.debug('compare failed: %s', e)
 
         return False
 

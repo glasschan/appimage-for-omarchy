@@ -148,8 +148,12 @@ file (GearLever's `move-appimage-on-integration` default).
 
 - `--yes` is **required** with `--json` (no interactive prompts), otherwise
   exit code 2.
-- Integrating a file whose content already matches an installed AppImage
-  prints `already-integrated` and exits 0 (nothing is changed).
+- Integrating a file whose content already matches **an app a desktop
+  entry backs** prints `already-integrated` and exits 0 (nothing
+  is changed). A bare file left in the managed folder that no desktop entry
+  backs (a removal leftover, an orphaned record, or the file the user
+  re-picked) is NOT integrated: it installs normally, so a removed app can
+  always be added back.
 - Name conflict (same app, different content): default keeps both — the
   second copy gets a version-suffixed filename and a `Name (version)`
   desktop name (GearLever behaviour). `--replace` overwrites the existing
@@ -276,12 +280,15 @@ entry also names the fetch `policy` it will run under (`reduced`, or `null`
 when nothing is fetched) — see Fetch policies.
 
 Flags: `already_integrated` is true when the file's content already
-matches an installed AppImage (integrate would print
+matches an app a desktop entry backs (integrate would print
 `already-integrated` and change nothing; `destination.path` is then the
-installed file itself). `name_conflict` is true when another version of
-the same app is installed (integrate keeps both — the derived
-`destination` already carries the version-suffixed, non-clobbering file
-name — or replaces it with `--replace`).
+installed file itself). A file that merely sits in the managed folder
+without a desktop entry backing it — a removal leftover or the very file
+the user re-picked — is not integrated and previews as a normal install.
+`name_conflict` is true when another version of the same app is installed
+(integrate keeps both — the derived `destination` already carries the
+version-suffixed, non-clobbering file name — or replaces it with
+`--replace`).
 
 Plain text (no `--json`): a short human-readable preview block.
 
@@ -1131,7 +1138,7 @@ Other `result` values: `already-integrated` (exit 0, app unchanged).
 | `verification` | The matrix above; `note` is the exact sentence the panel may render verbatim |
 | `destination` | For a local file: folder + exact file name + full path, derived with the install-time naming helper (conflict suffixing included; `path` is the installed file itself when `already_integrated`). For a URL: only `folder` is known — `filename`/`path` are `null`, the final name comes from the artifact's embedded desktop entry at integrate time |
 | `app` | Local files only: `name`/`version` read in place from the embedded desktop entry; `null` when the entry cannot be read in place (the preview stays valid) or for URLs (nothing was downloaded) |
-| `already_integrated` | Content already matches an installed AppImage |
+| `already_integrated` | Content already matches an app a desktop entry backs (a bare managed-folder leftover does not count) |
 | `name_conflict` | Another version of the same app is installed |
 | `advisory` | Always `true`; the integrate command re-classifies/re-verifies at its own runtime |
 
