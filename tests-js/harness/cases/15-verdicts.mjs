@@ -105,19 +105,16 @@ export function run() {
                    { fuse2: "present" }, armedAt + 32) === false)
   Model.clearError()
 
-  // A verdict that survived the panel's close settles on the NEXT listing —
-  // so the window matters (reported 2026-11-20): if that listing only runs
-  // after the user already launched, used and quit the app, "not running"
-  // says nothing about the launch. Past the window the verdict retires
-  // silently instead of raising a false "did not start." banner.
+  // A verdict armed by a panel that closes before any listing can judge it
+  // must be retired, not handed to a later listing: after that close nothing
+  // observes the launch, and "not running" after a normal quit says nothing.
   Model.clearError()
-  const stale = armedAt + 32
-  Model.armLaunchVerdict("launch.desktop", stale)
-  const staleSettled = Model.setItems([launchRow({ running: false })],
-                                      { fuse2: "missing" }, stale + 30001)
-  check("#47 a verdict past its window retires without a banner",
-    staleSettled === false && Model.state.launchVerdict === null
+  Model.armLaunchVerdict("launch.desktop", armedAt + 32)
+  check("#47 dropping an armed verdict retires it",
+    Model.dropLaunchVerdict() === true && Model.state.launchVerdict === null
     && Model.state.lastError === "")
+  check("#47 dropping an unarmed verdict is harmless",
+    Model.dropLaunchVerdict() === false && Model.state.launchVerdict === null)
 
   // ---- #50 the pending verdict survives the listing -------------------------
   // The verdict used to have two owners: the check response set it and the

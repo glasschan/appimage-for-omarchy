@@ -563,19 +563,16 @@ Panel {
     if (!item || item.path === "") return
     Quickshell.execDetached(launchArgvFor(item))
     Model.markRunning(item.id, true)
-    // Arm the launch verdict in the STORE (ticket #47): spawn success says
-    // nothing about the AppImage runtime, and this click closes the panel,
-    // so the verdict has to outlive this object. Any later listing settles
-    // it — the timer below only asks for one soon.
-    Model.armLaunchVerdict(item.id)
-    launchSettleTimer.restart()
-    // The panel is a full-screen overlay with exclusive keyboard focus, so
-    // a freshly launched app would sit behind it and the user would have
-    // to press Escape first. Close through the existing close path
-    // (requestClose) so the shell's openPanelIds bookkeeping stays
-    // consistent. A pinned panel is a compact floating window that is
-    // meant to stay open.
-    if (!root.pinned) root.requestClose()
+    // Only a panel that stays open can judge the launch: its settle timer
+    // asks for the listing. The unpinned panel below closes itself on click
+    // and takes the timer with it, so arming there would leave a verdict no
+    // listing can observe — the next open would then blame a normal quit.
+    if (root.pinned) {
+      Model.armLaunchVerdict(item.id)
+      launchSettleTimer.restart()
+    } else {
+      root.requestClose()
+    }
   }
 
   // First click arms the inline confirmation, second click runs --remove
@@ -912,6 +909,10 @@ Panel {
       root.dismissForceQuit()
       // In-panel notices die with the visit: see dismissNotices().
       root.dismissNotices()
+      // An armed launch verdict dies with the visit too: after this close
+      // no listing can observe the launch, so letting the next open's
+      // refresh judge it would raise a false "did not start." banner.
+      Model.dropLaunchVerdict()
       syncFromModel()
     }
   }
