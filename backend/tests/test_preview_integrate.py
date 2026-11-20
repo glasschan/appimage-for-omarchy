@@ -155,6 +155,42 @@ class LocalPreviewTests(InProcessCliMixin, OfflinePreviewMixin,
             self.managed_dir + os.sep))
         self.assertIn('Neovim', doc['app']['name'])
 
+    def test_managed_folder_leftover_is_not_already_integrated(self):
+        # Reported 2026-11-20: a file in the managed folder that the plugin
+        # does NOT integrate — a removal left it behind (a stale integration
+        # record, a hand-deleted .desktop entry), or the user re-picked the
+        # managed copy — used to match ITSELF in the content scan and report
+        # "already integrated", so the app could never be added back.
+        os.makedirs(self.managed_dir, exist_ok=True)
+        leftover = os.path.join(self.managed_dir, 'leftover.appimage')
+        with open(leftover, 'wb') as f:
+            f.write(make_minimal_elf())
+
+        out, err, code = self._preview(leftover)
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        self.assertFalse(doc['already_integrated'])
+        # nothing installed means no name conflict either: this is a plain
+        # new integrate, with the install-time destination derived normally
+        self.assertFalse(doc['name_conflict'])
+
+    def test_stale_record_leftover_is_not_already_integrated(self):
+        # The other shape of the same bug: apps.ini still records the app,
+        # its .desktop file was removed, and the AppImage stayed in the
+        # managed folder. The listing cannot see it (desktop-driven), so a
+        # content match must not claim it is integrated.
+        appimage, desktop, _icon = self.install_fake_app(
+            desktop_name='orphan', app_name='Orphan App')
+        os.remove(desktop)
+        # a real (bare) ELF header: the preview reads the arch from the file
+        with open(appimage, 'wb') as f:
+            f.write(make_minimal_elf())
+
+        out, err, code = self._preview(appimage)
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        self.assertFalse(doc['already_integrated'])
+
     def test_name_conflict_with_installed_app_is_flagged(self):
         # another version of the same app installed: preview must flag
         # that integrate would keep both (or replace with --replace),
