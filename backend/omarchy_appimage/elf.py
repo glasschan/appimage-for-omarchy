@@ -1,12 +1,11 @@
 # elf.py — ELF header parsing for AppImages (Python stdlib only).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# GearLever computed the embedded squashfs offset by shelling out to
-# `get_appimage_offset` (od + awk) or `file` for the architecture; both
-# are reimplemented here with `struct` so that no external tools are
-# required. The offset logic mirrors GearLever's
-# build-aux/get_appimage_offset.sh: the squashfs image starts right
-# after the last ELF section header, i.e. e_shoff + e_shentsize*e_shnum.
+#
+# GearLever shelled out to `get_appimage_offset` (od + awk) and `file`; both
+# are reimplemented here with `struct`. The offset logic mirrors upstream:
+# the squashfs image starts right after the last ELF section header, i.e.
+# e_shoff + e_shentsize*e_shnum.
 
 import struct
 
@@ -97,10 +96,9 @@ def get_elf_arch(path: str) -> str:
     return 'UNKNOWN'
 
 
-# Round-8 review: the section-name string table's size, every section's
-# sh_size, and the section names themselves are attacker-controlled
-# fields read straight from the file — all three are capped before they
-# can size an allocation.
+# The section-name string table's size, every section's sh_size, and the
+# section names themselves are attacker-controlled fields, so all three
+# are capped before they can size an allocation.
 MAX_SECTION_NAME_TABLE = 1 << 20   # 1 MiB of section names is generous
 MAX_ELF_SECTION_NAME = 255         # kernel NAME_MAX; longer is malformed
 MAX_UPD_INFO_BYTES = 4096          # .upd_info holds one update URL
@@ -201,10 +199,9 @@ def read_upd_info(path: str) -> str:
     `.upd_info` section (e.g. 'gh-releases-zsync|owner|repo|latest|*.zsync'),
     or '' when the section is missing or empty.
 
-    Replaces GearLever's `readelf --string-dump=.upd_info` subprocess
-    (UpdateManagerChecker.check_app_embedded_url) with a direct section
-    read; the AppImageSpec puts the update information in this section of
-    the runtime header."""
+    Replaces GearLever's `readelf --string-dump=.upd_info` subprocess with
+    a direct section read; the AppImageSpec puts the update information in
+    this section of the runtime header."""
     for name, offset, size in _read_sections(path):
         if name != '.upd_info':
             continue

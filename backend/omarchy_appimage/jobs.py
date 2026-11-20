@@ -3,15 +3,14 @@
 #
 # One document per app at $XDG_STATE_HOME/io.github.glasschan.appimage/
 # jobs/<desktop id>.json, written by the detached --update --async runner
-# (cli._job_entrypoint) and read by any CLI invocation. Every rewrite is
-# atomic (utils.atomic_write: temp file + os.replace), so a reader always
-# sees a complete document.
+# and read by any CLI invocation. Every rewrite is atomic
+# (utils.atomic_write), so a reader always sees a complete document.
 #
-# `interrupted` is NEVER written by anyone: it is a reader-side
-# classification (classify_job) for a non-terminal document whose process
-# is gone or whose heartbeat went stale. Phases a writer sets:
-#   starting | downloading | verifying | replacing | done | error
-# Terminal phases are `done` and `error` only.
+# `interrupted` is NEVER written: it is a reader-side classification
+# (classify_job) for a non-terminal document whose process is gone or
+# whose heartbeat went stale. Writer phases: starting | downloading |
+# verifying | replacing | done | error. Terminal phases are `done` and
+# `error` only.
 
 import fcntl
 import json
@@ -28,30 +27,27 @@ JOB_SCHEMA_VERSION = 1
 
 # Non-terminal phases a writer sets. `verifying` is best-effort: it is
 # entered from the download progress callback reaching the top fraction,
-# so sources that send no Content-Length never show it.
+# so sources with no Content-Length never show it.
 ACTIVE_PHASES = ('starting', 'downloading', 'verifying', 'replacing')
 TERMINAL_PHASES = ('done', 'error')
 
 # Liveness rule (CONTRACT.md): a job is ACTIVE iff its phase is
 # non-terminal AND its pid is alive AND its heartbeat is fresher than
-# this threshold. 120 s sits comfortably above the downloader's 30 s
-# per-read stall guard, so a slow-but-alive download is never
-# misclassified as interrupted.
+# this threshold. 120 s sits above the downloader's 30 s per-read stall
+# guard, so a slow-but-alive download is never misclassified.
 JOB_STALE_AFTER_SECONDS = 120
 
-# The grandchild refreshes the heartbeat at least this often (progress
-# callbacks rewrite the document too; this thread covers the phases no
-# progress callback fires in — verification, replace, long stalls).
+# The grandchild refreshes the heartbeat this often (progress callbacks
+# rewrite the document too; this thread covers verification, replace and
+# long stalls).
 JOB_HEARTBEAT_INTERVAL_SECONDS = 2.0
 
-# Progress fraction at or above this means the response body is fully
-# received and the source's digest verification is running.
+# Progress fraction at or above this means the body is fully received and
+# digest verification is running.
 JOB_VERIFY_FRACTION = 0.999
 
-# The per-job log is truncated on open when it has grown past this, and
-# the running job drops it back to empty whenever it passes the same cap
-# (a verification/replace phase can log for as long as it likes; what the
-# log must never do is grow past this bound).
+# The per-job log is truncated on open when past this bound, and the
+# running job drops it back to empty whenever it passes the same cap.
 JOB_LOG_MAX_BYTES = 256 * 1024
 
 # Desktop ids are basenames of .desktop files; the job file name must
@@ -66,8 +62,7 @@ def jobs_dir() -> str:
 def is_usable_desktop_id(desktop_id) -> bool:
     """Whether `desktop_id` can name a job file — the rule _job_stem
     enforces, exposed so a caller can refuse EARLY (a .desktop filename
-    may legally hold a space or a non-ASCII char; a job file name may
-    not)."""
+    may hold a space or a non-ASCII char; a job file name may not)."""
     if not isinstance(desktop_id, str):
         return False
     stem = desktop_id[:-8] if desktop_id.endswith('.desktop') \
@@ -166,27 +161,20 @@ def active_job(desktop_id: str):
 
 def open_job_log_fd(desktop_id: str) -> int:
     """Writable (append-mode) fd for the per-job log, living next to the
-    job document — AND the job's atomic claim.
+    job document, and the job's atomic claim.
 
-    The claim is an exclusive, non-blocking flock on this very open file
-    description: the kernel grants it to exactly one live job, and drops
-    it when the last descriptor for that description closes (process
-    death included). There is deliberately no claim FILE, so there is
-    nothing that can go stale. The detached runner inherits this
-    description through the fork and keeps it alive for its whole life
-    via the dup2'd stdout/stderr; the spawning parent closes its copy.
-    That is what makes "--async refuses immediately" true even when two
-    starts race before either job has written a document (the active-job
-    document only exists once the grandchild writes it).
+    The claim is an exclusive, non-blocking flock on this open file
+    description: the kernel grants it to one live job and drops it when
+    the last descriptor closes, process death included. There is no claim
+    FILE, so nothing can go stale. The detached runner inherits this
+    description through the fork via the dup2'd stdout/stderr; the
+    spawning parent closes its copy, which is what makes --async refuse
+    immediately even when two starts race.
 
-    Raises BlockingIOError when another live job already holds the
-    claim. Size cap: the truncation runs only AFTER the claim is held,
-    so a refused second start can never wipe the log of the job that is
-    still writing it; while the job runs, JobWriter.enforce_log_cap
-    keeps the log inside the same bound.
-
-    The caller owns the fd (single owner: the spawner's caller closes it
-    once the grandchild has inherited it)."""
+    Raises BlockingIOError when another live job holds the claim. The
+    truncation runs only AFTER the claim is held, so a refused second
+    start cannot wipe the log of the job still writing it. The caller owns
+    the fd."""
     path = job_log_path(desktop_id)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -200,16 +188,14 @@ def open_job_log_fd(desktop_id: str) -> int:
 
 
 def claim_held(desktop_id: str) -> bool:
-    """True when some live run holds this app's update claim (issue #46).
+    """True when some live run holds this app's update claim.
 
     `active_job` answers from the job DOCUMENT, which only exists once the
-    async grandchild writes it — a synchronous `--update` holds the claim
+    async grandchild writes it; a synchronous `--update` holds the claim
     while writing nothing. Removal has to ask the claim itself, or it
-    could uninstall an app the sync path is replacing. This never
-    truncates and never creates anything: it opens the log (which the
-    claim's holder already created), tries the same exclusive flock, and
-    closes its own descriptor, so the kernel drops only this probe.
-    """
+    could uninstall an app the sync path is replacing. This creates
+    nothing: it opens the log, tries the same flock, and closes its own
+    descriptor."""
     path = job_log_path(desktop_id)
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -290,10 +276,9 @@ class JobWriter:
                 size = getattr(manager, 'download_size', None) \
                     if manager is not None else None
                 if size:
-                    # declared at the availability check — for .zsync
+                    # declared at the availability check; for .zsync
                     # sources that is the CONTROL FILE's size, so
-                    # mid-download byte counts are approximate; the
-                    # terminal rewrite carries the exact downloaded bytes
+                    # mid-download byte counts are approximate
                     self._doc['total_bytes'] = int(size)
             elif stage == 'replacing':
                 self._doc['message'] = 'installing the downloaded release'
@@ -321,15 +306,13 @@ class JobWriter:
     def finish(self, status: str, message: str, new_version: str = None,
                downloaded_bytes: int = None, error: str = None,
                force_quit: dict = None):
-        """Terminal rewrite: phase `done` (status updated / up-to-date /
-        skipped-running) or `error` (status error, text in `error`).
+        """Terminal rewrite: phase `done` or `error`.
 
-        `force_quit` is the additive ticket-26 record of the processes
-        that had to be closed for the update ({"count": int,
-        "sigkill": bool}); it is written ONLY when something was actually
-        closed, so a document that never touched a process keeps its
-        original key set. `schema_version` stays 1 and no phase or status
-        value is added."""
+        `force_quit` is the additive record of the processes that had to
+        be closed for the update ({"count": int, "sigkill": bool}); it is
+        written ONLY when something was actually closed, so a document
+        that never touched a process keeps its original key set. No
+        schema key or phase value is added."""
         phase = 'error' if status == 'error' else 'done'
         with self._lock:
             self._doc['phase'] = phase
@@ -352,8 +335,7 @@ class JobWriter:
     def finish_error(self, message: str, force_quit: dict = None):
         """The error terminal document. `force_quit` is threaded through
         like finish()'s: a job that closed the app and THEN failed has to
-        say so, or the document claims nothing was closed while the user's
-        app is gone."""
+        say so."""
         self.finish('error', message, error=message, force_quit=force_quit)
 
     # ---------------------------------------------------------- heartbeat
@@ -361,16 +343,11 @@ class JobWriter:
     def enforce_log_cap(self):
         """Keep the log inside JOB_LOG_MAX_BYTES while the job runs.
 
-        Capping on open alone is not enough: one long run (a slow
-        download, a verification or replace phase that keeps talking)
-        writes past the cap and the log then grows without bound. Dropping
-        the log back to empty when it passes the cap keeps the bound
-        exact and leaves the most recent phase in it — the fd is
-        O_APPEND, so the job's next line lands at offset 0 again.
-
-        Safe only because this writer OWNS the job's claim (the flock
-        open_job_log_fd took): no second job can be interleaving lines
-        here."""
+        Capping on open alone is not enough: one long run writes past the
+        cap and the log grows without bound. Dropping it back to empty
+        keeps the bound exact and leaves the most recent phase; the fd is
+        O_APPEND, so the next line lands at offset 0. Safe only because
+        this writer OWNS the claim (the flock open_job_log_fd took)."""
         try:
             path = job_log_path(self.desktop_id)
             if os.path.getsize(path) > JOB_LOG_MAX_BYTES:
@@ -393,7 +370,7 @@ class JobWriter:
                 self._write()
                 self.enforce_log_cap()
             except OSError:
-                # state dir vanished mid-job: keep the job running, the
+                # state dir vanished mid-job: keep the job running; the
                 # document just stops refreshing (reads as interrupted)
                 return
 

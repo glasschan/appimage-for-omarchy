@@ -1,4 +1,4 @@
-# integrate.py — the --integrate and --preview-integrate verbs (ticket #56).
+# integrate.py — the --integrate and --preview-integrate verbs.
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # Everything URL-shaped lives here too: the release-URL classifier, the
@@ -6,8 +6,8 @@
 # URL triggers. --integrate is the single authority: it downloads,
 # verifies and installs; --preview-integrate is the offline, advisory
 # preview of the same classification. The fetch itself lives in updaters
-# under the REDUCED policy (issue #45); GitHub assets are demanded with
-# the digest under both policies.
+# under the REDUCED policy; GitHub assets are demanded with the digest
+# under both policies.
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
 
@@ -45,18 +45,17 @@ def _get_file_from_args(args) -> str:
 
 
 # Progress documents fire on percent changes of the declared
-# Content-Length; a server that sends none cannot be divided into
-# percent steps, so bytes are reported every _NO_LENGTH_REPORT_BYTES
-# instead (ticket #58).
+# Content-Length; a server that sends none cannot be divided into percent
+# steps, so bytes are reported every _NO_LENGTH_REPORT_BYTES instead.
 _NO_LENGTH_REPORT_BYTES = 32 * 1024 * 1024
 
 
 class _IntegrateProgress:
-    """The `event: progress` line emitter for `--integrate <url> --json`
-    (ticket #58). A plain run constructs nothing, so its human output is
-    untouched. Every document is flushed when written: stdout is
-    block-buffered when piped, and unflushed events would arrive in one
-    burst after the transfer and show nothing."""
+    """The `event: progress` line emitter for `--integrate <url> --json`.
+    A plain run constructs nothing, so its human output is untouched.
+    Every document is flushed when written: stdout is block-buffered when
+    piped, and unflushed events would arrive in one burst after the
+    transfer."""
 
     def __init__(self):
         self._percent = None
@@ -87,8 +86,8 @@ class _IntegrateProgress:
 
 def _fetch_integrate_artifact(kind: str, info: dict, raw_url: str,
                               dest_dir: str, byte_cb=None):
-    # The fetch itself lives in updaters (issue #45); its refusals are
-    # UpdateError, which this CLI layer reports as an operation failure.
+    # The fetch itself lives in updaters; its refusals are UpdateError,
+    # which this CLI layer reports as an operation failure.
     try:
         return _fetch_integrate_artifact_through_source(kind, info, raw_url,
                                                         dest_dir, byte_cb)
@@ -100,19 +99,17 @@ def _fetch_integrate_artifact_through_source(kind: str, info: dict,
                                              raw_url: str, dest_dir: str,
                                              byte_cb=None):
     """Fetch the artifact for a classified URL, returning
-    (file_path, kind, info) — `kind`/`info` are updated on the case 3-5
-    fallback to a static install and carry the `pattern` computed from the
-    release tag for the auto-source step. `byte_cb` threads the transfer
-    progress through to net.download_to_file (ticket #58)."""
+    (file_path, kind, info). `kind`/`info` are updated on the case 3-5
+    fallback to a static install and carry the `pattern` for the
+    auto-source step. `byte_cb` threads transfer progress."""
     # Every download below goes through updaters' fetchers under the
-    # REDUCED policy (issue #45): the user pasted this URL, so its lack of
-    # a publisher digest is their choice — while --update always fetches
-    # under the strict one.
+    # REDUCED policy: the user pasted this URL, so its lack of a publisher
+    # digest is their choice, while --update always fetches under the
+    # strict one.
     policy = updaters.POLICY_REDUCED
     magic = appimage_provider.can_install_file
     if kind == 'github':
-        # GitHub does publish digests, so its assets are demanded, digest
-        # or no digest, whichever policy brought the caller here.
+        # GitHub does publish digests, so its assets are demanded with one.
         return (updaters.download_github_asset(
             dict(info, url=raw_url), dest_dir, updaters.POLICY_STRICT,
             magic, byte_cb=byte_cb), kind, info)
@@ -144,10 +141,9 @@ def _fetch_integrate_artifact_through_source(kind: str, info: dict,
 def _find_name_conflict(list_element):
     """The installed element that is another version of the same app,
     detected either by display name or by the original (un-suffixed) name
-    recorded in X-AppImage-Name — GearLever's CLI only compares names,
-    which never matches apps that were integrated with the
-    "Name (version)" keep-both suffix. Shared by --integrate and
-    --preview-integrate."""
+    recorded in X-AppImage-Name. GearLever's CLI only compares names,
+    which never matches apps integrated with the "Name (version)"
+    keep-both suffix."""
     already_installed = None
     for a in appimage_provider.list_installed():
         original_name = ''
@@ -180,9 +176,8 @@ def cmd_integrate(args: list) -> int:
     url_kind = None
     url_info = None
     tmp_cleanup = None
-    # The progress stream (ticket #58) exists only for a URL integrate
-    # under --json: a plain run emits nothing, and a local-file integrate
-    # has no transfer to report.
+    # The progress stream exists only for a URL integrate under --json: a
+    # plain run emits nothing, and a local-file integrate has no transfer.
     progress = _IntegrateProgress() if (json_output and _is_url(target_arg
                                                                 or '')) \
         else None
@@ -210,9 +205,9 @@ def cmd_integrate(args: list) -> int:
         if appimage_provider.is_installed(list_element):
             # already integrated: nothing is installed. When the URL names a
             # release tag and the installed entry states no version of its
-            # own, record it there (metadata repair only, v0.9.4) —
-            # re-integrating the same URL is otherwise a dead end for an
-            # install made before the plugin knew how to fill it in.
+            # own, record it there (metadata repair only): re-integrating
+            # the same URL is otherwise a dead end for an install made
+            # before the plugin knew how to fill it in.
             if url_kind and appimage_provider.apply_version_to_installed(
                     list_element, (url_info or {}).get('version', '')):
                 logging.info('recorded release version %s on the installed '
@@ -232,11 +227,11 @@ def cmd_integrate(args: list) -> int:
         list_element.update_logic = AppImageUpdateLogic.KEEP
         appimage_provider.refresh_data(list_element)
         # A release tag is a real version even when the image forgets to
-        # embed one (v0.9.4): integrating from
+        # embed one: integrating from
         # .../releases/download/v0.9.0/Terax_0.9.0_amd64.AppImage used to
-        # produce an app with no version at all. The tag the user pasted
-        # describes the file better than nothing, and install_file then
-        # writes it as X-AppImage-Version and in the desktop Name suffix.
+        # produce an app with no version. The tag describes the file
+        # better than nothing, and install_file writes it as
+        # X-AppImage-Version and in the desktop Name suffix.
         if url_kind:
             appimage_provider.apply_release_version(
                 list_element, (url_info or {}).get('version', ''))
@@ -302,10 +297,9 @@ def cmd_integrate(args: list) -> int:
 def _verification_preview(kind: str) -> dict:
     """The verification block of the preview document: what --integrate
     will verify at its own runtime, derived from the same offline URL
-    classification. The digest itself is only fetched at integrate
-    time; a .zsync control file's SHA-1 line is likewise only read then
-    (the preview stays offline), so the zsync note spells out the
-    conditional."""
+    classification. The digest itself is only fetched at integrate time;
+    a .zsync control file's SHA-1 line is likewise only read then, so the
+    zsync note spells out the conditional."""
     if kind == 'github':
         return {
             'method': 'sha256',
@@ -348,8 +342,8 @@ def _preview_destination(source_basename: str, desktop_name,
                          version: str) -> dict:
     """The destination block of the preview document.
 
-    Produced by the install plan's own naming rule (issue #45), so a
-    preview cannot promise a file name the install would not use."""
+    Produced by the install plan's own naming rule, so a preview cannot
+    promise a file name the install would not use."""
     planned = appimage_provider.plan_destination(
         source_basename, desktop_name, version)
     return {'folder': planned['folder'], 'filename': planned['filename'],
@@ -358,17 +352,17 @@ def _preview_destination(source_basename: str, desktop_name,
 
 def cmd_preview_integrate(args: list) -> int:
     """--preview-integrate <path-or-url>: the offline pre-install preview
-    document. Purely advisory and read-only — no network access (the
+    document. Purely advisory and read-only: no network access (the
     classification is by URL shape, the same classifier --integrate
     uses), no AppImage execution (the embedded desktop entry is read in
-    place with the stdlib squashfs reader), nothing is installed,
-    downloaded or written. The integrate command remains the single
-    authority and re-classifies/re-verifies at its own runtime."""
+    place), nothing is installed, downloaded or written. The integrate
+    command remains the single authority and re-classifies and re-verifies
+    at its own runtime."""
     json_output = '--json' in args
 
     # CONTRACT.md's exit-code table: an unknown option is a usage error,
-    # never a silently ignored token — the preview verb accepts --json
-    # and nothing else.
+    # never a silently ignored token. The preview verb accepts --json and
+    # nothing else.
     positional = []
     for a in args:
         if a == '--json':
@@ -385,8 +379,8 @@ def cmd_preview_integrate(args: list) -> int:
 
     parts = _as_url(target)
     if parts is not None:
-        # the URL branch mirrors --integrate's egress policy: net
-        # refuses anything but https, so the preview refuses it too
+        # the URL branch mirrors --integrate's egress policy: net refuses
+        # anything but https, so the preview refuses it too
         if parts.scheme != 'https':
             raise OperationError(
                 f'{target}: only https:// URLs are allowed')

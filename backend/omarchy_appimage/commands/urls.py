@@ -1,7 +1,7 @@
-# urls.py — the --integrate URL layer (ticket #56): the release-URL
-# classifier, the release-API asset lookup and the update-source auto-setup
-# the install URL triggers. Pure decision logic over URL shape plus the
-# per-app config writes; the downloads live in updaters, the verbs in
+# urls.py — the --integrate URL layer: the release-URL classifier, the
+# release-API asset lookup and the update-source auto-setup the install URL
+# triggers. Pure decision logic over URL shape plus the per-app config
+# writes; the downloads live in updaters, the verbs in
 # commands/integrate.py.
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
@@ -53,23 +53,23 @@ def _github_release_url_data(url: str):
 
 def _classify_integrate_url(url: str):
     """Route a pasted --integrate URL to its download/verify path
-    (first match wins — a deliberate, documented deviation from the
-    strict digest rule used by --update; see CONTRACT.md):
+    (first match wins; a documented deviation from the strict digest rule
+    used by --update, see CONTRACT.md):
 
-    1. github.com /releases/download/  -> ('github',  <github src>)   sha256 mandatory
-    2. any host, path ends in .zsync   -> ('zsync',   {'url': url})   SHA-1 when present
-    3. host gitlab.com                 -> ('gitlab',  {'repo_url','repo','filename'})
-    4. host codeberg.org               -> ('codeberg',{'repo','filename'})
-    5. other host /releases/download/  -> ('forgejo', {'repo_url','repo','filename'})
+    1. github.com /releases/download/  -> ('github',  <github src>, sha256)
+    2. any host, path ends in .zsync   -> ('zsync',   {'url': url})
+    3. host gitlab.com                 -> ('gitlab',  ...)
+    4. host codeberg.org               -> ('codeberg', ...)
+    5. other host /releases/download/  -> ('forgejo', ...)
     6. anything else                   -> ('static',  {'url': url})
 
     Cases 3-5 look the release up through the host's API; a failed lookup
-    falls back to case 6 in _fetch_integrate_artifact."""
+    falls back to case 6."""
     github = _github_release_url_data(url)
     if github:
         # the tag parsed from the URL is a real version, and it travels
         # with the classification: apply_release_version uses it when the
-        # download carries no X-AppImage-Version of its own (v0.9.4)
+        # download carries no X-AppImage-Version of its own
         return 'github', dict(github, version=github['tag'])
 
     try:
@@ -124,12 +124,7 @@ def _update_source_chosen(el) -> bool:
 
 def _auto_set_github_source(el, src: dict):
     """Prepopulate the per-app GithubUpdater config from the install URL,
-    unless the user already chose a source (never clobber a choice).
-
-    The filename is turned into a glob by substituting the release version
-    (tag minus a leading 'v') with `*`, so a future release with a bumped
-    version still matches. If the version isn't in the name, the exact
-    filename is kept and the user can refine it in the panel."""
+    unless the user already chose a source."""
     if _update_source_chosen(el):
         return
 
@@ -212,9 +207,8 @@ def _release_api_url(kind: str, info: dict) -> str:
 def _lookup_release_asset(kind: str, info: dict):
     """Look the release asset up through the host's release API.
 
-    Returns {'url','tag','size','filename'} or None — a network/404 error
-    or a release without a matching asset makes --integrate fall back to a
-    static install of the pasted URL."""
+    Returns {'url','tag','size','filename'} or None. A network error or a
+    release without a matching asset falls back to a static install."""
     try:
         data = net.fetch_json(_release_api_url(kind, info))
     except net.NetworkError as e:

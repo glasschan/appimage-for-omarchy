@@ -18,15 +18,14 @@ DEFAULT_MANAGE_OUTSIDE = True
 # Mirror of GearLever's `move-appimage-on-integration` default.
 DEFAULT_MOVE_ON_INTEGRATION = True
 
-# Background update checks (F8, PRD decision #3): enabled, first check 5
-# minutes after the service starts, then every 6 hours.
+# Background update checks: enabled, first check 5 minutes after the
+# service starts, then every 6 hours.
 DEFAULT_UPDATE_CHECK_ENABLED = True
 DEFAULT_UPDATE_CHECK_INTERVAL = 360
 DEFAULT_UPDATE_CHECK_DELAY = 5
 
-# update-check scheduling bounds enforced by --set-setting (a shorter
-# interval would flirt with the PRD §2 no-polling budget; 15 minutes is
-# the floor, matching the fastest sensible manual-refresh cadence).
+# update-check scheduling bounds enforced by --set-setting: 15 minutes is
+# the floor, the fastest sensible manual-refresh cadence.
 MIN_UPDATE_CHECK_INTERVAL = 15
 
 BACKEND_VERSION = '0.4.2'
@@ -36,11 +35,10 @@ JSON_SCHEMA_VERSION = 1
 
 def backend_dir() -> str:
     """The absolute path of the running plugin's backend directory (the
-    one holding main.py) — the CURRENT install's own location, derived
-    from this module's __file__, never from a recorded value. Desktop
-    entries launched through the scale-aware entry point
-    (launch.entry_point_exec_text) are re-pointed here whenever the
-    directory recorded at integrate time stops matching."""
+    one holding main.py), derived from this module's __file__, never from
+    a recorded value. Desktop entries launched through the scale-aware
+    entry point are re-pointed here whenever the recorded directory stops
+    matching."""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -51,9 +49,8 @@ def home_dir() -> str:
 def xdg_data_home() -> str:
     """Respect $XDG_DATA_HOME (default ~/.local/share).
 
-    NOTE: GearLever hard-codes ~/.local/share for desktop files (it does
-    NOT honour XDG_DATA_HOME); honouring it is a deliberate deviation so
-    that tests and sandboxes can isolate the backend."""
+    GearLever hard-codes ~/.local/share; honouring XDG_DATA_HOME is a
+    deliberate deviation so tests and sandboxes can isolate the backend."""
     value = os.environ.get('XDG_DATA_HOME')
     if value:
         return os.path.abspath(os.path.expanduser(value))
@@ -69,8 +66,7 @@ def xdg_config_home() -> str:
 
 
 def xdg_state_home() -> str:
-    """Respect $XDG_STATE_HOME (default ~/.local/state) — same env-or-
-    default pattern as xdg_data_home/xdg_config_home above. Hosts the
+    """Respect $XDG_STATE_HOME (default ~/.local/state). Hosts the
     plugin's volatile state (background job documents and their logs)."""
     value = os.environ.get('XDG_STATE_HOME')
     if value:
@@ -79,13 +75,11 @@ def xdg_state_home() -> str:
 
 
 def process_environment() -> dict:
-    """The caller's process environment (`os.environ`) — the launch
-    handover's base map (`--exec-with-scale`, ticket #33): the image is
-    exec'd with the caller's variables, plus GDK_SCALE only when the
-    compositor query proved a different focused-monitor factor. This is
-    a hand-over, never a trust boundary; the gate's env rule stays
-    intact because behaviour is never gated on a read here. Tests patch
-    this seam."""
+    """The caller's process environment (`os.environ`), the launch
+    handover's base map: the image is exec'd with the caller's variables
+    plus GDK_SCALE only when the compositor query proved a different
+    focused-monitor factor. This is a hand-over, never a trust boundary.
+    Tests patch this seam."""
     return os.environ
 
 

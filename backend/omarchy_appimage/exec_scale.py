@@ -1,30 +1,24 @@
 # exec_scale.py — launch an AppImage at the focused monitor's scale
-# factor (`--exec-with-scale`, ticket #33).
+# factor (`--exec-with-scale`).
 #
-# Original code written for this plugin (GDK_SCALE wave, spec #31 /
-# ticket #33), GPL-3.0 (same license as the plugin; see LICENSE).
+# Original code written for this plugin, GPL-3.0 (same license as the
+# plugin; see LICENSE).
 #
-# The problem: an XWayland client launched into a scale-1 focused
-# monitor renders at 2x when the session exports GDK_SCALE=2 (the env
-# var is global, the monitor scale is per-output). The fix at launch
-# time: query the compositor for the FOCUSED monitor's scale, round it
-# to the whole factor GDK_SCALE takes, and exec the image with that
-# value — `os.execve` REPLACES the process image, so no wrapper outlives
-# the app and the app is PID one of its own lifecycle from the caller's
-# point of view.
+# An XWayland client launched into a scale-1 monitor renders at 2x when the
+# session exports GDK_SCALE=2 (the env var is global, the monitor scale is
+# per-output). So at launch time: query the compositor for the FOCUSED
+# monitor's scale, round it to the whole factor GDK_SCALE takes, and exec
+# the image with that value. `os.execve` replaces the process image, so no
+# wrapper outlives the app.
 #
-# Never-fail rule: a launch must never fail because the scale could not
-# be determined. EVERY failure of the compositor query (binary missing,
-# non-zero exit, timeout, malformed output, no focused monitor,
-# non-numeric scale) degrades to exec'ing with the CALLER'S environment
-# unchanged — the app still starts.
+# Never-fail rule: a launch must never fail because the scale could not be
+# determined; every query failure execs with the caller's environment
+# unchanged.
 #
-# Security posture (ticket #33 is on the process-spawning trigger list):
-# the only child ever spawned is the bounded compositor query — constant
-# argv through utils.run_command (argument lists, no shell, 10 MiB
-# output cap, process-group kill on timeout). The image and its
-# arguments are handed to `os.execve` as argv, never spliced into a
-# shell command line. Nothing here reads unbounded output.
+# Security: the only child spawned is the bounded compositor query, with
+# constant argv through utils.run_command (no shell, bounded output,
+# process-group kill on timeout). The image and its arguments go to
+# `os.execve` as argv, never through a shell.
 
 import json
 import logging
@@ -62,9 +56,8 @@ def _usable_scale(value) -> bool:
 
 def parse_focused_scale(stdout_text: str):
     """The focused monitor's scale from `hyprctl -j monitors` stdout, or
-    None when the answer is unusable (malformed JSON, not a list, no
-    focused monitor, non-numeric or out-of-range scale). Pure — the
-    tests drive every branch through this."""
+    None when unusable (malformed JSON, not a list, no focused monitor,
+    non-numeric or out-of-range scale)."""
     try:
         monitors = json.loads(stdout_text)
     except (ValueError, TypeError):
@@ -85,9 +78,7 @@ def focused_scale(query_argv=None, timeout=QUERY_TIMEOUT_SECONDS):
     """One bounded compositor query; the focused monitor's scale as a
     float, or None on ANY failure. Never raises.
 
-    `query_argv` overrides the command (tests point it at fakes); a
-    missing binary, a non-zero exit, a timeout and a malformed answer
-    are all the same "could not determine" verdict."""
+    `query_argv` overrides the command (tests point it at fakes)."""
     argv = HYPRCTL_QUERY_ARGV if query_argv is None else query_argv
     try:
         result = run_command(argv, check=False, timeout=timeout)
@@ -102,14 +93,14 @@ def focused_scale(query_argv=None, timeout=QUERY_TIMEOUT_SECONDS):
 
 def rounded_scale(scale: float) -> int:
     """The whole factor GDK_SCALE takes: nearest whole number, halves
-    away from .5 downward (1.49 -> 1, 1.5 -> 2, 2.0 -> 2). floor(x+0.5)
-    rather than round(), whose ties-to-even would send 2.5 to 2."""
+    rounded up (1.49 -> 1, 1.5 -> 2). floor(x+0.5) rather than round(),
+    whose ties-to-even would send 2.5 to 2."""
     return int(math.floor(scale + 0.5))
 
 
 def _inherited_matches(inherited, rounded: int) -> bool:
     """True when the caller's own GDK_SCALE already produces the rounded
-    factor — the env is then handed over UNCHANGED."""
+    factor, so the env is handed over unchanged."""
     try:
         value = float(inherited)
     except (TypeError, ValueError):
@@ -120,11 +111,9 @@ def _inherited_matches(inherited, rounded: int) -> bool:
 def launch_env(environment, scale):
     """The environment the image is exec'd with.
 
-    `scale` None (query unusable) -> the caller's environment unchanged.
-    Otherwise GDK_SCALE is set to the rounded focused-monitor factor —
-    except when the caller's own GDK_SCALE already rounds to the same
-    factor, in which case the environment is also handed over unchanged
-    (the value the caller would produce IS the focused monitor's)."""
+    `scale` None -> the caller's environment unchanged. Otherwise GDK_SCALE
+    is set to the rounded factor, unless the caller's own GDK_SCALE already
+    rounds to the same factor."""
     env = dict(environment)
     if scale is None:
         return env
@@ -135,23 +124,21 @@ def launch_env(environment, scale):
     return env
 
 
-# The managed-launch stamp (ticket #35): every launch the plugin
-# performs is a managed one — the launch builder (launch.py) writes
-# DESKTOPINTEGRATION=1 into the desktop entry's Exec and the panel's
-# env-prefixed `launch_argv`. The panel's scale-aware launch goes
-# through this backend CLI, and its detached spawn cannot carry env
-# vars, so the VERB applies the same stamp itself (append-if-absent:
-# a caller variable carrying the name always wins). Serialized as the
-# `VAR=VALUE` text launch.py owns; split here.
+# The managed-launch stamp: every launch the plugin performs is a managed
+# one — launch.py writes DESKTOPINTEGRATION=1 into the desktop entry's Exec
+# and the panel's env-prefixed `launch_argv`. The panel's scale-aware
+# launch goes through this backend CLI, whose detached spawn cannot carry
+# env vars, so the verb applies the stamp itself (append-if-absent: a
+# caller variable carrying the name wins). Serialized as the `VAR=VALUE`
+# text launch.py owns; split here.
 PLUGIN_LAUNCH_ENV = dict(
     pair.split('=', 1) for pair in (DESKTOPINTEGRATION_ENV,))
 
 
 def exec_env(environment, scale, extra_env=None):
     """The full handover environment: `launch_env`'s GDK_SCALE result,
-    then `extra_env` applied with `setdefault` semantics — a caller
-    value always wins, and the caller's own map is never mutated.
-    Pure and seam-free so the tests drive every branch."""
+    then `extra_env` applied with `setdefault` semantics. A caller value
+    always wins, and the caller's map is never mutated."""
     env = launch_env(environment, scale)
     for key, value in (extra_env or {}).items():
         env.setdefault(key, value)
@@ -161,15 +148,13 @@ def exec_env(environment, scale, extra_env=None):
 def exec_with_scale(image_path: str, arguments, environment=None,
                     query=focused_scale, extra_env=None):
     """Compute the launch environment, then REPLACE this process with
-    the image. Never returns on success; a failed exec (missing image,
-    not executable) raises and the CLI's error path reports it.
+    the image. Never returns on success; a failed exec raises and the
+    CLI's error path reports it.
 
     `query` is the compositor-query seam (tests mock it). On any
     unusable answer the child inherits the caller's environment
-    unchanged — a launch never fails because the scale could not be
-    determined. `extra_env` (default None: the bare #33 handover) is
-    merged with setdefault semantics AFTER the GDK_SCALE adjustment;
-    the verb passes PLUGIN_LAUNCH_ENV."""
+    unchanged. `extra_env` is merged with setdefault semantics AFTER the
+    GDK_SCALE adjustment; the verb passes PLUGIN_LAUNCH_ENV."""
     if environment is None:
         environment = constants.process_environment()
     env = exec_env(environment, query(), extra_env)

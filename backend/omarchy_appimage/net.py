@@ -1,31 +1,24 @@
 # net.py — hardened HTTP helpers on top of urllib (Python stdlib only).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# The `requests` calls scattered across GearLever's updaters
-# (models/*Updater.py) are funnelled through this module so every request
-# shares one User-Agent, one timeout policy and one error shape.
 #
-# Security model (marketplace security-review hardening):
-#   * https-only egress — http://, file://, ftp:// and everything else is
-#     rejected before a socket is opened;
-#   * SSRF guard — every hostname is resolved locally and *every* returned
-#     address must be a global (public) IP, so loopback, RFC1918,
-#     link-local, CGNAT, multicast and reserved targets are unreachable;
-#   * DNS-rebinding-safe dialing — the raw socket is pinned to one of the
-#     validated addresses (TLS still verifies the original hostname via
-#     SNI/cert checks), so the resolve-then-connect TOCTOU window is gone;
-#   * manual redirects — max 5 hops, each hop re-validated, and the
-#     intermediate 3xx body is drained in bounded chunks from
-#     redirect_request, the one hook every redirect status reaches
-#     (stdlib's shared 30x body drains it with an unbounded fp.read()
-#     before the final-response byte caps could ever apply);
-#   * byte caps — metadata responses are capped at MAX_METADATA_BYTES,
-#     downloads at MAX_DOWNLOAD_BYTES (a running cap aborts mid-stream
-#     even when the server lies about or omits Content-Length);
-#   * absolute deadlines — timeouts are whole-operation wall-clock
-#     budgets, not just per-socket-operation stall guards: a slow-drip
-#     server cannot keep a request (or a multi-GiB download) alive
-#     indefinitely.
+# Every request shares one User-Agent, one timeout policy and one error
+# shape.
+#
+# Security model:
+#   * https-only egress, rejected before a socket is opened;
+#   * SSRF guard: every resolved address must be a global (public) IP, so
+#     loopback, RFC1918, link-local, CGNAT, multicast and reserved targets
+#     are unreachable;
+#   * DNS-rebinding-safe dialling: the socket is pinned to a validated
+#     address while TLS verifies the original hostname, so the
+#     resolve-then-connect TOCTOU window is gone;
+#   * manual redirects: max 5 hops, each re-validated, with the
+#     intermediate 3xx body drained in bounded chunks;
+#   * byte caps at MAX_METADATA_BYTES / MAX_DOWNLOAD_BYTES, enforced
+#     mid-stream so a lying or missing Content-Length cannot bypass them;
+#   * absolute deadlines, so a slow-drip server cannot keep a request or
+#     download alive indefinitely.
 
 import http.client
 import ipaddress
@@ -59,21 +52,18 @@ MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024     # 4 GiB
 
 _MAX_REDIRECTS = 5
 # An intermediate 3xx body is never a payload, but urllib's redirect
-# handling drains it with an unbounded fp.read() before following the
-# redirect — a hostile hop could buffer an arbitrarily large body in
-# helper memory before the final-response byte caps are ever reached.
-# The drain is therefore performed here, in bounded chunks, and an
-# oversized (or endless) redirect body fails the request outright.
+# handling drains it with an unbounded fp.read(). The drain is done here
+# in bounded chunks instead; an oversized or endless redirect body fails
+# the request outright.
 _MAX_REDIRECT_BODY_BYTES = 1024 * 1024
 _CHUNK = 64 * 1024
 
 # Test-only seam: loopback/private targets for the loopback test servers.
-# NEVER set from the environment — tests patch this attribute directly
-# (mock.patch.object). Production processes cannot disable the guards.
+# NEVER set from the environment; production processes cannot disable the
+# guards.
 _ALLOW_LOCAL_FOR_TESTS = False
 
-# Small, fast endpoints used only to answer "is there a network at all"
-# (mirrors GearLever's lib/utils.check_internet).
+# Small, fast endpoints used only to answer "is there a network at all".
 _CONNECTIVITY_PROBES = (
     'https://api.github.com/',
     'https://fedoraproject.org/static/hotspot.txt',
@@ -116,9 +106,8 @@ def validate_remote_host(host: str) -> None:
 
 
 def _validate_url(url: str) -> None:
-    """Eager pre-flight check for request and redirect URLs: https-only
-    transport, no userinfo in the authority, host resolvable to public
-    addresses only (raises NetworkError)."""
+    """Eager pre-flight check: https-only transport, no userinfo in the
+    authority, host resolvable to public addresses only."""
     parts = urlsplit(url)
     if parts.scheme != 'https' \
             and not (_ALLOW_LOCAL_FOR_TESTS and parts.scheme == 'http'):
@@ -132,8 +121,8 @@ def _validate_url(url: str) -> None:
 
 def _dial_validated(host: str, port: int, timeout) -> socket.socket:
     """Resolve `host`, validate every address, then connect a raw socket
-    to one of the validated IPs — NOT to the hostname (that is what makes
-    a rebinding TOCTOU moot). Returns the connected, unwrapped socket."""
+    to one of the validated IPs, NOT to the hostname (that is what makes
+    a rebinding TOCTOU moot). Returns the connected unwrapped socket."""
     try:
         infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
     except OSError as e:
@@ -144,8 +133,7 @@ def _dial_validated(host: str, port: int, timeout) -> socket.socket:
     last_error = None
     # Validate EVERY answer before dialling any of them: the loop below
     # returns on the first successful connect, so validating per-iteration
-    # would leave the addresses after it unchecked and make this function's
-    # "checks at dial time" promise true only for the ones it reached.
+    # would leave later addresses unchecked.
     for _family, _socktype, _proto, _canonname, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
         if not _addr_allowed(ip):
@@ -169,15 +157,13 @@ def _dial_validated(host: str, port: int, timeout) -> socket.socket:
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """HTTPS connection that dials a validated IP (see _dial_validated)
     and then TLS-wraps with the original hostname, so SNI and certificate
-    verification keep working against the name the user asked for.
+    verification keep working.
 
-    Proxying is refused structurally: build_opener passes ProxyHandler({})
-    so no environment proxy is ever installed, and a tunnel request that
-    somehow reaches this class is rejected here. Without both, urllib's
-    proxy branch (request.py:775-800) would set _tunnel_host and rewrite
-    req.host to the proxy, and this connect() would then TLS-handshake and
-    verify the certificate of the PROXY while sending an origin-form
-    request line -- i.e. the release host would never be authenticated."""
+    Proxying is refused twice: build_opener passes ProxyHandler({}) so no
+    environment proxy is installed, and a tunnel request reaching this
+    class is rejected here. Either one alone would let urllib's proxy
+    branch rewrite req.host, so this connect() would verify the
+    certificate of the PROXY and never authenticate the release host."""
 
     def connect(self):
         if self._tunnel_host:
@@ -197,19 +183,15 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
 
 
 class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Manual redirect handling: the chain is capped at _MAX_REDIRECTS
-    hops and every hop is re-validated eagerly (https-only, no userinfo,
-    public addresses) — the pinned connection re-checks at dial time, the
-    eager check just makes the failure message point at the right hop.
+    """Manual redirects: max hops re-validated eagerly (https-only, no
+    userinfo, public addresses); the pinned connection re-checks at dial
+    time.
 
-    Intermediate 3xx bodies are drained by redirect_request in bounded
-    chunks and capped at _MAX_REDIRECT_BODY_BYTES. The drain deliberately
-    lives there and not in an http_error_30x override: CPython defines
-    301/303/307/308 as class-level aliases of the base http_error_302
-    FUNCTION, so a subclass override of http_error_302 alone never runs
-    for those statuses, while redirect_request is dynamically dispatched
-    for all of them — and the base body's own fp.read() afterwards then
-    sees EOF."""
+    The 3xx body drain lives in redirect_request and not in an
+    http_error_30x override: CPython defines 301/303/307/308 as
+    class-level aliases of the base http_error_302 function, so an
+    http_error_302 override never runs for those, while redirect_request
+    is dispatched for all of them."""
 
     max_hops = _MAX_REDIRECTS
 
@@ -221,12 +203,8 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
         _validate_url(newurl)
         if fp is not None:
             # Drain the intermediate body BEFORE the shared base 30x body
-            # follows the redirect: stdlib drains it with an unbounded
-            # fp.read(). redirect_request is the only hook every 30x
-            # status reaches (301/303/307/308 are class-level aliases of
-            # the base http_error_302 function — an http_error_30x
-            # override would miss them). fp is None in unit tests that
-            # exercise the guard without sockets.
+            # follows the redirect, since stdlib drains it unbounded. fp is
+            # None in unit tests that exercise the guard without sockets.
             self._drain_redirect_body(fp, req)
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None:
@@ -242,11 +220,10 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
         total = 0
         try:
             while True:
-                # Arm the socket with the remaining budget before each read,
-                # exactly as fetch_text does: read() can otherwise block for
-                # the full socket timeout, and with max_hops hops a stalling
-                # server would overshoot the whole-request deadline by that
-                # factor before the elapsed check ever ran.
+                # Arm the socket with the remaining budget before each read:
+                # read() can otherwise block for the full socket timeout,
+                # and with max_hops hops a stalling server would overshoot
+                # the whole-request deadline by that factor.
                 _arm_socket(fp, _remaining_or_raise(
                     req.full_url, start, deadline, 'redirect body drain'))
                 chunk = fp.read(_CHUNK)
@@ -293,11 +270,10 @@ def _unlink_quietly(path: str):
 
 def _remaining_or_raise(url: str, start: float, budget: float,
                         what: str) -> float:
-    """Seconds left of an absolute `budget` (seconds) that started at
-    `start` (time.monotonic()); raises NetworkError once the budget is
-    spent. This is what makes timeouts whole-operation deadlines: a
-    slow-drip server that delivers each chunk just within the socket
-    timeout still runs out of budget here."""
+    """Seconds left of an absolute `budget` that started at `start`;
+    raises NetworkError once the budget is spent. This is what makes
+    timeouts whole-operation deadlines: a slow-drip server that delivers
+    each chunk within the socket timeout still runs out of budget here."""
     remaining = budget - (time.monotonic() - start)
     if remaining <= 0:
         raise NetworkError(f'{url}: {what} deadline exceeded')
@@ -306,9 +282,7 @@ def _remaining_or_raise(url: str, start: float, budget: float,
 
 def _arm_socket(response, remaining: float) -> None:
     """Cap the NEXT blocking read at `remaining` seconds so a single
-    socket operation cannot outrun the absolute deadline (best-effort:
-    degrades to the elapsed check alone if the stdlib's
-    response -> socket path ever changes)."""
+    socket operation cannot outrun the absolute deadline (best-effort)."""
     fp = getattr(response, 'fp', None)
     sock = getattr(getattr(fp, 'raw', None), '_sock', None)
     if isinstance(sock, socket.socket):
@@ -323,10 +297,9 @@ def fetch_text(url: str, timeout: float = DEFAULT_TIMEOUT,
     """GET `url` and return the body as text (raises NetworkError).
 
     The body is capped at `max_bytes`: an over-long Content-Length is
-    rejected before reading, a streamed/chunked body is cut off as soon
-    as the running total would exceed the cap. `timeout` is an absolute
-    deadline for the whole request (connect + headers + body), not a
-    per-socket-operation guard."""
+    rejected before reading, a streamed body is cut off as soon as the
+    running total would exceed the cap. `timeout` is an absolute deadline
+    for the whole request, not a per-socket-operation guard."""
     chunks = []
     total = 0
     start = time.monotonic()
@@ -360,10 +333,9 @@ def fetch_json(url: str, timeout: float = DEFAULT_TIMEOUT):
 
     RecursionError is caught with the parse errors on purpose: nested
     arrays/objects make json.loads recurse in C, and a ~200 kB body of
-    '[' x N raises RecursionError on CPython 3.14 (probe: 8144 kB of C
-    stack at 200k nesting). Both call sites only handle NetworkError, so
-    letting it escape would turn a hostile 200 into an unexpected
-    traceback instead of the network-error path."""
+    '[' x N raises RecursionError on CPython 3.14. Both call sites only
+    handle NetworkError, so letting it escape would turn a hostile 200
+    into an unexpected traceback."""
     try:
         return json.loads(fetch_text(url, timeout=timeout))
     except (json.JSONDecodeError, RecursionError, ValueError) as e:
@@ -372,17 +344,14 @@ def fetch_json(url: str, timeout: float = DEFAULT_TIMEOUT):
 
 def head_headers(url: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
     """Headers for `url` via HEAD, falling back to an un-read GET stream
-    (some servers reject HEAD), like GearLever's StaticFileUpdater.
+    (some servers reject HEAD).
 
-    Keys are lower-cased so callers can look them up without worrying
-    about the server's header casing (a plain dict lookup would be
-    case-sensitive). Returns {} when both attempts fail."""
+    Keys are lower-cased. Returns {} when both attempts fail."""
     for method in ('HEAD', 'GET'):
         try:
             start = time.monotonic()
             with _open(url, method=method, timeout=timeout) as response:
-                # absolute deadline for the whole attempt (the socket
-                # timeout passed to _open bounds connect + headers)
+                # absolute deadline for the whole attempt
                 _remaining_or_raise(url, start, timeout, 'request')
                 return {k.lower(): v
                         for k, v in response.headers.items()}
@@ -398,22 +367,19 @@ def download_to_file(url: str, dest_path: str, progress_cb=None,
                      byte_cb=None) -> int:
     """Stream `url` to `dest_path` in 1 MiB chunks; returns the byte count.
 
-    Two independent time bounds: `timeout` is the per-read stall guard
-    (a single read that outlives it fails the download), `deadline` the
-    absolute wall-clock budget for the whole download — a slow-drip
-    server that never stalls long enough to trip the stall guard still
-    runs out of deadline.
+    Two independent time bounds: `timeout` is the per-read stall guard,
+    `deadline` the absolute wall-clock budget for the whole download; a
+    slow-drip server runs out of deadline.
 
     progress_cb(fraction) fires at most every ~1% with a value in [0, 1]
     (or not at all when the server sends no Content-Length). byte_cb(done,
-    total) — the integrate progress stream's seam (ticket #58) — fires
-    once per chunk with the running byte count and the declared
-    Content-Length (0 when the server sent none), so a caller can apply
-    its own throttle even without a declared length. Both callbacks are
-    robust to emission errors: a callback that raises is disabled instead
-    of failing the download. Raises NetworkError on transport failure, a
-    short body, a body over `max_bytes`, or a spent deadline; the partial
-    `dest_path` is always removed on failure."""
+    total) fires once per chunk with the running byte count and the
+    declared Content-Length (0 when none), so a caller can apply its own
+    throttle. Both callbacks are robust to emission errors: a callback
+    that raises is disabled instead of failing the download. Raises
+    NetworkError on transport failure, a short body, a body over
+    `max_bytes`, or a spent deadline; the partial `dest_path` is always
+    removed on failure."""
     done = 0
     declared = None
     start = time.monotonic()

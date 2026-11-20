@@ -1,12 +1,10 @@
 # ini_config.py — per-app integration metadata (Python stdlib only).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# Ported from src/lib/ini_config.py; GLib.get_user_config_dir() is
-# replaced by the XDG_CONFIG_HOME-aware helpers in constants.py and the
-# config file lives in this plugin's own config directory (GearLever
-# uses ~/.config/gearlever.conf). The on-disk section format
-# ([app.<md5-of-file-path>] with name/file_path/default_exec_arguments
-# keys) is kept identical to upstream.
+#
+# The config file lives in this plugin's own config directory. The on-disk
+# section format ([app.<md5-of-file-path>] with name/file_path/
+# default_exec_arguments keys) is kept identical to upstream.
 
 import configparser
 import hashlib
@@ -68,11 +66,10 @@ class Config:
         """Yield (section_key, config_dict) for every `app.<md5>` record,
         skipping the `app.<md5>.update_manager` sibling sections.
 
-        The section key is the md5 of the AppImage path, so this is the
-        way to enumerate every integrated app regardless of the (mutable)
-        desktop files. list_installed uses it to recover integrated apps
-        whose .desktop was clobbered by the app itself. Cheap: reuses
-        refresh() to re-read from disk."""
+        The section key is the md5 of the AppImage path, so this enumerates
+        every integrated app regardless of the mutable desktop files.
+        list_installed uses it to recover apps whose .desktop was clobbered
+        by the app itself."""
         cls.refresh()
         for section in cls.parser.sections():
             if not section.startswith('app.'):
@@ -87,11 +84,9 @@ class Config:
         h = cls.get_app_hash(el)
         data = dict(data)
         # el.name is the default only: on the update path the element IS the
-        # downloaded file (``<tmp>/update.appimage``), so its name is the
-        # literal "update" and overwriting with it recorded
-        # ``name = update`` for every updated app. A caller that knows the
-        # real name (commit_install, from the desktop entry it just wrote)
-        # passes it in `data` and it wins here.
+        # downloaded file, so its name is the literal "update". A caller
+        # that knows the real name (commit_install, from the desktop entry
+        # it just wrote) passes it in `data` and it wins here.
         data.setdefault('name', el.name)
         data['file_path'] = el.file_path
         cls.parser[f'app.{h}'] = data
@@ -99,7 +94,7 @@ class Config:
 
     # update-manager sections store the per-app update source chosen with
     # --set-update-source; the `manager` key names the UpdateManager class
-    # (same on-disk layout as upstream gearlever.conf).
+    # (same on-disk layout as upstream).
 
     @classmethod
     def get_app_update_config(cls, el) -> dict:

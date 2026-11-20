@@ -1,43 +1,24 @@
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 """Provider-supplied icon bytes are made safe to hand to the shell decoder.
 
-An icon is read out of an AppImage the plugin downloaded from a release
-host, written next to the installed AppImage and then decoded by the
-omarchy shell's QML ``Image`` element (AppRow.qml, ``.icons/<base>.png``).
-The decoders are libpng and Qt's SVG renderer, and neither is given a
-memory budget by us:
+An icon is read out of an AppImage, written next to the installed AppImage,
+then decoded by Qt. Neither libpng nor Qt's SVG renderer is given a memory
+budget. PNG dimensions come from IHDR, so a small file can ask for
+gigabytes; every textual/ICC/EXIF chunk is inflated and kept in memory, and
+libpng limits a single chunk's inflation but not the sum; an SVG declares
+its own size and Qt rasterises at the intrinsic size.
 
-* PNG dimensions are taken from IHDR, and libpng allocates the frame
-  before it has seen any pixel. A small file can therefore ask for
-  gigabytes (``struct``: 60000x60000 needs 14.4 GB at 4 bytes/pixel).
-* Every textual/ICC/EXIF chunk (``tEXt``/``zTXt``/``iTXt``/``iCCP``/``eXIf``)
-  is inflated and kept in memory as metadata. libpng limits a *single*
-  chunk's inflation, not the sum, so many tiny chunks in one 8 MiB file —
-  the extractor's ``MAX_ICON_BYTES`` cap, which counts *stored* bytes only
-  — expand to an arbitrary total.
-* An SVG declares its own size, and Qt rasterises at the intrinsic size.
+``sanitize_icon()`` is the single gate on that boundary. For PNG it rebuilds
+the file from scratch, keeping only the chunks a decoder needs (IHDR, PLTE,
+tRNS, IDAT, IEND) and proving the declared geometry against the inflated
+pixel stream (Adam7 included). For SVG it refuses markup declarations,
+requires a bounded root size, and refuses <image>, <script>, <style>,
+<filter> and filter primitives. Anything that cannot be bounded is refused,
+and the panel falls back to its own Tabler glyph.
 
-``sanitize_icon()`` is the single gate on that boundary. For PNG it
-rebuilds the file from scratch, keeping only the chunks a decoder needs to
-paint pixels (IHDR, PLTE, tRNS, IDAT, IEND) and dropping every ancillary
-chunk, then proves the declared geometry against the actual inflated pixel
-stream (exact size, including Adam7 interlacing) so neither a lying IHDR
-nor an IDAT bomb can pass. For SVG it refuses every markup declaration
-(DOCTYPE/ENTITY and friends), requires a bounded root size, and walks the
-whole tree: <image>, <script>, <style>, <filter> and filter primitives are
-refused because Qt renders an embedded raster at its own natural size, and
-only same-document `href="#id"` references are allowed. Anything that
-cannot be bounded is refused: the panel then falls back to the plugin's
-own Tabler glyph, so a refusal costs an icon, never a feature.
-
-The same gate covers the icons that are ALREADY on disk: an icon
-installed by an older plugin version never went through it, and the
-shell decodes whatever sits in the icons folder on every panel open.
-janitor.sweep_icons runs this sanitiser over those retained icons and
-removes the ones it refuses — and the listing verifies each icon a row
-would load (`janitor.verify_retained_icon`, recorded in the
-``sanitized-icons.json`` registry), so the frontend only ever opens a
-file the CURRENT sanitiser has proved.
+janitor.sweep_icons runs this sanitiser over retained icons and removes the
+ones it refuses; janitor.verify_retained_icon records the verdict in
+``sanitized-icons.json`` so the frontend only opens a proved file.
 """
 
 from __future__ import annotations
@@ -66,10 +47,8 @@ _PNG_SIG = b'\x89PNG\r\n\x1a\n'
 # than trusted.
 _KEEP = frozenset({b'IHDR', b'PLTE', b'tRNS', b'IDAT', b'IEND'})
 _CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
-# The PNG spec's valid (colour type → bit depth) table: any other pair is
-# a file no conforming decoder will render, so it is refused even though
-# the raw stream size could be predicted for it (ticket #63 — an IHDR a
-# decoder rejects must never be re-emitted for the shell to try).
+# The PNG spec's valid (colour type -> bit depth) table: any other pair is
+# a file no conforming decoder renders, so it is refused.
 _DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8),
            4: (8, 16), 6: (8, 16)}
 # Adam7: (x start, y start, x step, y step)
@@ -144,9 +123,8 @@ def _sanitize_png(data: bytes) -> bytes:
     if iend is None:
         raise _Unsafe('no IEND')
     width, height, depth, color_type, interlace = _parse_ihdr(ihdr[8:-4])
-    # The palette and the transparency table are part of the file, not of
-    # the geometry, so libpng allocates them as written: bound them to
-    # what the spec allows instead of trusting the length field.
+    # Bind palette and transparency to what the spec allows instead of
+    # trusting the length field.
     if color_type == 3:
         if plte_len is None:
             raise _Unsafe('palette image without PLTE')
@@ -170,8 +148,7 @@ def _sanitize_png(data: bytes) -> bytes:
         raise _Unsafe('pixel stream does not match the declared geometry')
     del out
     # Emit the canonical chunk order, never the attacker's: libpng
-    # fatally rejects PLTE before IHDR, and a duplicated palette, which
-    # would silently leave the user without an icon.
+    # fatally rejects PLTE before IHDR or a duplicated palette.
     parts = [ihdr]
     if plte is not None:
         parts.append(plte)
@@ -210,8 +187,7 @@ def _parse_ihdr(body: bytes):
     if depth not in _DEPTHS.get(color_type, ()):
         raise _Unsafe('unsupported depth/colour type')
     # A conforming decoder rejects any compression or filter method other
-    # than 0 (the two methods the spec defines); re-emitting such an IHDR
-    # just moves the decode failure into the row (ticket #63).
+    # than 0, so re-emitting such an IHDR just moves the failure into Qt.
     if comp != 0:
         raise _Unsafe('unsupported compression method')
     if filt != 0:
@@ -253,10 +229,9 @@ _COMMENT_OR_CDATA = re.compile(rb'<!--.*?-->|<!\[CDATA\[.*?\]\]>', re.S)
 
 # Elements that turn a picture into a program or an unbounded
 # rasterisation. Qt renders <image> at the embedded raster's NATURAL size,
-# not at the element's width/height: measured with Qt 6.12, a 243 KB SVG
-# whose single <image> carried an 8000x8000 PNG in a data: URI was
-# accepted by the dimension gate and took the decoding process from 17 MB
-# to 276 MB VmHWM. A real app icon needs none of these.
+# not at the element's width/height: a 243 KB SVG whose single <image> held
+# an 8000x8000 PNG took a decoder from 17 MB to 276 MB VmHWM. A real app
+# icon needs none of these.
 _SVG_FORBIDDEN = frozenset({'image', 'script', 'style', 'filter',
                             'foreignobject'})
 
@@ -285,16 +260,14 @@ def _sanitize_svg(data: bytes) -> bytes:
     if len(data) > MAX_SVG_BYTES:
         raise _Unsafe('SVG too large')
     # The checks below scan bytes, so the encoding must be one where a
-    # byte scan and the parser agree: UTF-16/32 writes '<', '!' and '?' as
-    # '\x00<'-style pairs, which would carry a DOCTYPE and its ENTITY
-    # declarations straight past them.
+    # byte scan and the parser agree: UTF-16/32 writes '<' as '\x00<',
+    # which would carry a DOCTYPE past them.
     if b'\x00' in data[:64]:
         raise _Unsafe('SVG encoding must be UTF-8')
     if b'<!' in _COMMENT_OR_CDATA.sub(b'', data):
         raise _Unsafe('SVG markup declaration refused')
-    # A processing instruction is the one external-URI form that is not
-    # an attribute, so the href rule in _assert_svg_tree_safe never sees
-    # it (Qt ignores PIs today; this keeps the rule total).
+    # A processing instruction is the one external-URI form that is not an
+    # attribute, so the href rule never sees it.
     if b'<?xml-stylesheet' in data:
         raise _Unsafe('SVG stylesheet instruction refused')
     try:
@@ -331,17 +304,9 @@ def installed_icon_format(name: str, data: bytes) -> Optional[str]:
     """The format of an icon already on disk, or None when it is unknown.
 
     The file name is the primary signal, because the shell probes the
-    extension (AppRow.qml tries `.png`, then `.svg`): the row decodes
-    whatever sits at `<stem>.png`, so that name decides how the bytes
-    must be judged. A name that says nothing is decided by the content
-    (the PNG magic). Anything else is unsanitisable — the sanitiser has
-    no format to work with, and the shell would not decode it either.
-
-    `installed_icon_is_unsafe` used to live here: a header-only backstop
-    that judged a retained icon from its IHDR alone. It is gone because
-    the sweep now runs the FULL sanitiser over the retained icons
-    (janitor.sweep_icons), and a header check cannot see the metadata
-    chunks that made a retained icon unbounded. Nothing else used it.
+    extension (AppRow.qml tries `.png`, then `.svg`). A name that says
+    nothing is decided by the content (the PNG magic). Anything else is
+    unsanitisable.
     """
     ext = os.path.splitext(name)[1].lower()
     if ext == '.png':
@@ -357,18 +322,11 @@ def installed_icon_format(name: str, data: bytes) -> Optional[str]:
 # Retained icons: read, atomic replace, and the sanitisation registry.
 #
 # The sweep (janitor.sweep_icons) and the listing verdict
-# (janitor.verify_retained_icon, reported as the app object's additive
-# `icon_safe`) share the primitives below, so the sweep and the listing
-# read and rewrite a retained icon identically — and the frontend only
-# opens a file whose sanitisation the CURRENT gate has proved.
+# (janitor.verify_retained_icon) share these primitives.
 
-# Bump on ANY change to sanitize_icon's verdict logic. Stored in the
-# registry (and in the sweep-throttle marker) so icons proven by an older
-# gate re-verify under the new one. 1 = the v0.9.9 extract-time gate,
-# 2 = this display gate (the retained-icon verdict + registry),
-# 3 = strict IHDR field validation (ticket #63: compression/filter
-# methods and the spec's (colour type, bit depth) pairs are enforced, so
-# an IHDR a decoder would reject is refused instead of re-emitted).
+# Bump on ANY change to sanitize_icon's verdict logic, so icons proven by
+# an older gate re-verify under the new one. 1 = the first extract-time
+# gate, 2 = this display gate, 3 = strict IHDR field validation.
 SANITIZER_VERSION = 3
 
 
@@ -381,8 +339,8 @@ def load_sanitized_registry() -> dict:
     """The persisted `{path: {v, s, m}}` verdicts, or {} on ANY failure.
 
     A registry is bookkeeping, never a source of truth: a missing,
-    unreadable, corrupt, or wrongly-shaped file costs a re-verification
-    (one sanitiser pass per icon), never an error."""
+    unreadable, corrupt or wrongly-shaped file costs a re-verification,
+    never an error."""
     try:
         with open(sanitized_registry_path(), 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -397,9 +355,8 @@ def load_sanitized_registry() -> dict:
 def save_sanitized_registry(reg: dict):
     """Persist the registry atomically, best-effort; never raises.
 
-    Only well-formed entries are written (string path, dict entry with
-    int v/s/m), so a hand-edited or programmatically polluted map cannot
-    poison the file a later load would have to trust-shape."""
+    Only well-formed entries are written, so a polluted map cannot poison
+    the file a later load would have to trust-shape."""
     clean = {}
     for key, entry in (reg or {}).items():
         if not isinstance(key, str) or not isinstance(entry, dict):
@@ -419,12 +376,10 @@ def save_sanitized_registry(reg: dict):
 def retained_bytes(path: str) -> Tuple[Optional[bytes], Optional[str]]:
     """Read one retained icon the way the sweep and the verdict both do.
 
-    lstat size check against extractor.MAX_ICON_BYTES (oversized is
-    unusable, never read), then an O_NOFOLLOW open capped at
-    MAX_ICON_BYTES + 1 (a symlink planted in place is never followed),
-    then the format from the file name (`installed_icon_format`). Returns
-    (data, fmt); (None, None) when the file is unusable — the caller
-    decides skip vs. remove. Never raises."""
+    lstat size check against extractor.MAX_ICON_BYTES, then an O_NOFOLLOW
+    open capped at MAX_ICON_BYTES + 1 (a symlink planted in place is never
+    followed), then the format from the file name. Returns (data, fmt);
+    (None, None) when the file is unusable. Never raises."""
     # imported here, not at module level: extractor imports this module's
     # sanitiser, so a top-level import would be circular
     from . import extractor
@@ -441,20 +396,19 @@ def retained_bytes(path: str) -> Tuple[Optional[bytes], Optional[str]]:
 
 
 # Prefix of the temporary file an atomic icon rewrite writes first. It is
-# hidden (the sweep skips hidden names) and lives in the icons folder
-# itself, because os.replace is only atomic within one filesystem.
+# hidden (the sweep skips hidden names) and lives in the icons folder,
+# because os.replace is only atomic within one filesystem.
 ICON_TMP_PREFIX = '.icon-sweep-'
 
 
 def replace_icon_file(path: str, data: bytes, mode: int):
     """Replace an icon with `data` atomically.
 
-    The new bytes land in a temporary file in the SAME directory
-    (os.replace is only atomic within one filesystem) and are renamed
-    over the old file, so a crash never leaves a half-written icon for
-    the shell to decode. The temporary name is hidden and carries this
-    module's own prefix, so a concurrent sweep never mistakes it for an
-    icon. Raises on failure (OSError); callers decide what that costs."""
+    The new bytes land in a temporary file in the SAME directory (os.replace
+    is only atomic within one filesystem) and are renamed over the old file,
+    so a crash never leaves a half-written icon for the shell to decode. The
+    temporary name is hidden and carries this module's own prefix, so a
+    concurrent sweep never mistakes it for an icon. Raises on failure."""
     directory = os.path.dirname(path) or '.'
     fd, tmp_path = tempfile.mkstemp(prefix=ICON_TMP_PREFIX, dir=directory)
     try:

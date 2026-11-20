@@ -1,27 +1,23 @@
 # pick_file.py — crash-isolated native file dialog for --pick-file.
 #
-# Original code written for this plugin (spec #14 / ticket #16),
-# GPL-3.0 (same license as the plugin; see LICENSE).
+# Original code written for this plugin, GPL-3.0 (same license as the
+# plugin; see LICENSE).
 #
-# The backend never dialogs in-process: it ORCHESTRATES a dialog that
-# lives in child processes, so a crashed or hung dialog can never take
-# down the caller (the panel's backend process). Probe order:
+# The backend never dialogs in-process: it ORCHESTRATES a dialog in child
+# processes, so a crashed or hung dialog cannot take down the caller.
+# Probe order:
 #
-#   1. xdg-desktop-portal FileChooser, driven through the glib DBus CLI
-#      (`gdbus`): a `gdbus monitor` is started on the portal first, then
-#      FileChooser.OpenFile is called — the method reply only carries the
-#      request handle, the actual answer arrives as the Request.Response
-#      signal on the monitored stream (monitor-then-call).
+#   1. xdg-desktop-portal FileChooser through `gdbus`: a `gdbus monitor`
+#      starts first, then FileChooser.OpenFile is called. The method reply
+#      only carries the request handle; the answer arrives as the
+#      Request.Response signal on the monitored stream.
 #   2. `zenity --file-selection`.
 #
-# First available wins; neither present -> a typed "unavailable" result
-# (the panel keeps today's path-field UX). The whole operation runs under
-# one absolute deadline (net.py's whole-operation budget discipline): a
-# stuck dialog yields a typed timeout error, never a hang. Child stdout
-# stays bounded (run_command's 10 MiB/stream cap; monitor lines are
-# additionally capped per line). Subprocess argv is fully constant — the
-# dialog title is not user data, and the picked path is returned as JSON
-# data, never spliced into a command line. No shell is ever involved.
+# First available wins; neither present gives a typed "unavailable" result.
+# One absolute deadline turns a stuck dialog into a typed timeout error,
+# never a hang. Child stdout stays bounded, subprocess argv is constant,
+# and the picked path is returned as JSON data, never spliced into a
+# command line. No shell is ever involved.
 
 import logging
 import os
@@ -96,8 +92,8 @@ class PickError(Exception):
 
 
 class PickCancelled(Exception):
-    """The user cancelled the dialog (no fallback: reopening a second
-    dialog after an explicit cancel is never wanted)."""
+    """The user cancelled the dialog (reopening a second dialog after an
+    explicit cancel is never wanted)."""
 
 
 def _which(name: str):
@@ -163,9 +159,8 @@ class _MonitorSession:
     """A running `gdbus monitor` child: line reads bounded by the
     whole-operation deadline (select) and per-line size cap.
 
-    The child runs in its own session (start_new_session) and is always
-    reaped by close() — killpg takes the whole group so no grandchild
-    survives, mirroring utils.run_command's process-group discipline."""
+    The child runs in its own session and is always reaped by close():
+    killpg takes the whole group so no grandchild survives."""
 
     def __init__(self, proc: subprocess.Popen):
         self._proc = proc
@@ -379,8 +374,7 @@ def _pick_via_zenity(deadline: float) -> str:
 
 def _run_pick(deadline: float) -> dict:
     """Probe order: portal first, zenity fallback, then typed unavailable.
-    A portal ERROR falls through to zenity (a broken portal must not cost
-    the user the feature); an explicit CANCEL never does."""
+    A portal ERROR falls through to zenity; an explicit CANCEL never does."""
     errors = []
     if portal_available(deadline):
         try:

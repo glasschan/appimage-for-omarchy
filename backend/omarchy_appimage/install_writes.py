@@ -1,11 +1,9 @@
 # install_writes.py — install name resolution + atomic file writes.
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
-# Split out of provider.py (ticket 57): the security-relevant write
-# primitives (temp-file + fsync + os.replace contract, the O_NOFOLLOW
-# source open) and the one naming rule share a home away from the
-# behaviour mixins. Behaviour is unchanged — the functions moved
-# verbatim; provider.py re-exports them.
+# The security-relevant write primitives (temp-file + fsync + os.replace,
+# the O_NOFOLLOW source open) and the one naming rule. provider.py
+# re-exports them.
 
 import os
 import stat
@@ -21,11 +19,11 @@ def _resolve_install_names(source_basename: str, desktop_name, version: str,
     GearLever's conflict suffixing (never overwrite an existing app).
 
     `desktop_name` (the embedded desktop entry's Name) and `version`
-    (X-AppImage-Version) are attacker-controlled embedded fields. Both are
-    passed through remove_special_chars() BEFORE any collision reuse, so
-    every candidate that reaches os.path.join() is a single flat filename:
-    no separator and no '..' component can ever survive, and a colliding
-    package cannot write outside the managed directories (round-4 review).
+    (X-AppImage-Version) are attacker-controlled embedded fields. Both go
+    through remove_special_chars() BEFORE any collision reuse, so every
+    candidate reaching os.path.join() is a single flat filename: no
+    separator and no '..' component survives, and a colliding package
+    cannot write outside the managed directories.
 
     Non-collision shape is unchanged from upstream: sanitized
     `name.appimage`; collision candidates are `name.appimage_v0_11_3` /
@@ -39,9 +37,7 @@ def _resolve_install_names(source_basename: str, desktop_name, version: str,
     # to false, so the extension is always appended here)
     appimage_filename = f'{appimage_filename}.appimage'
 
-    # NOTE: like upstream, app_name_without_ext still contains the
-    # extension at this point — but it is sanitized and lowercased ONCE
-    # here, before the collision loop can ever rebuild from it.
+    # like upstream, sanitized and lowercased before the collision loop
     app_name_without_ext = remove_special_chars(appimage_filename).lower()
     appimage_filename = app_name_without_ext
 
@@ -65,28 +61,24 @@ def _resolve_install_names(source_basename: str, desktop_name, version: str,
 
 # Public alias for cross-module callers: the preview's destination block
 # (cli.py) derives names through this helper, and cli.py must not import a
-# provider-internal name. The underscore-private spelling stays the
-# implementation — install_file() and the naming unit tests keep using it.
+# provider-internal name.
 resolve_install_names = _resolve_install_names
 
 
 def _replace_destination(dest: str, mode: int, write_body, before_replace=None):
     """Descriptor-safe replace of `dest` with whatever `write_body` writes.
 
-    Shared by `_atomic_install` (a file on disk) and `_atomic_write_bytes`
-    (in-memory bytes): the payload lands in a fresh temp file next to
-    `dest` (created exclusively by mkstemp and written straight through
-    its descriptor, so no window ever exists where a planted name could
-    swap the inode), is chmod'd + fsync'd, then os.replace()'d over the
-    final name — rename never follows a symlink at `dest`, so a planted
-    symlink gets replaced instead of written through, and a crash can
-    never leave a truncated file behind.
+    Shared by `_atomic_install` and `_atomic_write_bytes`: the payload lands
+    in a fresh temp file next to `dest` (created exclusively by mkstemp and
+    written through its descriptor), is chmod'd + fsync'd, then
+    os.replace()'d over the final name. Rename never follows a symlink at
+    `dest`, so a planted symlink gets replaced instead of written through,
+    and a crash can never leave a truncated file behind.
 
-    `before_replace` is the narrow seam for the running-app grant (ticket
-    26): it is called once, right before os.replace(), with the complete
-    but not yet visible temp file on disk. It defaults to None; an
-    exception from it aborts the install and the temp file is removed
-    like any other failure."""
+    `before_replace` is the seam for the running-app grant: called once,
+    right before os.replace(), with the complete but not yet visible temp
+    file on disk. An exception from it aborts the install and removes the
+    temp file."""
     try:
         if stat.S_ISDIR(os.lstat(dest).st_mode):
             raise InternalError(f'refusing to install over a directory: '
@@ -121,13 +113,13 @@ def _replace_destination(dest: str, mode: int, write_body, before_replace=None):
 
 
 def _atomic_install(src: str, dest: str, mode: int, before_replace=None):
-    """Descriptor-safe install of `src` at `dest` (marketplace review).
+    """Descriptor-safe install of `src` at `dest`.
 
     The source is the user's own chosen file: its final component is
     resolved with realpath first (following a symlink there is correct),
-    then opened O_NOFOLLOW; the bytes themselves are written by
+    then opened O_NOFOLLOW. The bytes are written by
     `_replace_destination`, which owns the temp-file/replace dance and
-    the `before_replace` hook (see there)."""
+    the `before_replace` hook."""
     def _copy_source(out):
         # O_NONBLOCK keeps a planted FIFO from blocking the open — the
         # regular-file check below rejects it right after (regular

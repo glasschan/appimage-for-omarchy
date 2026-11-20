@@ -1,26 +1,19 @@
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
-"""The one launch-command builder (ticket #32).
+"""The one launch-command builder.
 
-Every place that writes or spawns a launch — the desktop-entry writer at
-integrate time (``provider_install``), the clobbered-desktop repair
-(``provider_listing._repair_clobbered_desktop``) and the panel's launch
-action (the additive ``launch_argv`` key the listing reports) — builds its
-command through this module. The point is the follow-up tickets: when the
-launch environment changes (GDK_SCALE matching), it changes HERE and only
-here.
+Every place that writes or spawns a launch builds its command through this
+module, so a change to the launch environment happens here and nowhere
+else.
 
-Two serialisations of the same command exist, and both are pinned by
-tests/test_launch.py to stay byte-identical to the pre-#32 assemblies:
+Two serialisations of the same command exist, both pinned by
+tests/test_launch.py to stay byte-identical to the earlier assemblies:
+the desktop file's ``Exec=`` line (env prefix, quoted image path, arguments
+joined raw) and ``shlex.join(launch_argv(...))`` (every token quoted), which
+is what the repair path writes.
 
-* ``launch_exec_text`` — the desktop file's ``Exec=`` line: ``env``-style
-  prefix, the image path shlex-quoted, arguments joined raw (the parsed
-  tokens keep their original shape; the writer never re-quoted them).
-* ``shlex.join(launch_argv(...))`` — what the repair path writes: every
-  token quoted (this is what that site always did).
-
-``panel_launch_argv`` is the token list Quickshell.execDetached spawns:
-whitespace-split exec arguments with the desktop field codes (%f %F %u %U
-%i %c %d %k) dropped, because the panel has no file or URL to hand over.
+``panel_launch_argv`` is the token list the panel spawns: whitespace-split
+exec arguments with the desktop field codes dropped, because the panel has
+no file or URL to hand over.
 """
 
 import os
@@ -30,14 +23,12 @@ import sys
 
 DESKTOPINTEGRATION_ENV = 'DESKTOPINTEGRATION=1'
 
-# The scale-aware entry point (tickets #33/#34): the desktop entry's
-# `Exec=` invokes `<python> <backend>/main.py --exec-with-scale <image>
-# [args]` instead of the raw image, so a launcher click gets the focused
-# monitor's scale. The plugin's backend directory is recorded per app at
-# integrate time (`launch_backend_dir` in apps.ini) and rebuilt from the
+# The scale-aware entry point: the desktop entry's `Exec=` invokes
+# `<python> <backend>/main.py --exec-with-scale <image> [args]` instead of
+# the raw image, so a launcher click gets the focused monitor's scale. The
+# backend directory is recorded per app in apps.ini and rebuilt from the
 # CURRENT directory by the install and repair paths, so a plugin update
-# that moves the directory re-points existing entries instead of
-# breaking them.
+# that moves the directory re-points existing entries.
 EXEC_SCALE_FLAG = '--exec-with-scale'
 ENTRY_POINT_SCRIPT = 'main.py'
 
@@ -55,9 +46,8 @@ def merge_env_variables(current, previous):
     variables are adopted wholesale when it has any, and
     DESKTOPINTEGRATION=1 is appended when no variable carries the name.
 
-    Returns ``(variables, changed)`` — ``changed`` is what told the writer
-    to rewrite the ``Exec`` line, so the caller can keep writing the
-    entry untouched when neither adoption nor the append happened.
+    Returns ``(variables, changed)``; ``changed`` tells the writer whether
+    the ``Exec`` line must be rewritten.
     """
     if previous:
         env_variables = list(previous)
@@ -138,10 +128,9 @@ def parse_entry_point_exec(exec_text):
     """Read back an ``Exec=`` written by ``entry_point_exec_text``.
 
     Returns ``{'env_variables', 'image_path', 'arguments'}`` or None when
-    the text is not the entry-point shape (a legacy raw-image Exec, or an
-    app whose own first argument merely looks like one). The env
-    assignments are recognised between ``env`` and the interpreter only —
-    a bare NAME=value form, never a path."""
+    the text is not the entry-point shape. The env assignments are
+    recognised between ``env`` and the interpreter only, a bare NAME=value
+    form, never a path."""
     try:
         tokens = shlex.split(exec_text)
     except ValueError:
@@ -172,18 +161,15 @@ def _panel_exec_args(exec_arguments_text):
 def panel_launch_argv(image_path, exec_arguments_text):
     """The argv the panel spawns: ``launch_argv`` over the reported
     exec-argument string, whitespace-split with the desktop field codes
-    dropped — byte-identical to what Panel.qml's launchItem assembled
-    before ticket #32 moved the assembly here."""
+    dropped."""
     return launch_argv(image_path, _panel_exec_args(exec_arguments_text))
 
 
 def panel_exec_scale_argv(image_path, exec_arguments_text):
-    """The argv tail for the backend's ``--exec-with-scale`` entry point
-    (ticket #35): the image followed by its own arguments — the same
-    token set ``panel_launch_argv`` places behind the ``env`` prefix,
-    minus the env part. The panel spawns
-    ``[backendCommand..., '--exec-with-scale', *this]``; the verb stamps
-    ``DESKTOPINTEGRATION=1`` itself (the detached spawn cannot carry env
-    vars), so no env prefix belongs here and both surfaces — launcher
-    and panel — share the scale mechanism by construction."""
+    """The argv tail for the backend's ``--exec-with-scale`` entry point:
+    the image followed by its own arguments, the same token set
+    ``panel_launch_argv`` places behind the ``env`` prefix. The panel
+    spawns ``[backendCommand..., '--exec-with-scale', *this]``; the verb
+    stamps ``DESKTOPINTEGRATION=1`` itself (the detached spawn cannot
+    carry env vars), so no env prefix belongs here."""
     return [image_path, *_panel_exec_args(exec_arguments_text)]

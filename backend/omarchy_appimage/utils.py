@@ -2,8 +2,8 @@
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
 # extract_terminal_arguments, remove_special_chars and get_file_hash are
-# ported from src/lib/utils.py; Gio/Gtk/dbus helpers are dropped and the
-# subprocess helpers always use argument lists (never `sh -c`).
+# ported from src/lib/utils.py. Subprocess helpers always use argument
+# lists, never `sh -c`.
 
 import glob
 import hashlib
@@ -16,11 +16,10 @@ import subprocess
 import tempfile
 import threading
 
-# Producer-side output bound (marketplace review): a chatty child can
-# never make the backend buffer more than this per stream. Past the cap
-# the reader stops draining the pipe, the child blocks on write() and
-# the timeout reaps it — so memory stays bounded without killing well-
-# behaved children early.
+# Producer-side output bound: a chatty child can never make the backend
+# buffer more than this per stream. Past the cap the reader keeps draining
+# but discards, so memory stays bounded without killing well-behaved
+# children early.
 MAX_OUTPUT_BYTES = 10 * 1024 * 1024
 
 
@@ -70,11 +69,9 @@ def run_command(command: list, cwd: str = None, check: bool = True,
     captured; raises CalledProcessError on failure when check=True.
 
     Each output stream is capped at `max_output_bytes`: only the first
-    cap bytes are retained, while the pipe keeps being drained (and the
-    excess discarded) so a chatty child never deadlocks on a full pipe,
-    whatever the pipe size. Unbounded producers are reaped by `timeout`.
-    `stdin` may be an open file object (bsdtar reads the squashfs stream
-    from one)."""
+    cap bytes are retained, while the pipe keeps being drained so a chatty
+    child never deadlocks on a full pipe. Unbounded producers are reaped
+    by `timeout`. `stdin` may be an open file object."""
     logging.debug('Running %s', command)
     proc = subprocess.Popen(command, cwd=cwd, stdin=stdin,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -82,10 +79,7 @@ def run_command(command: list, cwd: str = None, check: bool = True,
 
     def _drain(stream) -> bytes:
         # Keep reading until EOF, but retain only the first
-        # max_output_bytes. Reading past the cap without storing the
-        # excess is what bounds memory: a chatty child is drained (so it
-        # never deadlocks on a full pipe, whatever the pipe size) and
-        # simply runs until it finishes or the timeout reaps it.
+        # max_output_bytes; the excess is read and discarded.
         kept = bytearray()
         scratch = bytearray(1 << 16)
         while True:
@@ -123,9 +117,7 @@ def run_command(command: list, cwd: str = None, check: bool = True,
     finally:
         for t in threads:
             t.join(timeout=5)
-        # the readers stop at the cap (the child then blocks on its full
-        # pipe until the timeout reaps it); the streams are only closed
-        # once the process is gone
+        # the streams are only closed once the process is gone
         for stream in (proc.stdout, proc.stderr):
             try:
                 stream.close()
@@ -169,23 +161,17 @@ def atomic_write(path: str, data: bytes):
 def is_app_running(file_path: str,
                    mounts_path: str = None,
                    probe=None) -> bool:
-    """True when the executable at `file_path` is currently running
-    (ported from GearLever's AppImageProvider.is_app_running).
+    """True when the executable at `file_path` is currently running.
 
     Two signals are OR-ed, because a type-2 AppImage started through its
     FUSE runtime executes from /tmp/.mount_* so its `ps` exe never equals
-    the AppImage path:
-      1. a process whose exe IS `file_path` (direct execution) — asked
-         through procs' identity rule, the SAME rule that answers
-         `running_pids`, so the two fields of one document cannot
-         disagree (a symlinked install directory, a pid scanned after the
-         file was replaced, a basename match on mounts);
-      2. `file_path` is the mount source of an active FUSE mount
-         (see is_fuse_mounted).
+    the AppImage path: a process whose exe IS `file_path` (procs' identity
+    rule, the same rule behind `running_pids`), or `file_path` being the
+    source of an active FUSE mount.
 
-    `mounts_path` overrides the /proc/mounts location (tests), and
-    `probe` is procs' seam: a listing passes ONE cached probe so N rows
-    cost one `ps` and one mounts read instead of one of each per row."""
+    `mounts_path` overrides /proc/mounts in tests, and `probe` is procs'
+    seam: a listing passes ONE cached probe so N rows cost one `ps` and
+    one mounts read."""
     from . import procs
     return (_running_by_ps(file_path, probe)
             or is_fuse_mounted(file_path, mounts_path, probe=probe))
@@ -194,9 +180,8 @@ def is_app_running(file_path: str,
 def _running_by_ps(file_path: str, probe=None) -> bool:
     """True when a process's exe IS `file_path`.
 
-    One rule with procs.pids_for — one bounded `ps -eo pid=,exe=` scan
-    (10 s, not run_command's 120 s default) plus the same realpath
-    comparison, instead of a second, string-compared `ps -eo exe` view."""
+    One rule with procs.pids_for: one bounded `ps -eo pid=,exe=` scan plus
+    the same realpath comparison."""
     if not file_path:
         return False
 
@@ -253,15 +238,14 @@ def is_fuse_mounted(file_path: str, mounts_path: str = None,
     """True when `file_path` is the source of an active FUSE mount.
 
     While a type-2 AppImage runs, its runtime FUSE-mounts the image at
-    /tmp/.mount_XXXXXX, e.g.
+    /tmp/.mount_XXXXXX:
 
         escrcpy.appimage /tmp/.mount_escrcpPC9VbJ fuse.escrcpy.appimage rw,... 0 0
 
-    Note the source: /proc/mounts only ever holds the AppImage's BASENAME
-    there, never the absolute path, so the attribution lives in
-    procs.mount_points_for (which also keeps the fuse.* filter that stops
-    an unrelated regular-file source — a loop device, a bind mount — from
-    matching). `mounts_path` overrides the /proc/mounts location (tests)."""
+    /proc/mounts only holds the AppImage's BASENAME there, so attribution
+    lives in procs.mount_points_for (which also keeps the fuse.* filter
+    that stops an unrelated regular-file source from matching).
+    `mounts_path` overrides the /proc/mounts location (tests)."""
     if not file_path:
         return False
 
@@ -295,18 +279,15 @@ def gnu_naturalsize(value: int, precision: int = 1) -> str:
 
 # ------------------------------------------------------------ fuse2 probe
 #
-# The fuse2 runtime probe (spec #14, ticket #17): type-2 AppImages need
-# libfuse.so.2 to launch; when it is absent the panel's launch-failure
-# banner can name the likely cause instead of a generic error. The probe
-# is best-effort only — it NEVER raises and NEVER fails a caller; a state
-# it cannot decide is reported as 'unknown'.
+# Type-2 AppImages need libfuse.so.2 to launch; when it is absent the
+# panel's launch-failure banner can name the likely cause. The probe is
+# best-effort: it never raises and never fails a caller; a state it cannot
+# decide is reported as 'unknown'.
 
 FUSE2_SONAME = 'libfuse.so.2'
 
-# `ldconfig -p` prints the dynamic-linker cache as one
-# "<soname> (<abi>) => <path>" line per entry; a missing binary, a
-# non-zero exit or a timeout only degrades the probe to the directory
-# globs below — never an error.
+# `ldconfig -p` prints the linker cache as one
+# "<soname> (<abi>) => <path>" line per entry.
 FUSE2_CACHE_COMMAND = ['ldconfig', '-p']
 
 # Standard library directories: the multiarch dir, lib64 and lib under
@@ -347,28 +328,18 @@ def _fuse2_in_lib_dirs(lib_dirs) -> bool:
 def probe_fuse2(cache_output: str = None, cache_command: list = None,
                 lib_dirs=None) -> str:
     """Best-effort fuse2 runtime check: FUSE2_PRESENT, FUSE2_MISSING or
-    FUSE2_UNKNOWN. One linker-cache read plus a few globs, once per
-    caller (the installed-list envelope probes once per call, never per
-    app).
+    FUSE2_UNKNOWN. One linker-cache read plus a few globs, once per call,
+    never per app.
 
-    Signal order:
-      1. the dynamic-linker cache (`ldconfig -p`, best-effort): a
-         libfuse.so.2 entry is decisive ('present');
-      2. otherwise the standard library directories are globbed — a hit
-         is decisive too ('present', even when the cache phase failed);
-         no hit after a *successful* cache read is 'missing'.
+    A libfuse.so.2 entry in the linker cache, or a glob hit in the
+    standard library dirs, is decisive 'present'; no hit after a
+    successful cache read is 'missing'. A failed cache phase (binary
+    absent, non-zero exit, timeout) leaves the globs to decide, and
+    without a hit the verdict is 'unknown'. Never raises.
 
-    The cache phase failing (binary absent, non-zero exit, timeout) is
-    not an error: the globs still run and, without a glob hit, the
-    verdict is 'unknown' (the primary evidence source was unavailable).
-    The function NEVER raises; any unexpected failure is logged and
-    reported as 'unknown'.
-
-    Tests pin behaviour with fakes (the host's real fuse2 state is never
-    depended on): `cache_output` stands in for the `ldconfig -p` stdout
-    (the command is then not run), `cache_command` replaces the command
-    (point it at something failing to fake an unavailable cache),
-    `lib_dirs` replaces FUSE2_LIB_DIRS."""
+    Tests pass fakes: `cache_output` stands in for the stdout,
+    `cache_command` replaces the command, `lib_dirs` replaces
+    FUSE2_LIB_DIRS."""
     try:
         if cache_output is None:
             try:

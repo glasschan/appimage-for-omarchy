@@ -1,10 +1,6 @@
 # provider_update.py — update-from-URL, version recording and image
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
-# metadata (ticket 57).
-#
-# Split out of provider.py as a mixin: `AppImageProvider` composes it, so
-# `update_from_url` and the version helpers keep their exact behaviour.
-# The definitions moved verbatim.
+# metadata.
 
 import logging
 
@@ -18,23 +14,17 @@ class UpdateMixin:
     def apply_release_version(self, el: AppImageListElement,
                               version: str) -> bool:
         """Record a release tag as the app's version when the downloaded
-        AppImage does not embed one (v0.9.4).
+        AppImage does not embed one.
 
         `X-AppImage-Version` is the only version source (see
-        _get_app_version), and plenty of real AppImages ship without it —
-        Terax and OpenTypeless, for instance, carry no version anywhere in
-        the image. Their release tag is the only version information there
-        is, so `--integrate .../releases/download/v0.9.0/Terax_0.9.0_amd64.
-        AppImage` used to produce an app with no version at all and the
-        panel had nothing to show. Both `--integrate` (whose classifier
-        knows the tag from the URL or from the release API) and
-        `update_from_url` (whose manager reports the release it just
-        downloaded) call this before install_file, so the desktop entry's
-        `Name (version)` suffix and the reported current_version describe
-        the release actually installed.
+        _get_app_version), and plenty of real AppImages ship without it,
+        so their release tag is the only version information there is.
+        `--integrate` and `update_from_url` both call this before
+        install_file, so the `Name (version)` suffix and the reported
+        current_version describe the release actually installed.
 
-        Never overrides a version the image states itself and never invents
-        one: a blank tag is a no-op. Returns whether it applied."""
+        Never overrides a version the image states itself and never
+        invents one: a blank tag is a no-op."""
         version = (version or '').strip()
         if not version:
             return False
@@ -51,18 +41,14 @@ class UpdateMixin:
     def apply_version_to_installed(self, el: AppImageListElement,
                                     version: str) -> bool:
         """Record a release tag on an ALREADY integrated app that states no
-        version of its own (v0.9.4 follow-up).
+        version of its own.
 
-        Re-integrating the very same URL is a no-op (`already-integrated`,
-        nothing installed), so an app integrated by an older plugin — one
-        that predates apply_release_version, or simply carries no
-        X-AppImage-Version — would keep its blank version until a newer
-        release happened to arrive. When the pasted URL names a tag, write
-        it into the installed desktop entry instead: metadata only, the
-        AppImage itself is untouched. A leftover GearLever md5 suffix in
-        the display Name (`Terax (77efdf)`) is cleaned off at the same
-        time so the launcher and the panel agree. Returns whether anything
-        was written."""
+        Re-integrating the same URL is a no-op, so an app carrying no
+        X-AppImage-Version would keep its blank version until a newer
+        release arrived. When the pasted URL names a tag, write it into the
+        installed desktop entry: metadata only, the AppImage is untouched.
+        A leftover GearLever md5 suffix in the display Name is cleaned off
+        at the same time so the launcher and the panel agree."""
         version = (version or '').strip()
         if not version:
             return False
@@ -98,27 +84,23 @@ class UpdateMixin:
                         before_replace=None) -> AppImageListElement:
         """Download an update through `manager` and install it over `el`.
 
-        Ported from AppImageProvider.update_from_url with the Gio.File
-        calls replaced by plain paths and the GTK progress callback
-        replaced by an optional progress_cb(fraction). Deviations:
+        Ported from AppImageProvider.update_from_url with plain paths and
+        an optional progress_cb(fraction). Deviations:
           * the download lands in a temp dir from
             extractor.new_temp_dir('appimage-update-'), which the shared
-            update core (cli.run_update) removes — scoped to the dirs
-            this call registered — right after the call; the global
+            update core removes right after the call; the global
             cleanup_temp_dirs() wipe stays in main.py's process-exit
-            finally-block as a backstop (upstream kept it in a per-run
-            extraction folder);
-          * `keep_both` lets the caller pick AppImageUpdateLogic.KEEP —
-            upstream's CLI path always installs with REPLACE;
-          * on success we only clear updating_from here, update_logic is
+            backstop;
+          * `keep_both` lets the caller pick AppImageUpdateLogic.KEEP,
+            where upstream's CLI path always installs with REPLACE;
+          * on success we only clear updating_from here; update_logic is
             left set so callers can tell KEEP from REPLACE installs;
-          * `before_replace` is handed to install_file (see there): the
-            running-app grant of ticket 26 needs one hook immediately
-            before the atomic replace.
+          * `before_replace` is handed to install_file: the running-app
+            grant needs one hook immediately before the atomic replace.
         Raises InternalError when the download is not an AppImage."""
         dest_dir = extractor.new_temp_dir(prefix='appimage-update-')
-        # An update is the strict path (issue #45): a source that cannot
-        # prove its artifact is refused before any byte is downloaded.
+        # An update is the strict path: a source that cannot prove its
+        # artifact is refused before any byte is downloaded.
         update_file_path = manager.fetch(dest_dir, updaters.POLICY_STRICT,
                                          progress_cb,
                                          is_appimage=self.can_install_file)
@@ -134,7 +116,7 @@ class UpdateMixin:
                                      else AppImageUpdateLogic.REPLACE)
         list_element.updating_from = el
         # The manager knows the release it downloaded: use its tag as the
-        # version when the image carries none of its own (v0.9.4).
+        # version when the image carries none of its own.
         self.apply_release_version(list_element,
                                    getattr(manager, 'available_version', ''))
         self.install_file(list_element, before_replace=before_replace)
@@ -155,12 +137,10 @@ class UpdateMixin:
                          desktop_entry: DesktopEntry = None):
         """The app's real version: X-AppImage-Version only.
 
-        GearLever's md5 fallback (first six hex chars of the file hash) is
-        deliberately gone: it is a hash, not a version, and it used to
-        leak into the installed desktop entry's Name as
-        "Terax (77efdf)" — where the launcher and the panel showed it as
-        the app's version. An image that ships no X-AppImage-Version has
-        no version, and every caller now renders nothing instead."""
+        GearLever's md5 fallback is deliberately gone: it is a hash, not a
+        version, and it used to leak into the desktop entry's Name where
+        the launcher and the panel showed it as the version. An image that
+        ships no X-AppImage-Version has no version."""
         if not desktop_entry:
             desktop_entry = extracted_appimage.desktop_entry \
                 if extracted_appimage else None

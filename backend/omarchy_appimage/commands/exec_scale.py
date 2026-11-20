@@ -1,15 +1,12 @@
-# commands/exec_scale.py — the `--exec-with-scale` verb (ticket #33).
+# commands/exec_scale.py — the `--exec-with-scale` verb.
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
-# A thin verb over omarchy_appimage.exec_scale (the mechanism module):
-# everything after the image path is the image's own argument list and
-# is forwarded UNTOUCHED to os.execve — including tokens that look like
-# options, because they belong to the app. The verb therefore accepts no
-# options of its own and never runs `_reject_unknown_options`: only the
-# first token is ours, and it must be a plain image path, never an
-# option. The process ends in `os.execve` on success, so this verb never
-# prints a document and never returns an exit code — it either becomes
-# the app or raises into cli.main's error path.
+# A thin verb over omarchy_appimage.exec_scale: everything after the image
+# path is the image's own argument list and is forwarded UNTOUCHED to
+# os.execve, including tokens that look like options. The verb accepts no
+# options of its own: only the first token is ours, and it must be a plain
+# image path. The process ends in `os.execve` on success, so this verb
+# never prints a document and never returns an exit code.
 
 from .. import exec_scale
 from .envelope import UsageError
@@ -20,12 +17,9 @@ def cmd_exec_with_scale(args: list) -> int:
     monitor's scale (compositor query bounded and best-effort: an
     unusable answer execs with the caller's environment unchanged).
 
-    The verb is the plugin's launch handover, so it stamps the
-    managed-launch marker DESKTOPINTEGRATION=1 onto the handover env
-    (append-if-absent — the caller's own value wins): the panel's
-    detached spawn cannot carry env vars, and every launch the plugin
-    performs carries the same marker the launch builder writes into the
-    desktop entry (ticket #35)."""
+    The verb stamps the managed-launch marker DESKTOPINTEGRATION=1 onto the
+    handover env (append-if-absent, so the caller's own value wins): the
+    panel's detached spawn cannot carry env vars."""
     if not args:
         raise UsageError('exec-with-scale requires an AppImage path')
     if args[0].startswith('-'):

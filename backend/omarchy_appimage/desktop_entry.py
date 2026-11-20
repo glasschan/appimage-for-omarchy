@@ -1,10 +1,10 @@
 # desktop_entry.py — minimal .desktop file reader/writer (stdlib only).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# Replaces GearLever's pyxdg DesktopEntry + desktop-entry-lib (JdDesktopEntry)
-# pair: one order-preserving implementation that keeps locale keys
-# (Name[xx]), field codes (%f %F %u %U %i %c %k) and [Desktop Action *]
-# sections intact when rewriting the file.
+#
+# One order-preserving implementation that keeps locale keys (Name[xx]),
+# field codes (%f %F %u %U %i %c %k) and [Desktop Action *] sections intact
+# when rewriting the file.
 
 import os
 

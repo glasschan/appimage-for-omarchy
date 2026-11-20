@@ -1,10 +1,9 @@
 # trash.py — FreeDesktop Trash implementation (Python stdlib only).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# GearLever used Gio.File.trash(); this is a self-contained
-# implementation of the FreeDesktop Trash Specification 1.0
-# (https://specifications.freedesktop.org/trash-spec/latest/) using
-# $XDG_DATA_HOME/Trash (honoured via constants.xdg_data_home()).
+#
+# A self-contained implementation of the FreeDesktop Trash Specification
+# 1.0 using $XDG_DATA_HOME/Trash.
 
 import logging
 import os
@@ -37,8 +36,8 @@ def _unique_name(directory: str, name: str) -> str:
 
 def send_to_trash(path: str) -> str:
     """Move `path` into the user trash dir; returns the path inside
-    Trash/files. Raises OSError on failure (caller decides to fall back
-    to deletion, like GearLever's uninstall does)."""
+    Trash/files. Raises OSError on failure (the caller decides whether to
+    fall back to deletion)."""
     path = os.path.abspath(path)
     if not os.path.lexists(path):
         raise FileNotFoundError(path)
@@ -59,8 +58,8 @@ def send_to_trash(path: str) -> str:
     info_path = os.path.join(trash_root(), 'info', dest_name + '.trashinfo')
     tmp_info = info_path + '.tmp'
     # fdopen over explicit flags: same create/truncate semantics as
-    # open(tmp_info, 'w'), expressed so path-taint scanners can see the
-    # sink has no attacker-controlled component
+    # open(tmp_info, 'w'), expressed so path-taint scanners see the sink
+    # has no attacker-controlled component
     with os.fdopen(os.open(tmp_info, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
                            0o666), 'w', encoding='utf-8') as f:
         f.write(info)

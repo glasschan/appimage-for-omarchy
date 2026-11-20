@@ -1,11 +1,8 @@
-# provider_install.py — install planning + commit (ticket 57).
+# provider_install.py — install planning + commit.
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
-# Split out of provider.py as a mixin: `AppImageProvider` composes it, so
-# `plan_install` / `commit_install` keep their exact signatures (cli.py and
-# the preview path call them). The definitions moved verbatim; the plan/
-# commit contract is unchanged — plan reads and validates without writing,
-# commit performs every write, and a refusal writes nothing.
+# A mixin `AppImageProvider` composes. plan reads and validates without
+# writing; commit performs every write, and a refusal writes nothing.
 
 import logging
 import os
@@ -48,12 +45,12 @@ class InstallMixin:
     def plan_destination(self, source_basename: str, desktop_name,
                          version: str) -> dict:
         """The names an install would use: ONE naming rule, shared by
-        plan_install and the preview document (issue #45).
+        plan_install and the preview document.
 
         Reading the folder's existing names is a read; nothing here
         creates the folder or touches a file. The conflict suffix comes
-        from GearLever's helper (round-4 review: desktop Name and
-        X-AppImage-Version are embedded, attacker-controlled fields)."""
+        from GearLever's helper (desktop Name and X-AppImage-Version are
+        embedded, attacker-controlled fields)."""
         folder = self._get_appimages_default_destination_path()
         existing_names = (os.listdir(folder)
                           if os.path.isdir(folder) else [])
@@ -72,11 +69,7 @@ class InstallMixin:
         Extraction into a temporary folder is a READ (the extractor never
         executes the image), so nothing here touches the managed folder,
         `.icons`, the applications directory or apps.ini. Every refusal is
-        an InternalError with a human message: an image with no root
-        desktop entry, a desktop file that cannot be read, or an Exec
-        command that does not parse is rejected BEFORE the first write —
-        never an AttributeError halfway through, and never a half-applied
-        install.
+        an InternalError raised BEFORE the first write.
 
         The returned record is complete: destination names, the exact
         desktop-entry bytes, the sanitised icon bytes, the apps.ini keys,
@@ -85,10 +78,7 @@ class InstallMixin:
         extracted_appimage = self._load_appimage_metadata(el)
 
         # A root-level .desktop is mandatory: its Exec arguments and its
-        # Icon drive the installed entry. Checking it BEFORE any write is
-        # the whole point of the plan (ticket 40; the old guard sat after
-        # the binary replace, where the missing entry had already
-        # crashed on .getExec()).
+        # Icon drive the installed entry, so it is checked BEFORE any write.
         if extracted_appimage.desktop_entry is None \
                 or not extracted_appimage.desktop_file:
             raise InternalError(
@@ -126,7 +116,7 @@ class InstallMixin:
             prefixed_filename = os.path.splitext(desktop_file_path)[0]
         else:
             # The naming rule is plan_destination's, so the preview cannot
-            # disagree with the install (issue #45).
+            # disagree with the install.
             planned_names = self.plan_destination(
                 os.path.basename(el.file_path),
                 extracted_appimage.desktop_entry.getName(), version)
@@ -137,8 +127,7 @@ class InstallMixin:
                                           appimage_filename)
 
         # The icon bytes are read NOW, so what commit writes is exactly
-        # what this plan validated (the extractor already sanitised them;
-        # see icon.sanitize_icon).
+        # what this plan validated (the extractor already sanitised them).
         dest_appimage_icon_file = None
         icon_bytes = None
         icon_file = extracted_appimage.icon_file
@@ -188,15 +177,13 @@ class InstallMixin:
                         'Could not parse the recorded Exec arguments for '
                         f'this app: {e}') from e
 
-        # The launch path is the scale-aware entry point (ticket #34):
-        # Exec invokes `<python> <backend>/main.py --exec-with-scale
-        # <image> [args]` through the ONE launch builder, so a launcher
-        # click gets the focused monitor's scale. The plugin backend
-        # directory is recorded in apps.ini and rebuilt from the CURRENT
-        # directory on every install/repair, so a plugin update that
-        # moves the directory re-points the entry instead of breaking it.
-        # TryExec stays the raw image: the listing uses it to locate the
-        # installed file.
+        # The launch path is the scale-aware entry point: Exec invokes
+        # `<python> <backend>/main.py --exec-with-scale <image> [args]`
+        # through the ONE launch builder. The backend directory is recorded
+        # in apps.ini and rebuilt from the CURRENT directory on every
+        # install/repair, so a plugin update that moves the directory
+        # re-points the entry. TryExec stays the raw image, which the
+        # listing uses to locate the installed file.
         launch_backend_dir = constants.backend_dir()
         env_variables, _ = launch.merge_env_variables(
             el.env_variables,
@@ -247,16 +234,13 @@ class InstallMixin:
         # install_file used to rewrite the entry once more through
         # update_desktop_file() so it runs with `env VAR=...`; the final
         # Exec text is computed above through the ONE launch-command
-        # builder (tickets #32/#34). merge_env_variables still owns the
-        # DESKTOPINTEGRATION precedence for the recorded env list
-        # (tests/test_launch.py pins its behaviour).
+        # builder. merge_env_variables still owns the DESKTOPINTEGRATION
+        # precedence for the recorded env list.
 
         desktop_content = jd_desktop_entry.get_text().encode('utf-8')
 
-        # The record is keyed by the INSTALLED path (el.file_path becomes
-        # `dest_appimage_file`); an existing record for the same path (the
-        # REPLACE case) is merged exactly like Config.get_app_config(el)
-        # did after the binary was in place.
+        # The record is keyed by the INSTALLED path; an existing record for
+        # the same path (the REPLACE case) is merged.
         app_config = dict(Config.get_app_config(
             SimpleNamespace(file_path=dest_appimage_file)))
         app_config['default_exec_arguments'] = new_default_exec_arguments
@@ -266,10 +250,9 @@ class InstallMixin:
         app_config['appimage_path'] = dest_appimage_file
         app_config['desktop_file_path'] = dest_desktop_file_path
         app_config['icon_path'] = dest_appimage_icon_file or ''
-        # where the entry-point Exec points (ticket #34): recorded once
-        # here, re-checked against constants.backend_dir() on every
-        # listing so a plugin update that moves the directory repairs
-        # the entry instead of breaking it
+        # where the entry-point Exec points: recorded once here, re-checked
+        # against constants.backend_dir() on every listing so a plugin
+        # update that moves the directory repairs the entry.
         app_config['launch_backend_dir'] = launch_backend_dir
 
         remove_original = (
@@ -297,10 +280,10 @@ class InstallMixin:
                        before_replace=None):
         """Perform every write of an install, in the ported flow's order.
 
-        Binary replace first (that is where `before_replace` fires — the
-        force-quit grant of ticket 26), then its mode, the icon and its
-        stale siblings, the desktop entry, apps.ini, the original
-        download's removal and the desktop-database refresh."""
+        Binary replace first (that is where `before_replace` fires), then
+        its mode, the icon and its stale siblings, the desktop entry,
+        apps.ini, the original download's removal and the desktop-database
+        refresh."""
         appimages_destination_path = os.path.dirname(
             plan.dest_appimage_file)
         os.makedirs(appimages_destination_path, exist_ok=True)
@@ -320,11 +303,10 @@ class InstallMixin:
             _atomic_write_bytes(plan.icon_bytes, plan.dest_icon_file, 0o644)
 
         # A previous icon of the same stem must not survive: the panel
-        # renders .icons/<stem>.png|svg by file name (not through the
-        # desktop entry's Icon=), so a stale file would keep being decoded
-        # by the shared shell even after an update whose new icon is
-        # refused -- and a stale .png would win the panel's png-first probe
-        # over a freshly installed .svg.
+        # renders .icons/<stem>.png|svg by file name, so a stale file would
+        # keep being decoded even after an update whose new icon is
+        # refused, and a stale .png would win the png-first probe over a
+        # freshly installed .svg.
         icons_folder = os.path.join(appimages_destination_path, '.icons')
         keep_ext = (os.path.splitext(plan.dest_icon_file)[1]
                     if plan.dest_icon_file else None)
@@ -346,13 +328,10 @@ class InstallMixin:
         el.desktop_file_path = plan.dest_desktop_file_path
         el.installed_status = InstalledStatus.INSTALLED
 
-        # Record the name the desktop entry now carries — NOT el.name,
-        # which on the update path is the downloaded file's basename
-        # ("update"). install_file appends " (<version>)" under the KEEP
-        # logic, so exactly that suffix is dropped again; anything else stays
-        # (an app really named "Foo (Fork)" survives). The listing falls back
-        # to this name when an app's desktop entry is unreadable, so
-        # "update" would otherwise surface as an app called "update".
+        # Record the name the desktop entry now carries, NOT el.name, which
+        # on the update path is the downloaded file's basename ("update").
+        # The listing falls back to this name when an app's desktop entry
+        # is unreadable.
         plan.app_config['name'] = _recorded_app_name(
             el.desktop_entry, plan.version, plan.dest_appimage_file)
         Config.set_app_config(el, plan.app_config)
@@ -375,16 +354,12 @@ class InstallMixin:
         """Ported from AppImageProvider.install_file (naming, conflict
         resolution and desktop entry rewriting follow upstream).
 
-        Since ticket 40 this is plan + commit: `plan_install` reads and
-        validates the whole install without writing anything, then
-        `commit_install` performs every write in the original order.
+        plan_install validates the whole install without writing anything,
+        then commit_install performs every write in the original order.
 
-        `before_replace` is forwarded to the AppImage's own
-        _atomic_install only (never to the icon write): it is the last
-        moment before the new file becomes visible at its final name, so
-        an update that was granted permission to close the running app
-        can close whatever was (re)started during the download. Default
-        None keeps every existing caller byte-identical."""
+        `before_replace` is forwarded to the AppImage's own _atomic_install
+        only, never the icon write: it is the last moment before the new
+        file becomes visible at its final name."""
         logging.info('Installing appimage: %s', el.file_path)
         el.installed_status = InstalledStatus.INSTALLING
         plan = self.plan_install(el)
@@ -405,8 +380,8 @@ class InstallMixin:
                 f'Could not parse the recorded Exec arguments for this '
                 f'app: {e}') from e
 
-        # the scale-aware entry point (ticket #34), built by the ONE
-        # launch builder with the CURRENT backend directory
+        # the scale-aware entry point, built by the ONE launch builder with
+        # the CURRENT backend directory
         jd_desktop_file.Exec = launch.entry_point_exec_text(
             constants.backend_dir(), tryexec_command,
             exec_argument_tokens, env_variables=list(el.env_variables or []),

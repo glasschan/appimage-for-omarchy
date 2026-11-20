@@ -1,4 +1,4 @@
-# listing.py — the --list-installed and --remove verbs (ticket #56).
+# listing.py — the --list-installed and --remove verbs.
 #
 # The listing is the panel's 10 s poll: one janitor sweep (throttled), ONE
 # process probe for the whole table, the pending-verdict record read once.
@@ -23,34 +23,29 @@ from .envelope import (EXIT_OK, EXIT_USAGE, OperationError, UsageError, _ask,
 def cmd_list_installed(args: list) -> int:
     _reject_unknown_options(args, {'--json'})
     json_output = '--json' in args
-    # janitor sweep (ticket 03): fossils — terminal/interrupted job
-    # documents past the acknowledgement window and orphan update temp
-    # dirs past the grace window — go away on every listing. THROTTLED:
-    # the panel polls this every 10 s and each sweep is an unbounded
-    # listdir + stat walk of the shared temp dir in this process's
-    # foreground (the job-start hook in _cmd_update_async stays
+    # janitor sweep: fossils (terminal/interrupted job documents past the
+    # acknowledgement window and orphan update temp dirs past the grace
+    # window) go away on every listing. THROTTLED: the panel polls this
+    # every 10 s and each sweep is an unbounded listdir + stat walk of the
+    # shared temp dir in this process's foreground (the job-start hook stays
     # unthrottled). Best-effort by contract: never raises. The icon sweep
-    # is handed the managed folder's .icons: an icon installed by a
-    # pre-sanitiser plugin version is still decoded by Panel.qml on every
-    # open, and provider.py only unlinks the stem it is replacing.
+    # is handed the managed folder's .icons.
     janitor.sweep_throttled(
         icons_dir=os.path.join(settings.appimages_folder(), '.icons'))
     apps = appimage_provider.list_installed()
-    # ONE process table + one mounts read for the whole listing (ticket
-    # #41): the panel polls this every 10 s, so the cost of a listing must
-    # not grow with the number of installed apps. Every running answer and
-    # every process count below reads through this one scan.
+    # ONE process table + one mounts read for the whole listing: the panel
+    # polls this every 10 s, so the cost must not grow with the number of
+    # installed apps. Every running answer and process count below reads
+    # through this one scan.
     scan = procs._cached_probe()
 
     if json_output:
-        # The remembered verdict of the last check (issue #53): read ONCE
-        # for the whole listing (the panel polls this every 10 s) and
-        # matched per app by the record's own key.
+        # The remembered verdict of the last check: read ONCE for the
+        # whole listing and matched per app by the record's own key.
         state = settings.load_updates_state()
-        # The icon display gate (ticket #62): the registry is read ONCE
-        # and persisted ONCE after the loop — and only when the loop
-        # actually changed it (every verify mutation appends to `dirty`),
-        # so a clean 10 s poll costs no registry write at all.
+        # The icon display gate: the registry is read ONCE and persisted
+        # ONCE after the loop, and only when the loop actually changed it,
+        # so a clean 10 s poll costs no registry write.
         reg = icon.load_sanitized_registry()
         icons_dir = os.path.join(settings.appimages_folder(), '.icons')
         dirty = []
@@ -59,7 +54,7 @@ def cmd_list_installed(args: list) -> int:
             # check_url_for_app is local-only (apps.ini config + the
             # embedded .upd_info ELF section) and fills the manager /
             # embedded_source fields; available_version / download_size
-            # stay null until an actual check runs (--list-updates).
+            # stay null until an actual check runs.
             table.append(_make_app_json(
                 a, manager=UpdateManagerChecker.check_url_for_app(a),
                 probe=scan, pending=state.get(_updates_state_key(a)),
@@ -71,7 +66,7 @@ def cmd_list_installed(args: list) -> int:
             'installed': table,
             # additive envelope key (schema_version stays 1): best-effort
             # runtime capability states for the panel's launch-failure
-            # banner — probing never errors the call
+            # banner; probing never errors the call
             'runtime': _runtime_block(),
         })
         return EXIT_OK
@@ -112,10 +107,9 @@ def cmd_remove(args: list) -> int:
 
     el = _resolve_target(positional[0])
 
-    # Issue #46: removal during that app's update job is refused here,
-    # by the module that owns the job, and not only by the panel's
-    # button. A job that cannot name a document cannot exist for this
-    # app, so an unusable id simply has nothing to refuse.
+    # Removal during that app's update job is refused here, by the module
+    # that owns the job, not only by the panel's button. A job that cannot
+    # name a document cannot exist for this app.
     try:
         job_id = _job_desktop_id(el)
     except OperationError:
@@ -128,7 +122,7 @@ def cmd_remove(args: list) -> int:
                 f'(pid {active.get("pid")}); refusing to remove it')
         # A synchronous --update writes no job document, so the document
         # check alone would let this command uninstall the file it is
-        # replacing; ask the claim itself (issue #46).
+        # replacing; ask the claim itself.
         if jobs.claim_held(job_id):
             raise OperationError(
                 f'{el.file_path} is being updated right now; refusing to '
@@ -158,22 +152,22 @@ def cmd_remove(args: list) -> int:
     return EXIT_OK
 
 
-# The icon display gate (ticket #63): the panel probes candidates in the
-# same png→svg order (lib/Model.js iconBaseFor derives
-# `.icons/<basename-without-extension>`), but a candidate that fails to
-# DECODE makes the Image fall through to the next one — so verifying only
-# the first existing candidate let an unproved .svg reach the shell's
-# decoder. Each existing candidate therefore carries its OWN verdict; a
-# candidate without `true` is never offered to the Image at all.
+# The icon display gate: the panel probes candidates in png-then-svg
+# order (lib/Model.js iconBaseFor derives `.icons/<basename-without-
+# extension>`), but a candidate that fails to DECODE makes the Image fall
+# through to the next one, so verifying only the first existing candidate
+# let an unproved .svg reach the shell's decoder. Each existing candidate
+# therefore carries its OWN verdict; a candidate without `true` is never
+# offered.
 _ICON_EXTENSIONS = ('.png', '.svg')
 
 
 def _listing_icon_verdicts(el, reg: dict, icons_dir: str,
                            dirty: list) -> dict:
     """Per-candidate verdicts: `{"png": bool, "svg": bool}`, one key per
-    EXISTING candidate (janitor.verify_retained_icon against `reg`; every
-    registry mutation appends to `dirty`, which the listing persists once
-    after the loop). No icon file at all → {}. Never raises."""
+    EXISTING candidate. Every registry mutation appends to `dirty`, which
+    the listing persists once after the loop. No icon file at all means
+    {}. Never raises."""
     stem = os.path.join(
         icons_dir,
         os.path.splitext(os.path.basename(el.file_path or ''))[0])

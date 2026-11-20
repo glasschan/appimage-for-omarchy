@@ -1,10 +1,8 @@
-# provider_uninstall.py — app removal (ticket 57).
+# provider_uninstall.py — app removal.
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
-# Split out of provider.py as a mixin: `AppImageProvider` composes it, so
-# `uninstall` keeps its exact behaviour — the containment-bound removal
-# (recorded-path or managed-layout only, never directories/FIFOs,
-# trash with delete fallback) moved verbatim.
+# Containment-bound removal: recorded path or managed layout only, never
+# directories or FIFOs, trash with delete fallback.
 
 import logging
 import os
@@ -21,19 +19,16 @@ class UninstallMixin:
                   remove_configuration=True):
         """Remove an integrated app.
 
-        Deviation from GearLever: upstream only trashes the AppImage and
-        hard-deletes the .desktop file and icon; per this project's spec
-        (PRD F3) all three artifacts are sent to the trash (with a
-        delete fallback, like upstream's binary handling).
+        Upstream only trashes the AppImage and hard-deletes the .desktop
+        file and icon; here all three artifacts go to the trash, with a
+        delete fallback.
 
-        Marketplace-review hardening: the desktop entry is mutable, so a
-        path taken from it (Icon= especially) is only removed when it is
-        bound to this app — either equal to the path recorded at install
-        time in apps.ini, or inside the managed-folder layout (AppImage
-        in the managed folder, desktop file in the user applications
-        dir, icon in <managed folder>/.icons with a stem matching the
-        desktop id). Anything unbound is logged and skipped; directories
-        and FIFOs are never removed."""
+        The desktop entry is mutable, so a path taken from it (Icon=
+        especially) is only removed when it is bound to this app: equal to
+        the path recorded at install time in apps.ini, or inside the
+        managed-folder layout (AppImage in the managed folder, desktop
+        file in the user applications dir, icon in <managed folder>/.icons
+        with a matching stem). Anything unbound is logged and skipped."""
         logging.info('Removing %s', el.file_path)
 
         def _remove(path: str):

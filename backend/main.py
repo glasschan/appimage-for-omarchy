@@ -2,10 +2,10 @@
 # main.py — CLI entry point for the AppImage for Omarchy backend.
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# Replaces GearLever's src/Cli.py + flatpak launcher: a plain Python 3
-# stdlib-only script meant to be spawned once per action by the QML
-# frontend (Quickshell Process) and exit immediately afterwards
-# (PRD §2: zero resident memory).
+#
+# A plain Python 3 stdlib-only script spawned once per action by the QML
+# frontend and exiting immediately afterwards, so it holds no resident
+# memory.
 
 import logging
 import os

@@ -1,24 +1,19 @@
 # extractor.py — metadata extraction from AppImages (stdlib only).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# Replaces AppImageProvider._extract_appimage / _load_appimage_metadata.
 #
-# Extraction strategy (the AppImage is NEVER executed):
-#   1. pure-Python squashfs reader (squashfs.py) — works for gzip, xz and
-#      zstd images without any external tool (PRD §7.3 wanted bsdtar, but
-#      libarchive has no squashfs reader; verified with libarchive 3.8);
-#   2. fallback: `unsquashfs -o <offset>` when installed;
-#   3. fallback: `bsdtar` reading the squashfs stream at the offset
-#      (kept for the day libarchive grows squashfs support).
+# The AppImage is NEVER executed. Extraction order:
+#   1. pure-Python squashfs reader (squashfs.py), no external tool;
+#   2. `unsquashfs -o <offset>` when installed;
+#   3. `bsdtar` reading the squashfs stream at the offset.
 #
-# Marketplace security-review hardening: the external fallbacks fail
-# closed — the listing is quota-checked before extraction, the extracted
-# tree is sanitized afterwards (escaping symlinks unlinked, aggregate
-# file-count/size quotas enforced) and _DirSource reads are
-# containment-bound and never follow a final symlink.
+# The fallbacks fail closed: the listing is quota-checked before extraction,
+# the extracted tree is sanitized afterwards (escaping symlinks unlinked,
+# file-count/size quotas enforced) and _DirSource reads are containment
+# bound and never follow a final symlink.
 #
-# The discovery logic below (root *.desktop, .DirIcon, icon search order)
-# mirrors GearLever's AppImageProvider._load_appimage_metadata.
+# Icon discovery order (.DirIcon, then root <icon>, then hicolor) mirrors
+# GearLever's AppImageProvider._load_appimage_metadata.
 
 import glob
 import logging
@@ -72,11 +67,9 @@ def temp_dirs_snapshot() -> tuple:
 def remove_temp_dir(path: str):
     """Remove ONE registered temp dir and drop it from the global registry.
 
-    Scoped cleanup for sequential in-process callers: unlike
-    cleanup_temp_dirs() it touches only the named dir — but the
-    snapshot-delta pattern in cli.run_update is correct only when one
-    update runs at a time; concurrent in-process updates could each
-    rmtree the other's live download dir."""
+    Unlike cleanup_temp_dirs() it touches only the named dir, so
+    cli.run_update's snapshot-delta pattern is correct only when one
+    update runs at a time."""
     try:
         _TEMP_DIRS.remove(path)
     except ValueError:
@@ -86,8 +79,8 @@ def remove_temp_dir(path: str):
 
 def cleanup_temp_dirs():
     """Process-exit backstop: wipe every registered temp dir. Only main()
-    (and the detached async job's own exit path) may call this — a library
-    caller must use remove_temp_dir()/temp_dirs_snapshot() instead."""
+    (and the detached async job's own exit path) may call this; a library
+    caller must use remove_temp_dir()/temp_dirs_snapshot()."""
     for d in _TEMP_DIRS:
         shutil.rmtree(d, ignore_errors=True)
     _TEMP_DIRS.clear()
@@ -180,11 +173,10 @@ class _DirSource:
     """File source backed by an already-extracted directory on disk
     (unsquashfs / bsdtar fallbacks).
 
-    Containment (marketplace review): the root is resolved once, every
-    path is joined against it and its realpath must stay inside —
-    violations read as nonexistent. Reads never follow a final symlink
-    (O_NOFOLLOW); callers that want link resolution call resolve_symlink
-    first, which is itself containment-bound."""
+    Containment: the root is resolved once, every path is joined against
+    it and its realpath must stay inside; violations read as nonexistent.
+    Reads never follow a final symlink (O_NOFOLLOW); callers that want
+    link resolution call resolve_symlink first."""
 
     def __init__(self, root: str):
         self.root = os.path.realpath(root)
@@ -226,10 +218,9 @@ class _DirSource:
         if self._contained(path) is None:
             return None
         try:
-            # O_NOFOLLOW: never read *through* a final symlink (symlinked
-            # paths are resolved via resolve_symlink + containment
-            # instead); O_NONBLOCK keeps a planted FIFO from blocking the
-            # open — the fstat regular-file check rejects it right after
+            # O_NOFOLLOW: never read through a final symlink; O_NONBLOCK
+            # keeps a planted FIFO from blocking the open, and the fstat
+            # regular-file check rejects it right after
             fd = os.open(self._raw(path),
                          os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except OSError as e:
@@ -263,18 +254,10 @@ def _superblock_quota(appimage_path: str, offset: int) -> tuple:
     """(inode_count, stored_filesystem_bytes) from the squashfs
     superblock.
 
-    The superblock is binary filesystem metadata — unlike `unsquashfs
-    -ls` output it never echoes entry names, so crafted filenames cannot
-    inject fake records or bend the quota inputs (round-5 review:
-    filename-embedded newlines spoofed the line-based listing parse).
-    inode_count bounds how many entries extraction can produce;
-    bytes_used_total is the STORED filesystem length — a sanity ceiling
-    on the image itself, not an uncompressed-size bound (round-7
-    review): uncompressed volume is bounded per-block by the decompress
-    caps and per-file by read_file's declared-size guards instead.
-
-    Raises SquashfsError when the superblock cannot be read: extraction
-    must never run without a quota-checkable preflight."""
+    Binary filesystem metadata never echoes entry names, so crafted
+    filenames cannot inject fake records or bend the quota inputs. Raises
+    SquashfsError when the superblock cannot be read: extraction must
+    never run without a quota-checkable preflight."""
     reader = None
     try:
         reader = SquashfsReader(appimage_path, offset)
@@ -289,10 +272,10 @@ def _superblock_quota(appimage_path: str, offset: int) -> tuple:
 
 
 def _enforce_quotas(files: int, total_bytes: int):
-    """Fail closed when the superblock already shows an extraction
-    bomb. total_bytes is the STORED filesystem length — a ceiling on the
-    image itself; uncompressed volume is bounded separately by the
-    per-block decompress caps and read_file's declared-size guards."""
+    """Fail closed when the superblock already shows an extraction bomb.
+    total_bytes is the STORED filesystem length; uncompressed volume is
+    bounded separately by per-block decompress caps and read_file's
+    declared-size guards."""
     if files > MAX_EXTRACT_FILES:
         raise SquashfsError(f'extraction quota exceeded: superblock shows '
                             f'{files} inodes (max {MAX_EXTRACT_FILES})')
@@ -304,10 +287,8 @@ def _enforce_quotas(files: int, total_bytes: int):
 
 def _sanitize_extracted(root: str):
     """Post-extraction backstop: unlink symlinks whose target escapes
-    `root` (file *and* directory symlinks — os.walk reports the latter
-    in dirnames, which it never iterates itself) and enforce the
-    aggregate quotas while walking (an image that busts either gets its
-    tree removed and is rejected)."""
+    `root` (file AND directory symlinks, since os.walk reports the latter
+    in dirnames) and enforce the aggregate quotas while walking."""
     def _bust(reason: str):
         shutil.rmtree(root, ignore_errors=True)
         raise SquashfsError('extraction quota exceeded ' + reason)
@@ -361,10 +342,7 @@ def _sanitize_extracted(root: str):
 def _open_source(appimage_path: str) -> tuple:
     """Return (source, extracted_dir_or_None). Raises on total failure."""
     # Quota preflight from the superblock BEFORE anything reads the image:
-    # binary filesystem metadata that entry names cannot influence, and
-    # ONE verdict shared by every path — the stdlib VFS reader included
-    # (round-6 review: the VFS path used to return before the preflight
-    # and decompress attacker-controlled blocks with no global bound).
+    # one verdict shared by every path, the stdlib VFS reader included.
     # An unreadable superblock means the image cannot be quota-checked at
     # all, so extraction is refused outright.
     try:
@@ -373,8 +351,8 @@ def _open_source(appimage_path: str) -> tuple:
     except SquashfsError:
         raise
     except (struct.error, ValueError, OSError) as e:
-        # cannot even locate/read the image (not a type-2 AppImage, ELF
-        # malformations): same total-failure verdict as before
+        # cannot locate or read the image (not a type-2 AppImage, ELF
+        # malformations): same total-failure verdict
         logging.info('quota preflight impossible (%s)', e)
         raise SquashfsError(_CANNOT_EXTRACT) from e
 
@@ -463,8 +441,7 @@ def _find_icon(source, icon_name: str) -> Optional[bytes]:
                 candidates.append('/.DirIcon')
             elif fmt == 'text/plain':
                 # the text path is untrusted: strip it to image-absolute
-                # components and refuse any '..' traversal; as before it
-                # must also exist inside the image
+                # components and refuse any '..' traversal
                 possible = diricon.decode('utf-8', 'replace').strip()
                 parts = [p for p in possible.split('/')
                          if p not in ('', '.')]
@@ -494,10 +471,9 @@ def _find_icon(source, icon_name: str) -> Optional[bytes]:
         if not source.exists(path):
             continue
         # name-based candidates may themselves be in-root symlinks (a
-        # common layout: /icon.png -> usr/share/icons/app.png);
-        # _DirSource.read never reads *through* a final symlink, so
-        # resolve the chain first (containment enforced inside
-        # resolve_symlink/read)
+        # common layout: /icon.png -> usr/share/icons/app.png).
+        # _DirSource.read never reads through a final symlink, so resolve
+        # the chain first (containment enforced inside resolve_symlink)
         read_path = path
         if source.is_symlink(path):
             target = source.resolve_symlink(path)
@@ -509,10 +485,10 @@ def _find_icon(source, icon_name: str) -> Optional[bytes]:
             fmt = image_format(data)
             if fmt in ('image/png', 'image/svg+xml'):
                 # MAX_ICON_BYTES bounds the STORED bytes only; what the
-                # decoder materialises is a different quantity (IHDR
-                # dimensions, inflated chunk payloads), so the bytes are
-                # sanitised before they can ever become a file the shell
-                # decodes. Refused icons fall through to the next candidate.
+                # decoder materialises is a different quantity, so the
+                # bytes are sanitised before they can become a file the
+                # shell decodes. Refused icons fall through to the next
+                # candidate.
                 safe = sanitize_icon(data, fmt)
                 if safe:
                     return safe
@@ -522,18 +498,15 @@ def _find_icon(source, icon_name: str) -> Optional[bytes]:
 
 def read_desktop_entry_in_place(appimage_path: str) -> tuple:
     """(name, version) read straight from the embedded desktop entry,
-    fully in place: the pure-Python squashfs reader opens the image and
-    only the root-level *.desktop files are read (size-capped, in
-    memory) — nothing is extracted to disk, no external tool runs and
-    the AppImage is never executed. Used by --preview-integrate (the
-    offline pre-install preview).
+    fully in place: only the root-level *.desktop files are read, size
+    capped, in memory. Nothing is extracted to disk, no external tool
+    runs, and the AppImage is never executed. Used by
+    --preview-integrate.
 
-    The same superblock quota preflight as _open_source runs first, so a
-    hostile image is bounded by exactly the limits extraction would use.
+    The same superblock quota preflight as _open_source runs first.
 
-    Returns ('', '') when the image cannot be read in place (unsupported
-    compression, ELF malformations, no parseable root desktop entry):
-    preview metadata is advisory and never fatal."""
+    Returns ('', '') when the image cannot be read in place: preview
+    metadata is advisory and never fatal."""
     try:
         offset = elf.get_squashfs_offset(appimage_path)
         _enforce_quotas(*_superblock_quota(appimage_path, offset))
@@ -560,11 +533,9 @@ def read_desktop_entry_in_place(appimage_path: str) -> tuple:
 
 
 def load_appimage_metadata(appimage_path: str) -> ExtractedAppImage:
-    """Extract .desktop + icon from an AppImage into a temp folder.
+    """Extract .desktop + icon from an AppImage into a fresh temp folder.
 
-    Ported from AppImageProvider._load_appimage_metadata; the temp folder
-    is keyed by the file's md5 like upstream (fresh per call here, since
-    the CLI is a short-lived process)."""
+    The temp folder is keyed by the file's md5 like upstream."""
     tmp_folder = new_temp_dir('gearlever_appimage_')
 
     result = ExtractedAppImage()
@@ -578,7 +549,7 @@ def load_appimage_metadata(appimage_path: str) -> ExtractedAppImage:
         if desktop_name:
             desktop_path = os.path.join(tmp_folder, 'app.desktop')
             # fdopen over explicit flags: same create/truncate semantics as
-            # open(desktop_path, 'w'), expressed so path-taint scanners can
+            # open(desktop_path, 'w'), expressed so path-taint scanners
             # see the sink has no attacker-controlled component
             with os.fdopen(os.open(desktop_path,
                                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
@@ -589,10 +560,9 @@ def load_appimage_metadata(appimage_path: str) -> ExtractedAppImage:
 
             icon_data = _find_icon(source, entry.getIcon())
             if icon_data:
-                # The extension must describe what the sanitised bytes
-                # actually are: the panel probes .png before .svg, so a
-                # mislabelled file would be decoded as the wrong format
-                # (Qt sniffs content, but the probe order is by name).
+                # The extension must describe the sanitised bytes: the
+                # panel probes .png before .svg, so a mislabelled file
+                # would be probed as the wrong format.
                 ext = ('.svg' if image_format(icon_data) == 'image/svg+xml'
                        else '.png')
                 icon_path = os.path.join(tmp_folder, 'icon' + ext)

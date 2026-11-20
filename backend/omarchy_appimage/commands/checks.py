@@ -1,4 +1,4 @@
-# checks.py — the update-check verbs (ticket #56): --list-updates and
+# checks.py — the update-check verbs: --list-updates and
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 # --fetch-updates plus their shared core (_check_updates, the tri-state
 # per-app walk) and the durable updates-state record they merge into.
@@ -32,25 +32,21 @@ def _update_signature(manager) -> str:
 
 
 def _update_state_entry(manager) -> dict:
-    """One app's remembered check result (issue #39/#43/#53): the signature
-    that drives notifications, the installability verdict so a later
-    listing can warn about an update that cannot be installed, the
-    AppImage path so a later sweep can tell "this app is gone" from "this
-    sweep could not list it" — the listing silently skips an app whose
-    desktop entry is momentarily unreadable (VS Code forks rewrite their
-    own entry on first launch), and forgetting its signature would
-    re-notify for a release already seen — and the pending release version
-    so the listing can name what it waits for."""
+    """One app's remembered check result: the signature that drives
+    notifications, the installability verdict, the AppImage path (so a
+    later sweep can tell "this app is gone" from "this sweep could not
+    list it"), and the pending release version. The listing silently
+    skips an app whose desktop entry is momentarily unreadable, and
+    forgetting its signature would re-notify for a release already seen."""
     entry = {'signature': _update_signature(manager),
              'installable': manager.installable()}
     el = getattr(manager, 'el', None)
     path = getattr(el, 'file_path', '') or ''
     if path:
         entry['path'] = path
-    # the version the source named ('' when it names none): the record
-    # says a release is pending, and this says which one. Capped at
-    # MAX_PERSISTED_VERSION_CHARS so the durable record itself stays
-    # bounded — --list-installed echoes it on every poll.
+    # the version the source named ('' when it names none), capped so the
+    # durable record stays bounded; --list-installed echoes it on every
+    # poll
     entry['version'] = _capped_version(manager.available_version)
     return entry
 
@@ -70,16 +66,13 @@ def _source_was_consulted(manager) -> bool:
 
     A False verdict means "no newer release" only when the source could
     be consulted. A plain-URL static source answers False when its remote
-    size is unknown — the source could not be reached — and that is not
-    the same answer as "the installed file is the newest one". Reading
-    such a False as a definite verdict would retire a pending release
-    nobody ever looked at, and the pending state would keep appearing
-    and disappearing (issue #43).
+    size is unknown, which is not "the installed file is the newest one";
+    reading that as a verdict would retire a pending release nobody
+    looked at.
 
-    The evidence is what the source told us: the release it offers
-    (available_version) or that release's size (download_size), or a
-    digest-backed comparison (a zsync source compares the publisher's
-    control file with the installed file before it answers False)."""
+    The evidence is the release the source offers (available_version), its
+    size (download_size), or a digest-backed comparison (a zsync source
+    compares the control file with the installed file)."""
     try:
         if manager.available_version is not None:
             return True
@@ -95,19 +88,13 @@ def _check_updates():
     """Every installed app's update verdict, plus the state keys of every
     installed app the walk saw.
 
-    Each app's outcome is one of:
-      'update'  — the source reported a newer release;
-      'current' — the source reported that there is no newer release
-                  (an app with no update source at all is current: there
-                  is nothing to wait for);
-      'unknown' — the verdict is not determinable (the check raised, it
-                  answered None, or the source could not be consulted).
+    Each app's outcome is one of 'update' (a newer release), 'current'
+    (no newer release, or no update source at all) or 'unknown' (the
+    check raised, answered None, or the source could not be consulted).
 
-    Returned as (element, manager, outcome) triples; `manager` is None
-    for an app without an update source. Ported from the check loop of
-    upstream Cli.list_updates: per-app errors are logged and skipped so
-    one broken source cannot hide the others. Callers decide on
-    connectivity first (net.check_internet)."""
+    Returned as (element, manager, outcome) triples; `manager` is None for
+    an app without an update source. Per-app errors are logged and
+    skipped so one broken source cannot hide the others."""
     outcomes = []
     installed_keys = set()
     for el in appimage_provider.list_installed():
@@ -127,7 +114,7 @@ def _check_updates():
 
         # tri-state: only a definite True counts (None = not determinable)
         if status is True:
-            # a verdict exists, so installability is reportable (#39)
+            # a verdict exists, so installability is reportable
             manager.checked = True
             outcomes.append((el, manager, 'update'))
         elif status is False and _source_was_consulted(manager):
@@ -139,15 +126,14 @@ def _check_updates():
 
 def _merge_updates_state(state: dict, outcomes: list,
                           installed_keys: set) -> dict:
-    """The record after a check walk (issue #43/#53).
+    """The record after a check walk.
 
     MERGE, never replace: an app the walk did not see keeps its entry
-    while the file it names still exists (the listing silently skips an
-    app whose desktop entry is momentarily unreadable — an invisible app
-    is not an uninstalled one), and an app whose verdict was not
-    determinable keeps what the last successful check learned. Only a
-    definite verdict changes the record: a newer release writes a fresh
-    entry, "no newer release" retires it."""
+    while the file it names still exists (an invisible app is not an
+    uninstalled one), and an app whose verdict was not determinable keeps
+    what the last successful check learned. Only a definite verdict
+    changes the record: a newer release writes a fresh entry, "no newer
+    release" retires it."""
     remembered = {}
     for key, value in state.items():
         if key in installed_keys:
@@ -164,7 +150,7 @@ def _merge_updates_state(state: dict, outcomes: list,
             remembered.pop(key, None)
         elif key in state:
             # the verdict was not determinable: keep what the last
-            # successful check learned (issue #43)
+            # successful check learned
             remembered[key] = state[key]
     return remembered
 
@@ -199,10 +185,10 @@ def cmd_list_updates(args: list) -> int:
     updates = [(el, manager) for el, manager, outcome in outcomes
                if outcome == 'update']
 
-    # The record is the backend's memory of the last verdict (issue
-    # #53): both check verbs write it, so a later listing reports the
-    # pending release without asking the network again. A failed write
-    # is logged, never fatal — this verb keeps its exit codes.
+    # The record is the backend's memory of the last verdict: both check
+    # verbs write it, so a later listing reports the pending release
+    # without asking the network again. A failed write is logged, never
+    # fatal.
     state = settings.load_updates_state()
     remembered = _merge_updates_state(state, outcomes, installed_keys)
     _save_updates_state(remembered)
@@ -229,11 +215,9 @@ def cmd_list_updates(args: list) -> int:
 
 
 def cmd_fetch_updates(args: list) -> int:
-    """One-shot background update check (F8), ported from upstream
-    BackgroudUpdatesFetcher.fetch: never fails hard, and sends a single
-    notify-send when updates NEWER than the last check are seen (upstream
-    notifies on every run; the signature-based dedupe is this project's
-    deviation). The QML timer service invokes this every
+    """One-shot background update check: never fails hard, and sends a
+    single notify-send when updates NEWER than the last check are seen.
+    The QML timer service invokes this every
     update_check_interval_minutes."""
     _reject_unknown_options(args, {'--json'})
     json_output = '--json' in args
@@ -261,14 +245,11 @@ def cmd_fetch_updates(args: list) -> int:
                    if _update_signature(manager)
                    != _update_state_signature(state.get(_updates_state_key(el)))]
 
-    # The record is written BEFORE the announcement (issue #53): the
-    # announcement says "this release is new to you", and it can only be
-    # said once the release has been recorded. A failed write means this
-    # sweep learned nothing durable, so nothing is announced — until now
-    # the announcement came first and the failed write left the old
-    # record behind, so the NEXT sweep announced the same release again.
-    # A state-file failure must not turn a successful sweep into a failed
-    # exit (CONTRACT.md: --fetch-updates always exits 0).
+    # The record is written BEFORE the announcement: a failed write means
+    # this sweep learned nothing durable, so nothing is announced, and the
+    # next sweep cannot announce the same release again. A state-file
+    # failure must not fail the sweep (CONTRACT.md: --fetch-updates
+    # always exits 0).
     remembered = _merge_updates_state(state, outcomes, installed_keys)
     written = _save_updates_state(remembered)
 

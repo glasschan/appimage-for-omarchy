@@ -1,20 +1,16 @@
-# cli.py — the CLI facade: usage text, verb dispatch table and main (ticket #56).
+# cli.py — the CLI facade: usage text, verb dispatch table and main.
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
-# Every verb lives in commands/ (one concern per module): envelope helpers
-# in commands/envelope.py, the integrate/preview verbs in
-# commands/integrate.py, listing/removal in commands/listing.py, the
-# update checks in commands/checks.py, the update pipeline in
-# commands/update.py, the async job runner in commands/jobs.py and the
-# settings verbs in commands/settings.py. This module stays the PUBLIC
+# Every verb lives in commands/ (one concern per module): envelope helpers,
+# integrate/preview, listing/removal, update checks, the update pipeline,
+# the async job runner and the settings verbs. This module stays the PUBLIC
 # import surface: every moved name is re-exported below, so
 # `omarchy_appimage.cli.<name>` keeps working for backend/main.py, the
-# tests and CONTRACT.md — including the monkeypatch seams the suite
-# patches here (cli.run_update, cli.run_command, cli._stdin_is_tty,
+# tests and CONTRACT.md, including the monkeypatch seams the suite patches
+# here (cli.run_update, cli.run_command, cli._stdin_is_tty,
 # cli._spawn_update_job, cli._cmd_update_async).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# Ported from src/Cli.py + src/BackgroudUpdatesFetcher.py.
 #
 # Contract: with --json, stdout carries ONLY the JSON document; every
 # human-readable line and all logging goes to stderr (PRD §8).

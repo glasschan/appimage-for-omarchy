@@ -1,28 +1,22 @@
 # provider.py — AppImage integration provider (stdlib only).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# Ported from src/providers/AppImageProvider.py with the infra layer
-# replaced:
-#   * Gio.File / content-type queries  -> os.path + magic-byte checks (elf.py)
-#   * GLib.get_home_dir() + hard-coded ~/.local/share -> XDG helpers (constants.py)
-#   * Gio.Settings                     -> JSON settings (settings.py)
-#   * pyxdg DesktopEntry + desktop_entry_lib -> desktop_entry.DesktopEntry
-#   * 7zz/unsquashfs/appimage-extract  -> extractor.py (never executes the AppImage)
-#   * Gio.File.trash()                 -> trash.py (FreeDesktop spec)
-# Everything else (naming, conflict resolution, desktop entry rewriting,
-# update logic hooks) follows upstream behaviour.
 #
-# Since ticket 57 the provider is split by responsibility; this module is
-# the composition root + stable import surface:
-#   provider_types.py     data types (InstalledStatus, InternalError,
-#                         AppImageListElement, InstallPlan)
+# Every GearLever infra layer is replaced: magic-byte checks instead of
+# Gio content types, XDG helpers for paths, JSON settings for Gio.Settings,
+# desktop_entry.DesktopEntry for pyxdg, extractor.py for the external
+# extractors, and trash.py for Gio.File.trash(). Naming, conflict
+# resolution and desktop entry rewriting follow upstream behaviour.
+#
+# The provider is split by responsibility; this module is the composition
+# root and stable import surface:
+#   provider_types.py     data types
 #   install_writes.py     install name resolution + atomic file writes
-#   provider_listing.py   ListingMixin (listing, stale records, probes)
+#   provider_listing.py   ListingMixin
 #   provider_install.py   InstallMixin (plan_install / commit_install)
 #   provider_update.py    UpdateMixin (update_from_url, versions, metadata)
 #   provider_uninstall.py UninstallMixin (containment-bound removal)
-# The names below are re-exported verbatim so every existing importer
-# (`omarchy_appimage.provider import ...` in cli.py and the tests) keeps
+# The names below are re-exported verbatim so existing importers keep
 # working unchanged.
 
 from . import settings
@@ -48,7 +42,6 @@ class AppImageProvider(ListingMixin, InstallMixin, UpdateMixin,
         # across list_installed() calls (the panel polls) so a desktop
         # that keeps clobbering itself isn't re-written on every call.
         self._repaired_desktop_paths = set()
-
     @property
     def user_desktop_files_path(self) -> str:
         """XDG_DATA_HOME/applications, resolved on every access so that

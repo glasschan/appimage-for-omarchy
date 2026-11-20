@@ -1,10 +1,10 @@
 # settings.py — user settings stored as plain JSON (Python stdlib only).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# Replaces GearLever's GSettings-backed models/Settings.py with a JSON
-# file at $XDG_CONFIG_HOME/io.github.glasschan.appimage/settings.json,
-# per PRD §7.2. Key names mirror the upstream GSettings keys so the
-# semantics stay comparable.
+#
+# A JSON file at $XDG_CONFIG_HOME/io.github.glasschan.appimage/settings.json.
+# Key names mirror the upstream GSettings keys so the semantics stay
+# comparable.
 
 import json
 import logging
@@ -17,8 +17,8 @@ _DEFAULTS = {
     'appimages_default_folder': constants.DEFAULT_APPIMAGES_FOLDER,
     'manage_files_outside_default_folder': constants.DEFAULT_MANAGE_OUTSIDE,
     'move_appimage_on_integration': constants.DEFAULT_MOVE_ON_INTEGRATION,
-    # F8 background update checks (PRD decision #3): first check shortly
-    # after login, then every 6 hours by default.
+    # Background update checks: first check shortly after login, then
+    # every 6 hours by default.
     'update_check_enabled': constants.DEFAULT_UPDATE_CHECK_ENABLED,
     'update_check_interval_minutes': constants.DEFAULT_UPDATE_CHECK_INTERVAL,
     'update_check_delay_minutes': constants.DEFAULT_UPDATE_CHECK_DELAY,
@@ -62,16 +62,14 @@ def appimages_folder() -> str:
 # ------------------------------------------------------- update-check state
 #
 # updates-state.json is the plugin's durable record of the last update
-# check, one entry per app (issue #50). An entry PRESENT means a pending
-# release is known for that app: it carries the signature that drives the
-# desktop notification (available_version + download_size, so the
-# notification only fires for NEWLY available updates — upstream
-# BackgroudUpdatesFetcher notifies on every run instead; the dedupe is a
-# deviation asked for by this project's spec), the installability verdict,
-# the AppImage path, and the pending release version. Both check verbs
-# write it, the installed-app listing reports it, and a successful update
-# deletes the app's entry. A legacy plain-signature entry is still read as
-# "pending, version and verdict unknown".
+# check, one entry per app. An entry PRESENT means a pending release is
+# known: it carries the signature that drives the desktop notification
+# (available_version + download_size, so only NEWLY available updates
+# notify, where upstream notifies on every run), the installability
+# verdict, the AppImage path, and the pending release version. Both check
+# verbs write it, the listing reports it, and a successful update deletes
+# the app's entry. A legacy plain-signature entry still reads as "pending,
+# version and verdict unknown".
 
 def updates_state_path() -> str:
     return os.path.join(constants.plugin_config_dir(), 'updates-state.json')

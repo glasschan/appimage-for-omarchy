@@ -1,11 +1,9 @@
 # provider_types.py — the provider's shared data types (stdlib only).
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
-# Split out of provider.py (ticket 57): InstalledStatus / InternalError /
-# AppImageListElement / InstallPlan are referenced by every provider
-# submodule, so they live in a module with no dependencies on the
-# behaviour mixins. Behaviour is unchanged — the definitions moved
-# verbatim; provider.py re-exports them.
+# InstalledStatus / InternalError / AppImageListElement / InstallPlan are
+# referenced by every provider submodule, so they live in a module with no
+# dependencies on the behaviour mixins. provider.py re-exports them.
 
 import dataclasses
 import logging
@@ -90,10 +88,9 @@ class InstallPlan:
     `AppImageProvider.plan_install` returns one of these after reading the
     source image (extraction into a temp dir is a read) and proving the
     whole install can succeed; `commit_install` then performs every write
-    in the order the ported GearLever flow used. Splitting the two means a
-    refused install — no root desktop entry, no desktop file to point at,
-    an Exec line that does not parse — leaves the managed folder, `.icons`,
-    the applications directory and apps.ini untouched."""
+    in the ported GearLever order. Splitting the two means a refused
+    install leaves the managed folder, `.icons`, the applications
+    directory and apps.ini untouched."""
     source_appimage: str
     dest_appimage_file: str
     desktop_id: str                       # app/desktop/icon file stem

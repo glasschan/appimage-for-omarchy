@@ -1,12 +1,12 @@
-# jobs.py — the --update --async background job runner (ticket #56).
+# jobs.py — the --update --async background job runner.
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # The parent side validates the target, takes the job's atomic claim (the
 # flock on the job log) and double-forks the detached grandchild; the
-# grandchild runs the whole update pipeline (commands/update.py's
-# run_update) and publishes one job document per phase. Nothing here ever
-# prompts: the parent asks the close-the-running-app question before any
-# side effect, and the grandchild re-checks and closes silently.
+# grandchild runs the whole update pipeline and publishes one job document
+# per phase. Nothing here prompts: the parent asks the
+# close-the-running-app question before any side effect, and the grandchild
+# re-checks and closes silently.
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
 
@@ -28,27 +28,22 @@ _JOB_HANDSHAKE_TIMEOUT_SECONDS = 10
 def _cmd_update_async(target: str, keep_both: bool, force: bool,
                       json_output: bool, kill_running: bool = False,
                       assume_yes: bool = False) -> int:
-    """Parent side of --update --async: validate the target (local name/id
-    resolution only), take the job's atomic claim, refuse when a job is
-    running for the app, then spawn the detached grandchild (see
-    _spawn_update_job) and report `job-started` immediately. The parent
-    never runs the pipeline itself and never resolves the update manager:
-    that is run_update's first step inside the grandchild, so a missing
-    or broken source surfaces as a terminal `error` job document instead
-    of a second, drifting manager resolution here.
+    """Parent side of --update --async: validate the target, take the job's
+    atomic claim, refuse when a job is running for the app, then spawn the
+    detached grandchild and report `job-started` immediately. The parent
+    never resolves the update manager: that is run_update's first step in
+    the grandchild, so a missing or broken source surfaces as a terminal
+    `error` job document.
 
-    --async is NOT implicitly non-interactive any more: on a TTY the
-    close-the-running-app question is asked HERE, in the parent, before
-    anything is spawned (the grandchild's stdin is /dev/null, so a job
-    that asked would have to publish skipped-running after a
-    `job-started` that already told the user the update was under way).
-    A yes becomes the grandchild's --kill-running grant."""
+    On a TTY the close-the-running-app question is asked HERE, before
+    anything is spawned (the grandchild's stdin is /dev/null). A yes
+    becomes the grandchild's --kill-running grant."""
     el = _resolve_target(target)
     # fail closed BEFORE any side effect (no sweep, no fork): the id must
     # be able to name a job file, or this path cannot honour its contract
     desktop_id = _job_desktop_id(el)
 
-    # D: the question, still before any side effect — a decline leaves no
+    # The question comes before any side effect: a decline leaves no
     # claimed log, no sweep and no grandchild behind.
     if not kill_running and not force and not keep_both:
         ask = _running_app_prompt(json_output, assume_yes)
@@ -71,17 +66,15 @@ def _cmd_update_async(target: str, keep_both: bool, force: bool,
             # a yes is the whole job's grant, exactly like --kill-running
             kill_running = True
 
-    # janitor sweep (ticket 03), parent-side only — never in the
-    # grandchild: stale terminal/interrupted documents age out and orphan
-    # update temp dirs are reclaimed before a new job is spawned.
-    # Best-effort by contract: sweep() never raises.
+    # janitor sweep, parent-side only, never in the grandchild: stale
+    # terminal/interrupted documents age out and orphan update temp dirs
+    # are reclaimed before a new job is spawned. sweep() never raises.
     janitor.sweep()
 
     # The claim comes first, and it is atomic: two starts racing before
     # either job document exists would otherwise both pass the active-job
-    # check and both write this log (TOCTOU). open_job_log_fd also owns
-    # the only legal truncation of an over-cap log, so a start that turns
-    # out to be refused cannot wipe a live job's log.
+    # check and both write this log. open_job_log_fd also owns the only
+    # legal truncation of an over-cap log.
     try:
         log_fd = jobs.open_job_log_fd(desktop_id)
     except BlockingIOError:
@@ -94,8 +87,7 @@ def _cmd_update_async(target: str, keep_both: bool, force: bool,
 
         try:
             # `_spawn_update_job` is resolved through the cli facade at
-            # CALL time: it is the tests' patch seam
-            # (mock.patch.object(cli, '_spawn_update_job'), ticket #56).
+            # CALL time: it is the tests' patch seam.
             from .. import cli
             pid, job_path, log_path = cli._spawn_update_job(
                 desktop_id, target, keep_both=keep_both, force=force,
@@ -104,7 +96,7 @@ def _cmd_update_async(target: str, keep_both: bool, force: bool,
             raise OperationError(f'could not start the update job: {e}')
     finally:
         # single owner: the grandchild inherited the description (and the
-        # flock with it) through the fork, so this copy is done
+        # flock with it) through the fork
         os.close(log_fd)
 
     if json_output:
@@ -125,11 +117,9 @@ def _cmd_update_async(target: str, keep_both: bool, force: bool,
 
 def _job_desktop_id(el) -> str:
     """The app's job key, with the fail-closed precondition attached: an
-    id the job store cannot turn into a file name (a legal .desktop
-    filename may hold a space or a non-ASCII char) is an OperationError,
-    i.e. the contract's error shape — never a ValueError escaping to
-    main()'s catch-all as a generic "unexpected error" + traceback. Sync
-    --update accepts such an id, so the refusal has to name the reason."""
+    id the job store cannot turn into a file name is an OperationError,
+    never a ValueError escaping to main()'s catch-all. Sync --update
+    accepts such an id, so the refusal names the reason."""
     desktop_id = _updates_state_key(el)
     if not jobs.is_usable_desktop_id(desktop_id):
         raise OperationError(
@@ -170,21 +160,19 @@ def _job_entrypoint(desktop_id: str, target: str, keep_both: bool,
     """The detached grandchild's body: run the whole update pipeline and
     publish one job document per phase (jobs.JobWriter). Never raises;
     returns a process exit code (the fork site os._exit()s with it).
-    In-process callers (tests) use the same entrypoint, so the sync and
-    async pipelines cannot drift."""
+    Tests use the same entrypoint, so the sync and async pipelines cannot
+    drift."""
     writer = jobs.JobWriter(desktop_id)
     writer.start_heartbeat()
-    # G: run_update raises instead of returning a result when it fails, so
+    # run_update raises instead of returning a result when it fails, so
     # the only way the error document can carry the force-quit record is
-    # this sink — filled the moment the app is actually closed.
+    # this sink, filled the moment the app is actually closed.
     sink = {}
     try:
         try:
-            # `run_update` is resolved through the cli facade at CALL time:
-            # it is the tests' patch seam
-            # (mock.patch.object(cli, 'run_update')), and the facade
-            # re-export must stay the name the job runner invokes (ticket
-            # #56).
+            # `run_update` is resolved through the cli facade at CALL
+            # time: it is the tests' patch seam, and the facade re-export
+            # must stay the name the job runner invokes.
             from .. import cli
             result = cli.run_update(target, keep_both=keep_both, force=force,
                                 kill_running=kill_running,
@@ -217,9 +205,9 @@ def _finish_job_document(writer, result: UpdateResult) -> int:
                       force_quit=result.force_quit)
         return EXIT_OK
     if result.status == 'up-to-date':
-        # B: belt on top of run_update's ordering — a document that
-        # applied nothing must never say the app was closed for it, so
-        # `force_quit` is dropped here whatever the result carries
+        # A document that applied nothing must never say the app was
+        # closed for it, so `force_quit` is dropped here whatever the
+        # result carries
         writer.finish('up-to-date',
                       message=f'{result.el.file_path} is up to date',
                       force_quit=None)
@@ -238,16 +226,14 @@ def _spawn_update_job(desktop_id: str, target: str, keep_both: bool,
     """Detach the job runner as a grandchild: os.fork() twice (setsid in
     the intermediate, so the grandchild owns no controlling terminal and
     cannot reacquire one), stdio redirected into the size-capped per-job
-    log, stdin from /dev/null. No shell, no exec, nothing interpolated —
-    the grandchild continues this process image and runs
-    _job_entrypoint, then reports its pid back over a pipe so the parent
-    can name it in the job-started document. The parent reaps only the
-    intermediate; the grandchild is reparented and reaped by init.
+    log, stdin from /dev/null. No shell, no exec: the grandchild continues
+    this process image and runs _job_entrypoint, then reports its pid over
+    a pipe so the parent can name it in the job-started document. The
+    parent reaps only the intermediate; init reaps the grandchild.
 
-    `log_fd` is the caller's already-open (and flock-claimed) job log, not
-    something this function opens: the claim has to be held across the
-    active-job check and the fork, and only the caller can bracket that.
-    Ownership of the fd stays with the caller.
+    `log_fd` is the caller's already-open (and flock-claimed) job log: the
+    claim must be held across the active-job check and the fork, and only
+    the caller can bracket that. The caller keeps ownership.
 
     Returns (grandchild_pid, job_document_path, job_log_path)."""
     devnull_fd = os.open(os.devnull, os.O_RDONLY)
@@ -277,9 +263,7 @@ def _spawn_update_job(desktop_id: str, target: str, keep_both: bool,
             grandchild_code = EXIT_ERROR
             try:
                 # write_fd only: the intermediate already closed read_fd
-                # before forking, so the grandchild's fd table has no
-                # read end to close (a double close here would EBADF and
-                # kill the job before its stdio is even redirected)
+                # before forking, so a double close here would EBADF
                 os.close(write_fd)
                 os.dup2(devnull_fd, 0)
                 os.dup2(log_fd, 1)
@@ -326,9 +310,8 @@ def _spawn_update_job(desktop_id: str, target: str, keep_both: bool,
     finally:
         os.close(read_fd)
         os.close(devnull_fd)
-    # bounded above by the handshake deadline only via the pipe: the
-    # intermediate's post-fork code is close/setsid/fork/write/_exit, so a
-    # hang here would require a signal mid-sequence — reap is unblocking-free
+    # the intermediate's post-fork code is close/setsid/fork/write/_exit,
+    # so a hang here would need a signal mid-sequence
     os.waitpid(intermediate_pid, 0)
 
     try:

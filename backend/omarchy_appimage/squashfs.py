@@ -1,17 +1,14 @@
 # squashfs.py — minimal read-only SquashFS 4.0 reader (Python stdlib only).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
-# The SquashFS on-disk layout handled here follows the SquashFS 4.0 spec
-# (https://github.com/plougher/squashfs-tools/blob/master/README-4.0);
-# GearLever delegated this job to external extractors (7zz / unsquashfs /
-# appimage-extract), which are not guaranteed to exist on a stock Arch /
-# Omarchy system. This reader only extracts the few files needed for
-# desktop integration (.desktop entries and icons) and it NEVER executes
-# the AppImage.
+#
+# The layout follows the SquashFS 4.0 spec. This reader extracts only the
+# files desktop integration needs (.desktop entries and icons), and it
+# NEVER executes the AppImage.
 #
 # Supported compressions: gzip (zlib), xz (lzma) and zstd
 # (compression.zstd on Python >= 3.14, otherwise the `zstd` CLI).
-# Unsupported images raise UnsupportedCompression and the caller can fall
+# Unsupported images raise UnsupportedCompression so the caller can fall
 # back to external tools (see extractor.py).
 
 import io
@@ -33,16 +30,15 @@ COMP_LZ4 = 5
 COMP_ZSTD = 6
 
 SQUASHFS_METADATA_SIZE = 8192
-# Kernel PATH_MAX; squashfs symlink targets longer than this cannot resolve
-# anywhere, so they are malformed by construction (caps _read_inode's stream
-# span against attacker-inflated targets).
+# Kernel PATH_MAX; longer symlink targets cannot resolve anywhere, so they
+# are malformed by construction.
 SQUASHFS_MAX_SYMLINK_TARGET = 4096
 SQUASHFS_COMPRESSED_BIT_BLOCK = 1 << 24
 SQUASHFS_INVALID_FRAG = 0xFFFFFFFF
 
-# Round-7 review: every accumulation below is driven by untrusted metadata
-# fields, so each gets an explicit ceiling. Legit AppImages sit orders of
-# magnitude under all of them.
+# Every accumulation below is driven by untrusted metadata fields, so each
+# gets an explicit ceiling. Legit AppImages sit orders of magnitude under
+# all of them.
 SQUASHFS_MAX_DIR_LISTING_BYTES = 1 << 20       # one directory's listing
 SQUASHFS_MAX_FRAGMENT_COUNT = 20_000           # matches the file quota
 SQUASHFS_MAX_INODE_SPAN = 256 * 1024           # metadata bytes per inode
@@ -95,11 +91,9 @@ def _zstd_decompress(data: bytes, max_out: int) -> bytes:
     if _ZSTD_MODE == 'stdlib':
         from compression import zstd
         # SquashFS zstd frames are streamed WITHOUT the content-size
-        # header, so needs_input stays False even on a fully-consumed
-        # legal frame — the output cap is the only reliable bound: a
-        # crafted frame can expand gigabytes from a few stored bytes,
-        # and the declared file-size slice only applies afterwards
-        # (round-6 review). Over-cap frames are refused, not truncated.
+        # header, so the output cap is the only reliable bound: a crafted
+        # frame can expand gigabytes from a few stored bytes. Over-cap
+        # frames are refused, not truncated.
         d = zstd.ZstdDecompressor()
         out = d.decompress(data, max_length=max_out + 1)
         if len(out) > max_out:
@@ -109,11 +103,9 @@ def _zstd_decompress(data: bytes, max_out: int) -> bytes:
 
     if _ZSTD_MODE == 'cli':
         # CI invariant (scripts/ci/security-gates.sh): every raw
-        # subprocess.run outside utils.py must carry a bounded timeout —
-        # one squashfs block is at most a few MiB, so 120s (the same
-        # ceiling utils.run_command uses) is generous. The child is also
-        # RLIMIT_FSIZE-capped at the output bound: it dies on SIGXFSZ
-        # instead of materializing a bomb (round-6 review).
+        # subprocess.run outside utils.py must carry a bounded timeout.
+        # The child is also RLIMIT_FSIZE-capped at the output bound: it
+        # dies on SIGXFSZ instead of materializing a bomb.
         import resource
 
         def _cap_output():
@@ -184,9 +176,8 @@ class SquashfsReader:
          bytes_used, _id_table, _xattr, self.inode_table_start,
          self.directory_table_start, self.fragment_table_start,
          _lookup_table) = struct.unpack('<IIIIIHHHHHHQQQQQQQQ', sb[:0x60])
-        # Total uncompressed size of the filesystem (superblock metadata,
-        # never influenced by entry names): the extraction byte quota
-        # reads this before any external extractor runs.
+        # Total uncompressed size of the filesystem: the extraction byte
+        # quota reads this before any external extractor runs.
         self.bytes_used_total = bytes_used
 
         if self.magic != SQUASHFS_MAGIC:
@@ -194,11 +185,10 @@ class SquashfsReader:
                                 f'(magic=0x{self.magic:08x})')
         if self.s_major != 4:
             raise SquashfsError(f'unsupported squashfs version {self.s_major}')
-        # Round-6 review: block_size is an attacker-controlled field. The
-        # spec caps it at 1 MiB (power of two) and block_log must agree —
-        # anything else is a malformed/hostile image, and it is this field
-        # that sizes sparse-block allocations and every decompression cap
-        # below, so it is validated before anything reads a block.
+        # block_size is an attacker-controlled field. The spec caps it at
+        # 1 MiB (power of two) and block_log must agree. It sizes
+        # sparse-block allocations and every decompression cap below, so
+        # it is validated before anything reads a block.
         if (self.block_size < 4096 or self.block_size > 1 << 20
                 or self.block_size & (self.block_size - 1)):
             raise SquashfsError(f'implausible block size {self.block_size}')
@@ -246,12 +236,9 @@ class SquashfsReader:
 
         The stored size and the declared file size are both
         attacker-controlled; an uncapped decompress turns a few stored
-        kilobytes into gigabytes of allocation before the declared-size
-        slice ever applies (round-6 review). Every caller passes the
-        legal uncompressed size for its block type (`block_size` for
-        data blocks, `SQUASHFS_METADATA_SIZE` for metadata); a block
-        that expands further is corrupt or hostile and is refused, not
-        truncated."""
+        kilobytes into gigabytes before the declared-size slice applies.
+        Every caller passes the legal uncompressed size for its block
+        type; a block that expands further is refused, not truncated."""
         bomb = (f'block expands beyond {max_out} bytes — refusing')
         try:
             if self.compression == COMP_GZIP:
@@ -296,8 +283,8 @@ class SquashfsReader:
             data = self._decompress(raw, max_out=SQUASHFS_METADATA_SIZE)
 
         result = (data, block_offset + 2 + stored)
-        # round-7 review: the cache is keyed by attacker-reachable block
-        # offsets; a walk over a hostile image must not grow it forever
+        # the cache is keyed by attacker-reachable block offsets; a walk
+        # over a hostile image must not grow it forever
         if len(self._meta_cache) > SQUASHFS_MAX_CACHED_META_BLOCKS:
             self._meta_cache.clear()
         self._meta_cache[key] = result
@@ -321,7 +308,7 @@ class SquashfsReader:
             buf += data
             bo = nb
 
-        # same round-7 bound for the concatenated-stream cache
+        # same bound for the concatenated-stream cache
         if len(self._stream_cache) > SQUASHFS_MAX_CACHED_STREAMS:
             self._stream_cache.clear()
         self._stream_cache[key] = (buf, bo)
@@ -418,16 +405,15 @@ class SquashfsReader:
         """Return (name, inode_ref, type) for every entry of a directory.
 
         Directory listings are packed as a continuous byte stream that may
-        straddle metadata block boundaries (and individual entries with
-        them), so the chained metadata blocks are first concatenated into
-        one contiguous buffer.
+        straddle metadata block boundaries, so the chained blocks are
+        concatenated into one contiguous buffer first.
         """
         listing_size = inode.file_size - 3
         if listing_size <= 0:
             return []
-        # round-7 review: listing_size is a raw inode field; the chained
-        # metadata blocks below are decompressed into ONE buffer before
-        # parsing, so a hostile listing size must not reach _stream
+        # listing_size is a raw inode field; the chained metadata blocks
+        # below are decompressed into ONE buffer before parsing, so a
+        # hostile listing size must not reach _stream
         if listing_size > SQUASHFS_MAX_DIR_LISTING_BYTES:
             raise SquashfsError(
                 f'directory listing {listing_size} bytes '
@@ -479,9 +465,9 @@ class SquashfsReader:
         if self._fragment_cache is not None:
             return self._fragment_cache
 
-        # round-7 review: the entry list is built by materializing every
-        # fragment's metadata — the count is a superblock field and must
-        # not exceed the same quota as extracted files
+        # the entry list is built by materializing every fragment's
+        # metadata; the count is a superblock field and must not exceed
+        # the same quota as extracted files
         if self.fragment_count > SQUASHFS_MAX_FRAGMENT_COUNT:
             raise SquashfsError(
                 f'fragment table declares {self.fragment_count} entries '
@@ -546,7 +532,7 @@ class SquashfsReader:
         for size in inode.block_list:
             stored = size & ~SQUASHFS_COMPRESSED_BIT_BLOCK
             # the stored size is metadata too: an incompressible block is
-            # stored at exactly block_size, never larger (round-6 review)
+            # stored at exactly block_size, never larger
             if stored > self.block_size:
                 raise SquashfsError(
                     f'{path!r}: block header {stored} bytes exceeds the '
@@ -563,8 +549,8 @@ class SquashfsReader:
             addr += stored
 
             # a hostile block list must not accumulate past the declared
-            # size — the final slice only bounds what is RETURNED, never
-            # what was allocated (round-6 review)
+            # size; the final slice only bounds what is RETURNED, never
+            # what was allocated
             if len(out) > max_size:
                 raise SquashfsError(f'{path!r}: block list overruns the '
                                     f'declared file size '

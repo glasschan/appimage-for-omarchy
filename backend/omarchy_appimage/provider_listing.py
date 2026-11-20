@@ -1,11 +1,10 @@
 # provider_listing.py — listing, stale records, running-process
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
-# bookkeeping and ELF/type probes (ticket 57).
+# bookkeeping and ELF/type probes.
 #
-# Split out of provider.py as a mixin: `AppImageProvider` composes it, so
-# every method keeps its exact name and behaviour; the definitions moved
-# verbatim. Methods that belong to other responsibilities (destination
-# paths, version reads) are still resolved through `self` at runtime.
+# A mixin `AppImageProvider` composes. Methods that belong to other
+# responsibilities (destination paths, version reads) are resolved through
+# `self` at runtime.
 
 import filecmp
 import logging
@@ -81,11 +80,10 @@ class ListingMixin:
                     continue
 
                 exec_location = entry.getTryExec()
-                # The entry-point shape (ticket #34: `env ... python
-                # main.py --exec-with-scale <image> [args]`) is parsed by
-                # the launch module's reader, which recovers the image's
-                # own arguments verbatim; anything else (a legacy
-                # raw-image Exec written by an older plugin, or an
+                # The entry-point shape (`env ... python main.py
+                # --exec-with-scale <image> [args]`) is parsed by the launch
+                # module, which recovers the image's own arguments verbatim.
+                # Anything else (a legacy raw-image Exec, or an
                 # app-clobbered entry) falls back to the heuristic
                 # GearLever parser.
                 entry_point = launch.parse_entry_point_exec(entry.getExec())
@@ -100,10 +98,10 @@ class ListingMixin:
                 recovered = False
 
                 if not os.path.isfile(exec_location):
-                    # Exec/TryExec point at a path that is gone — typically a
+                    # Exec/TryExec point at a path that is gone, typically a
                     # mount-time binary whose /tmp/.mount_* dir was removed
-                    # after the app quit. Recover from the record made at
-                    # install time if it still resolves.
+                    # after the app quit. Recover from the install record if
+                    # it still resolves.
                     recorded = desktop_to_config.get(desktop_path)
                     recorded_appimage = (recorded or {}).get(
                         'appimage_path', '')
@@ -124,9 +122,7 @@ class ListingMixin:
 
                 if not exec_arguments.strip():
                     # The current desktop entry carries no arguments: fall
-                    # back to the ones recorded at install time (the entry
-                    # may have been rewritten without them). The current
-                    # entry always wins when it has arguments.
+                    # back to the ones recorded at install time.
                     exec_arguments = self._recorded_exec_arguments(
                         desktop_to_config.get(desktop_path))
 
@@ -177,10 +173,9 @@ class ListingMixin:
         """Integration records whose .desktop file is gone.
 
         list_installed() is desktop-driven, so such a record is invisible
-        there — and could never be removed either, because the CLI only
-        resolves targets the listing knows. These elements are the
-        explicit handle for an orphan: nothing is deleted automatically,
-        the user has to ask for the removal (--remove <desktop id>)."""
+        there, and the CLI only resolves targets the listing knows. These
+        elements are the explicit handle for an orphan: nothing is deleted
+        automatically, the user has to ask with --remove <desktop id>."""
         stale = []
         for _section_key, rec in Config.iter_app_records():
             desktop_path = rec.get('desktop_file_path', '')
@@ -205,9 +200,8 @@ class ListingMixin:
         recorded install paths, preserving every other field.
 
         Only called from list_installed() when the apps.ini fallback
-        matched, and exactly once per desktop path per provider instance,
-        so the panel/CLI never spin on the disk for an entry that keeps
-        self-clobbering while it runs."""
+        matched, and once per desktop path per provider instance, so the
+        panel never spins on a self-clobbering entry."""
         if desktop_path in self._repaired_desktop_paths:
             return
         try:
@@ -221,17 +215,16 @@ class ListingMixin:
         default_args = recorded.get('default_exec_arguments', '') or ''
         args = shlex.split(default_args) if default_args.strip() else []
         entry.TryExec = appimage
-        # the scale-aware entry point (ticket #34), built by the ONE
-        # launch builder with the CURRENT backend directory
+        # the scale-aware entry point, built by the ONE launch builder with
+        # the CURRENT backend directory
         entry.Exec = shlex.join(launch.entry_point_argv(
             constants.backend_dir(), appimage, args))
         entry.Icon = icon
         entry.write_file(desktop_path)
-        # persist the backend directory this Exec was built with (the
-        # same key `_repair_entry_point_dir` reads): otherwise the next
-        # listing's entry-point repair would rewrite an already-correct
-        # entry once more. Full-record get-modify-set — Config
-        # replaces the whole app section.
+        # persist the backend directory this Exec was built with (the same
+        # key `_repair_entry_point_dir` reads), so the next listing does
+        # not rewrite an already-correct entry. Full-record get-modify-set,
+        # since Config replaces the whole app section.
         if recorded is not None:
             updated = dict(recorded)
             updated['launch_backend_dir'] = constants.backend_dir()
@@ -246,17 +239,15 @@ class ListingMixin:
                                 appimage_path, exec_arguments,
                                 env_variables):
         """Re-point an entry-point Exec at the CURRENT plugin backend
-        directory (ticket #34).
+        directory.
 
         The directory recorded at integrate time (`launch_backend_dir` in
         apps.ini) is compared against constants.backend_dir() on every
-        listing; a plugin update that moved the directory (or an
-        uninstall-leftover recorded path) re-points the entry instead of
-        leaving a dead Exec behind. Entries recorded before ticket #34
-        carry no key and are left alone — they adopt the entry point on
-        their next update or re-integrate, never from a passive listing.
-        The re-point is persisted in the record, so it happens once; the
-        per-instance set only guards a record write that keeps failing."""
+        listing; a plugin update that moved the directory re-points the
+        entry. Entries recorded before this key existed adopt the entry
+        point on their next update or re-integrate. The re-point is
+        persisted in the record; the per-instance set only guards a record
+        write that keeps failing."""
         recorded_dir = (recorded or {}).get('launch_backend_dir') or ''
         if not recorded_dir:
             return
@@ -298,10 +289,9 @@ class ListingMixin:
 
         Read-only on purpose: `is_installed` also runs on the preview path,
         which must never write (CONTRACT.md), so this does not go through
-        list_installed() and its entry repairs. Both shapes count: an
-        apps.ini record whose desktop file is still on disk, and a desktop
-        entry whose TryExec names an AppImage (an install older than the
-        records, or one whose apps.ini entry was lost)."""
+        list_installed() and its entry repairs. An apps.ini record whose
+        desktop file is still on disk counts, and so does a desktop entry
+        whose TryExec names an AppImage."""
         paths = set()
         dangling = set()
         for _section_key, rec in Config.iter_app_records():
@@ -320,7 +310,7 @@ class ListingMixin:
             desktop_path = os.path.join(self.user_desktop_files_path,
                                         file_name)
             # A stale record's desktop file is gone, so it cannot be this
-            # one; skip nothing else, the listing is the authority either way.
+            # one.
             if not os.path.isfile(desktop_path) or desktop_path in dangling:
                 continue
             try:
@@ -337,13 +327,11 @@ class ListingMixin:
     def is_installed(self, el: AppImageListElement) -> bool:
         """True when this element's bytes are an app the plugin integrates.
 
-        A content match inside the managed folder is not enough (reported
-        2026-11-20): the folder also holds leftovers that were never (or no
-        longer) integrated — an AppImage whose .desktop file was removed, or
-        the very file the user re-picked. Claiming "already integrated" for
-        those made a removed app impossible to add back. Only a file a
-        desktop entry backs can match, and a file that is one of those is
-        installed by definition.
+        A content match inside the managed folder is not enough: the folder
+        also holds leftovers that were never (or no longer) integrated, and
+        claiming "already integrated" for those made a removed app
+        impossible to add back. Only a file a desktop entry backs can
+        match.
         """
         if not el.file_path:
             return False
@@ -366,8 +354,7 @@ class ListingMixin:
             except OSError:
                 continue
             # Never compare a file with itself: the source IS the candidate
-            # when the user re-picked the managed copy, and a bare leftover
-            # would otherwise always match.
+            # when the user re-picked the managed copy.
             if real_candidate == real_source:
                 continue
             if real_candidate not in integrated_real:

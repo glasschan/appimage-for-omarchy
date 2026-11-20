@@ -1,12 +1,11 @@
-# envelope.py — shared CLI envelope helpers (ticket #56).
+# envelope.py — shared CLI envelope helpers.
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # The helpers every verb reads: JSON printing, the interactive ask, argv
 # flag helpers, option validation, target resolution, the --list-installed
 # app-object normaliser, the updates-state key/normalisers and the print
-# table. Also the module-level singletons (appimage_provider) and the
-# exit codes / error types the whole CLI speaks. Nothing here parses a
-# verb's own argv; that belongs to the per-verb modules.
+# table. Also the module-level singletons and the exit codes / error types
+# the whole CLI speaks. Nothing here parses a verb's own argv.
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
 
@@ -61,19 +60,15 @@ def _remove_flag_value(args: list, flags: list) -> list:
 
 
 def _running_pid_count(el, probe=None) -> int:
-    """How many processes provably belong to this installed AppImage
-    (ticket #27): `procs.pids_for`'s runtime parent plus its FUSE-mount
-    children — the same set `--kill-running` would close.
+    """How many processes provably belong to this installed AppImage:
+    `procs.pids_for`'s runtime parent plus its FUSE-mount children.
 
     Display-only: the panel's force-quit card names the number before the
-    user agrees to close the app, and nothing acts on it. Best-effort like
-    the `running` flag it accompanies — a failed scan reports 0 instead of
-    erroring (one warning, not a traceback: the panel polls this every
-    10 s), and callers only ask for RUNNING rows.
+    user agrees to close the app. A failed scan reports 0 with one warning
+    rather than a traceback, since the panel polls this every 10 s.
 
-    `probe` is procs' probe seam; a listing passes ONE cached probe (see
-    procs._cached_probe) so N running rows cost one `ps` and one mounts
-    parse instead of N of each."""
+    `probe` is procs' probe seam; a listing passes ONE cached probe so N
+    running rows cost one `ps` and one mounts parse."""
     try:
         found = procs.pids_for(el.file_path, probe=probe)
         return len(found['parent']) + len(found['children'])
@@ -87,9 +82,8 @@ def _make_app_json(el, manager=None, running=None, probe=None,
                    pending=None, icon_safe=None) -> dict:
     if running is None:
         try:
-            # `probe` is the listing's ONE cached scan: asking the question
-            # per row would spawn a fresh `ps` for every app, every poll
-            # (ticket #41)
+            # `probe` is the listing's ONE cached scan: asking per row
+            # would spawn a fresh `ps` for every app, every poll
             running = appimage_provider.is_app_running(el, probe=probe)
         except Exception:
             running = False
@@ -104,64 +98,56 @@ def _make_app_json(el, manager=None, running=None, probe=None,
         'available_version': manager.available_version if manager else None,
         'download_size': manager.download_size if manager else None,
         'manager': manager.name if manager else None,
-        # additive (schema_version stays 1), issue #39: the method a fetch
-        # would use to prove the artifact, and whether that fetch would even
-        # be attempted. `null` means no verdict yet (no check has run, or
-        # there is no source); the policy itself is unchanged — a source
-        # that cannot prove its artifact still refuses the install.
+        # additive (schema_version stays 1): the method a fetch would use
+        # to prove the artifact, and whether that fetch would even be
+        # attempted. `null` means no verdict yet; the policy itself is
+        # unchanged, so a source that cannot prove its artifact still
+        # refuses the install.
         'verification': _verification_of(manager),
         'installable': _installable_of(manager),
         'embedded_source': bool(manager and manager.embedded),
         'running': running,
-        # additive (schema_version stays 1): how many processes belong to
-        # this AppImage, 0 when it is not running or the scan cannot tell.
-        # Only a running row is scanned — a non-running one costs nothing.
+        # additive: how many processes belong to this AppImage, 0 when it
+        # is not running or the scan cannot tell. Only a running row is
+        # scanned.
         'running_pids': _running_pid_count(el, probe) if running else 0,
-        # the desktop entry's Exec arguments (field codes stay VERBATIM —
+        # the desktop entry's Exec arguments (field codes stay VERBATIM,
         # the UI strips them), "" when the app has none
         'exec_arguments': getattr(el, 'exec_arguments', '') or '',
-        # additive (schema_version stays 1), ticket #32: the launch command
-        # as argv, built by the ONE launch builder (omarchy_appimage.launch)
-        # — the panel spawns this instead of assembling it in QML.
+        # additive: the launch command as argv, built by the ONE launch
+        # builder, since the panel spawns this instead of assembling it
+        # in QML.
         'launch_argv': launch.panel_launch_argv(
             el.file_path, getattr(el, 'exec_arguments', '') or ''),
-        # additive (schema_version stays 1), ticket #35: the argv tail for
-        # the backend's `--exec-with-scale` entry point — the image and its
-        # own arguments, built by the ONE launch builder. The panel spawns
-        # [backendCommand..., '--exec-with-scale', *launch_scale_argv] so
-        # the panel launch shares the launcher's scale mechanism;
-        # `launch_argv` stays for an older shell pairing and as the
-        # non-scale fallback.
+        # additive: the argv tail for the backend's `--exec-with-scale`
+        # entry point, built by the ONE launch builder. `launch_argv`
+        # stays for an older shell pairing and as the non-scale fallback.
         'launch_scale_argv': launch.panel_exec_scale_argv(
             el.file_path, getattr(el, 'exec_arguments', '') or ''),
-        # additive (schema_version stays 1), issue #53: the verdict the
-        # last check recorded for this app. `pending` is the record's own
-        # entry for this app (None when the record has none): an entry
-        # means a pending release is known, and it carries the version
-        # that check found and whether that release could be installed.
-        # The record is the backend's memory, so the listing reports the
-        # same verdict on every poll without checking the network again.
-        # Only a record (dict) or a legacy signature (str) counts as
-        # pending — a corrupt scalar/container entry is not a verdict,
-        # matching the normalisers below (adversarial review, 0.11.0).
+        # additive: the verdict the last check recorded for this app.
+        # `pending` is the record's own entry for this app (None when the
+        # record has none). The record is the backend's memory, so the
+        # listing reports the same verdict on every poll without checking
+        # the network again. Only a record (dict) or a legacy signature
+        # (str) counts as pending.
         'pending_update': isinstance(pending, (dict, str)),
         'pending_version': (_update_state_version(pending) or None)
         if isinstance(pending, (dict, str)) else None,
         'pending_installable': _update_state_installable(pending),
-        # additive (schema_version stays 1), ticket #62/#63 — the display
-        # gate: a per-candidate verdict dict (`{"png": bool, "svg": bool}`,
-        # one key per EXISTING `.icons/<base>.<ext>` candidate) from
-        # janitor.verify_retained_icon against the persisted registry.
-        # The row may load ONLY the candidates whose own verdict is true;
-        # a non-dict or an empty dict reports `null` — the panel shows its
-        # built-in glyph and never opens `.icons/<base>.{png,svg}`.
+        # additive: the display gate, a per-candidate verdict dict
+        # (`{"png": bool, "svg": bool}`, one key per existing
+        # `.icons/<base>.<ext>` candidate) from
+        # janitor.verify_retained_icon against the persisted registry. The
+        # row may load ONLY candidates whose own verdict is true; a
+        # non-dict or empty dict reports `null`, and the panel shows its
+        # built-in glyph.
         'icon_safe': (icon_safe if isinstance(icon_safe, dict) and icon_safe
                       else None),
     }
 
 
-# The four verification methods a source can report (issue #39). Only the
-# two digest methods let download() accept an artifact, which is what makes
+# The four verification methods a source can report. Only the two digest
+# methods let download() accept an artifact, which is what makes
 # installability derivable instead of a second opinion.
 DIGEST_VERIFICATIONS = ('sha256', 'zsync-sha1')
 VERIFICATIONS = DIGEST_VERIFICATIONS + ('size', 'none')
@@ -178,8 +164,7 @@ def _verification_of(manager) -> str:
 def _installable_of(manager):
     """True/False once a check reached a verdict, None before one.
 
-    Derived from the method so the two fields can never disagree: only a
-    digest lets the fetch path install, and #39 changes reporting only."""
+    Derived from the method so the two fields can never disagree."""
     if manager is None:
         return None
     verdict = manager.installable()
@@ -192,8 +177,7 @@ def _reject_unknown_options(args: list, allowed: set):
     """Raise UsageError for any '-'-prefixed token outside `allowed`.
 
     Every verb validates its own option set: an option it does not
-    implement is a usage error, never a silently ignored token (same rule
-    CONTRACT.md states for the preview verb)."""
+    implement is a usage error, never a silently ignored token."""
     for a in args:
         if a.startswith('-') and a not in allowed:
             raise UsageError(f'unknown option: {a!r}')
@@ -222,8 +206,7 @@ def _resolve_target(target: str):
             return el
 
     # 4. a stale record: its .desktop file is gone, so list_installed()
-    #    cannot know it — but the record in apps.ini still names the
-    #    AppImage, and the user must be able to reclaim it explicitly.
+    #    cannot know it, but the user must be able to reclaim it.
     for el in appimage_provider.list_stale_records():
         if el.file_path == target:
             return el
@@ -247,7 +230,7 @@ def _updates_state_key(el) -> str:
 
 
 # A real release tag is far shorter than this; the cap only bounds a
-# pathological or hostile `available_version` (adversarial review, 0.11.0).
+# pathological or hostile `available_version`.
 MAX_PERSISTED_VERSION_CHARS = 200
 
 
@@ -259,22 +242,19 @@ def _capped_version(value) -> str:
 def _update_state_version(entry) -> str:
     """The pending release version out of a stored entry ('' if unknown).
 
-    A legacy plain-signature entry names no version at all, so it reads as
-    '' — the same as a source that offers a release without naming it. A
-    legacy or hand-edited record is also capped here, so the listing never
-    echoes an unbounded version even if the file predates the write cap."""
+    A legacy plain-signature entry names no version, so it reads as ''.
+    The value is capped here too, so the listing never echoes an
+    unbounded version from an old record."""
     if isinstance(entry, dict):
         return _capped_version(entry.get('version'))
     return ''
 
 
 def _update_state_installable(entry):
-    """The installability verdict out of a stored entry (None if it has none).
+    """The installability verdict out of a stored entry (None if none).
 
-    A legacy plain-signature entry carries no verdict, so it reads as None:
-    "unknown", never a promise that the pending release can be installed.
-    Only a real boolean passes through — the same normalisation the app
-    object's own `installable` gets, so a hand-edited or corrupt record
+    A legacy plain-signature entry carries no verdict, so it reads as None.
+    Only a real boolean passes through, so a hand-edited or corrupt record
     (a string like "false", a number, a list) can never reach the panel as
     "this can be installed"."""
     if isinstance(entry, dict):
@@ -285,10 +265,10 @@ def _update_state_installable(entry):
 
 
 def _runtime_block() -> dict:
-    """The additive `runtime` envelope block (ticket #17): best-effort
-    runtime capability states, probed ONCE per listing — never per app.
-    probe_fuse2 never raises by contract; the guard keeps even a probe
-    crash from failing the listing ('unknown', block still present)."""
+    """The additive `runtime` envelope block: best-effort runtime
+    capability states, probed ONCE per listing, never per app. probe_fuse2
+    never raises by contract; the guard keeps even a probe crash from
+    failing the listing."""
     try:
         fuse2 = utils.probe_fuse2()
     except Exception:
@@ -332,7 +312,7 @@ def _ask_close_running(el) -> bool:
         print(file=sys.stderr)
         return False
     except KeyboardInterrupt:
-        # Ctrl-C at the question means "no": the caller gets the
+        # Ctrl-C at the question means "no", so the caller gets the
         # documented skipped-running result instead of a traceback
         print(file=sys.stderr)
         return False
@@ -343,13 +323,11 @@ def _running_app_prompt(json_output: bool, assume_yes: bool):
     """The `confirm_close` callable for run_update's guard, or None when
     no question may be asked: --json keeps stdout a pure document stream
     (that is why it requires --yes), --yes means "skip any interactive
-    question", and without a TTY there is nobody to ask — that path
-    returns the skipped-running result, whose message names
-    --kill-running."""
+    question", and without a TTY the path returns the skipped-running
+    result, whose message names --kill-running."""
     # `_stdin_is_tty` is resolved through the cli facade at CALL time: it
-    # is the tests' patch seam (mock.patch.object(cli, '_stdin_is_tty')),
-    # and the facade re-export must stay the name the production guard
-    # consults (ticket #56).
+    # is the tests' patch seam, and the facade re-export must stay the
+    # name the production guard consults.
     from .. import cli
     if json_output or assume_yes or not cli._stdin_is_tty():
         return None

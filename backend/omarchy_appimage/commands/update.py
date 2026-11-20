@@ -1,12 +1,12 @@
-# update.py — the --update verb and the shared update pipeline (ticket #56).
+# update.py — the --update verb and the shared update pipeline.
 # Released under the GNU GPL-3.0 — see the repo's LICENSE for terms.
 #
 # run_update is the single update lifecycle, entered through its
-# single-flight claim (the flock on the job log): resolve target →
-# update-source check → availability check → running-app guard → download
-# to temp → verify → atomic replace → scoped temp-dir cleanup →
-# pending-verdict retirement. cmd_update is argv/flag parsing plus the
-# result's document; --async detaches the pipeline (commands/jobs.py).
+# single-flight claim (the flock on the job log): resolve target,
+# update-source check, availability check, running-app guard, download to
+# temp, verify, atomic replace, scoped temp-dir cleanup, pending-verdict
+# retirement. cmd_update is argv/flag parsing plus the result's document;
+# --async detaches the pipeline (commands/jobs.py).
 #
 # Derived from GearLever (c) mijorus, GPL-3.0.
 
@@ -24,14 +24,13 @@ from .envelope import (EXIT_OK, EXIT_USAGE, OperationError, UsageError, _ask_clo
                        appimage_provider)
 
 def _retire_update_verdict(el):
-    """Drop this app's pending verdict from the record (issue #50).
+    """Drop this app's pending verdict from the record.
 
     The record owns the notification marker, the badge count and the
     Update button, so deleting the entry is what makes the pending state
     settle. Called when the truth moved: the update was applied, or the
-    update pipeline's own availability check found nothing newer to
-    install. Best-effort — a failed write only leaves a stale marker for
-    the next check to clear."""
+    availability check found nothing newer. Best-effort: a failed write
+    only leaves a stale marker for the next check."""
     try:
         state = settings.load_updates_state()
         key = _updates_state_key(el)
@@ -51,7 +50,6 @@ class UpdateResult:
     stdout. `status` uses the CLI's update result values:
     'skipped-running' | 'up-to-date' | 'updated' — anything else fails
     closed (InternalError) in both output paths."""
-
     __slots__ = ('status', 'el', 'manager', 'message', 'downloaded_bytes',
                  'force_quit')
 
@@ -66,19 +64,17 @@ class UpdateResult:
         # up-to-date: its plain-mode line is derived from el.file_path)
         self.message = message
         self.downloaded_bytes = downloaded_bytes
-        # {"count": int, "sigkill": bool} when the running-app grant
-        # actually closed something (None otherwise); the sync --json
-        # result never carries it — it only reaches the job document
+        # {"count": int, "sigkill": bool} when the grant actually closed
+        # something (None otherwise); the sync --json result never carries
+        # it, only the job document
         self.force_quit = force_quit
 
 
 class _ManagerStageProxy:
     """Read-only view over an update manager that reports stage changes
     for the async job document: `on_stage('replacing')` fires when
-    download() — whose tail performs the digest verification — returns,
-    i.e. when only the install step of update_from_url remains. Constant
-    structure: nothing is ever written to the real manager, the pipeline
-    owns the view."""
+    download() (whose tail performs the digest verification) returns.
+    Constant structure: nothing is ever written to the real manager."""
 
     def __init__(self, manager, on_replacing):
         self._manager = manager
@@ -103,18 +99,18 @@ def _close_running_app(file_path: str, stage: str, probe=None,
                        sink: dict = None) -> dict:
     """procs.quit_app plus the job document's additive record of it.
 
-    Returns {'count': n, 'sigkill': bool} for the processes that were
-    actually closed, or None when nothing was signalled (not running any
-    more, or never was).
+    Returns {'count': n, 'sigkill': bool} for the processes actually
+    closed, or None when nothing was signalled (not running any more, or
+    never was).
 
-    A pid that survived the round — another user's process, a signal the
-    app blocks, a SIGKILL that did not take — is never a licence to swap
+    A pid that survived the round (another user's process, a signal the
+    app blocks, a SIGKILL that did not take) is never a licence to swap
     the file underneath it: that raises OperationError naming the pid(s)
     and the stage. The record is written to `sink` FIRST, so a job that
     closed the app and then failed still says so in its error document.
 
-    `sink` is the caller's dict (run_update's force-quit sink); passing it
-    keeps the record visible to the failure path without a second scan."""
+    `sink` is the caller's dict; passing it keeps the record visible to
+    the failure path without a second scan."""
     report = procs.quit_app(file_path, probe=probe)
 
     record = None
@@ -155,13 +151,11 @@ def run_update(target: str, keep_both: bool = False,
                claim_owned: bool = True) -> UpdateResult:
     """The update lifecycle, entered through its single-flight claim.
 
-    Issue #46: the claim lives here, not in a caller, so a second update
-    of the same app is refused the same way whoever starts it — the
-    panel's background job and a terminal `--update` both end up in the
-    one rule below. `claim_owned=False` is the async grandchild's door:
-    it inherits the flock through the log description its spawner opened
-    and kept alive across the fork, so taking it again would conflict
-    with itself.
+    The claim lives here, not in a caller, so a second update of the same
+    app is refused the same way whoever starts it. `claim_owned=False` is
+    the async grandchild's door: it inherits the flock through the log
+    description its spawner opened and kept alive across the fork, so
+    taking it again would conflict with itself.
     """
     if not claim_owned:
         return _run_update_body(
@@ -172,8 +166,7 @@ def run_update(target: str, keep_both: bool = False,
 
     el = _resolve_target(target)
     # A desktop id the job store cannot name a document for cannot have a
-    # job either, so the synchronous path claims nothing for it — the
-    # documented sync `--update` on such an app keeps working.
+    # job either, so the sync path claims nothing for it.
     try:
         job_id = _job_desktop_id(el)
     except OperationError:
@@ -202,64 +195,39 @@ def _run_update_body(target: str, keep_both: bool = False,
                      on_stage=None, kill_running: bool = False,
                      confirm_close=None, probe=None,
                      force_quit_sink: dict = None) -> UpdateResult:
-    """The shared update pipeline: resolve target → update-source check →
-    availability check → running guard → download to temp → verify →
-    atomic replace → scoped temp-dir cleanup → pending-notification drop.
+    """The shared update pipeline: resolve target, update-source check,
+    availability check, running guard, download to temp, verify, atomic
+    replace, scoped temp-dir cleanup, pending-notification drop.
 
-    Plain function: no argv parsing, no stdout writes. Raises the same
-    exceptions the CLI reported before this was extracted (OperationError
-    for an unresolvable target / missing update source, InternalError /
-    net.NetworkError / updater errors from download & install) — main()
-    maps them to error documents and exit codes exactly as before, and
-    cmd_update adds no behaviour of its own beyond the argv check.
-    Ticket 02's async job runner calls this too, so the sync and async
-    paths cannot drift.
+    Plain function: no argv parsing, no stdout writes. main() maps its
+    exceptions to error documents and exit codes. The async job runner
+    calls this too, so the sync and async paths cannot drift.
 
     Hooks (both optional, used by the async runner only):
-      progress_cb(fraction) — download progress from net.download_to_file;
-        without it the fraction is only debug-logged (sync behaviour).
-      on_stage(stage, manager=None) — 'downloading' fires before the
-        download starts (with the checked manager, so its declared
-        download_size is available), 'replacing' after the download and
-        its digest verification returned (via _ManagerStageProxy).
+      progress_cb(fraction) — download progress, debug-logged when absent.
+      on_stage(stage, manager=None) — 'downloading' before the download
+        (with the checked manager), 'replacing' after its digest
+        verification returned.
 
-    Running-app guard (ticket 26). The availability check runs before
-    anything can touch a process, so an update that does not exist never
-    costs the user their running app (status `up-to-date`, no process
-    touched, no question asked, no force_quit). The one answer that needs
-    no knowledge of the update — "it is running and nobody agreed to
-    close it" — is decided even earlier, so the documented
-    skipped-running refusal still arrives on a machine that cannot reach
-    the update source. When an update DOES exist, three modes decide what
-    happens, and only two of them signal anything:
-      * neither a grant nor consent → the `skipped-running` result,
-        untouched, and no process is signalled;
-      * `kill_running=True` (--kill-running) → an unconditional grant for
-        the whole job: procs.quit_app runs once here, before the
-        download (fail fast — downloading for an app that cannot be
-        replaced wastes the user's bandwidth), and once immediately
-        before the atomic replace, so a process relaunched during the
-        download is closed too. A process that survives either round is
-        an OperationError: replacing the file under a running app is
-        exactly what the banner must never lie about;
-      * `confirm_close(el) -> bool` → the interactive path: the same
-        grant, but only when the caller's question was answered yes. The
+    Running-app guard. The availability check runs before anything can
+    touch a process, so an update that does not exist never costs the user
+    their running app. Three modes decide what happens:
+      * neither a grant nor consent -> skipped-running, nothing signalled;
+      * `kill_running=True` (--kill-running) -> a grant for the whole job:
+        procs.quit_app runs once before the download (fail fast) and once
+        immediately before the atomic replace, so a process relaunched
+        during the download is closed too. A survivor is an
+        OperationError;
+      * `confirm_close(el) -> bool` -> the same grant, only on a yes. The
         prompt lives in cmd_update; the core never writes stdout.
 
-    `keep_both` installs into a NEW file: os.replace never touches the
-    running app's path, so neither quit call runs — --kill-running is
-    accepted and ignored in that combination (a running app is not in
-    the way).
+    `keep_both` installs into a NEW file, so neither quit call runs and
+    --kill-running is ignored. `force` bypasses the guard and never
+    signals; an explicit close request wins over it.
 
-    `force` keeps its documented meaning — bypass the guard silently and
-    replace under a running app without closing it — and never signals.
-    When both are given the explicit close request wins.
-
-    `probe` is procs' seam: it is the process view and signal sender for
-    both quit calls (None = the production probe). `force_quit_sink`, when
-    given, receives the job's force-quit record as soon as it is known, so
-    a failure AFTER the app was closed (which raises, so there is no
-    result) can still publish it.
+    `probe` is procs' seam for both quit calls. `force_quit_sink`
+    receives the job's force-quit record as soon as it is known, so a
+    failure AFTER the app was closed can still publish it.
     """
     el = _resolve_target(target)
 
@@ -270,7 +238,7 @@ def _run_update_body(target: str, keep_both: bool = False,
 
     sink = force_quit_sink if force_quit_sink is not None else {}
     force_quit = None
-    # C: --keep-both writes beside the running app, never over it, so that
+    # --keep-both writes beside the running app, never over it, so that
     # combination asks nothing, closes nothing and never skips.
     replaces_in_place = not keep_both
     granted = kill_running and replaces_in_place
@@ -279,19 +247,16 @@ def _run_update_body(target: str, keep_both: bool = False,
     # only a replace-in-place without a grant needs it.
     needs_consent = replaces_in_place and not kill_running and not force
     running = (needs_consent and appimage_provider.is_app_running(el)) or False
-    # A: the availability decision comes before anything can touch the
-    # process. Closing (or asking to close) the running app for an update
-    # that turns out not to exist is the worst possible trade — the user
-    # loses the app, or answers a pointless question, and gains nothing.
-    # tri-state: None (state not determinable) still attempts the download
+    # the availability decision comes before anything can touch the
+    # process. tri-state: None (state not determinable) still attempts the
+    # download
     try:
         available = manager.is_update_available()
     except Exception:
         # The check needs the source; a refusal that does not need it must
         # still be answerable when the source cannot be reached. Only the
-        # non-interactive no-grant case (the answer is the same with or
-        # without an update) degrades to skipped-running; everything else
-        # keeps raising exactly as before.
+        # non-interactive no-grant case degrades to skipped-running;
+        # everything else keeps raising.
         if running and confirm_close is None:
             return UpdateResult(
                 status='skipped-running', el=el, manager=manager,
@@ -304,7 +269,6 @@ def _run_update_body(target: str, keep_both: bool = False,
         # the pipeline's own availability check just proved there is
         # nothing newer to install, so the pinned pending verdict is
         # stale: retire it here rather than waiting for the next sweep
-        # (issue #50 — a definite verdict changes the record)
         _retire_update_verdict(el)
         return UpdateResult(status='up-to-date', el=el, manager=manager)
 
@@ -312,8 +276,7 @@ def _run_update_body(target: str, keep_both: bool = False,
         # the user said yes: same grant as --kill-running, and only now,
         # with an update actually available; a caller that cannot ask
         # (non-TTY, --json, --yes) refuses here, after the check
-        if confirm_close is None or not confirm_close(el):
-            return UpdateResult(
+        if confirm_close is None or not confirm_close(el):            return UpdateResult(
                 status='skipped-running', el=el, manager=manager,
                 message=(f'{el.file_path} was skipped because the '
                          'application is running; pass --kill-running to '
@@ -340,8 +303,8 @@ def _run_update_body(target: str, keep_both: bool = False,
         appimage_path = el.file_path
 
         def before_replace():
-            # the grant covers the whole job: whatever was (re)started
-            # while the download ran is closed before the replace, so a
+            # the grant covers the whole job: whatever was restarted while
+            # the download ran is closed before the replace, so a
             # relaunched app cannot hold the old inode open behind us
             nonlocal force_quit
             force_quit = _merge_force_quit(
@@ -357,19 +320,17 @@ def _run_update_body(target: str, keep_both: bool = False,
     finally:
         # the temp-dir lifecycle is core-owned: update_from_url registers
         # its download dir via extractor.new_temp_dir() (and the install
-        # step registers extraction dirs) — the scoped cleanup removes
+        # step registers extraction dirs). The scoped cleanup removes
         # exactly the dirs THIS call added and leaves the rest of the
-        # process-global registry alone. The global wipe stays where it
-        # belongs: main.py's process-exit finally-block as a backstop.
+        # process-global registry alone; the global wipe stays main.py's
+        # process-exit backstop.
         for path in extractor.temp_dirs_snapshot():
             if path not in temp_dirs_before:
                 extractor.remove_temp_dir(path)
 
-    # the update was applied: retire the app's pending verdict (issue
-    # #50). The one record owns the notification marker, the badge count
-    # and the Update button, so dropping the entry is what makes the
-    # pending state settle — and it keeps the next --fetch-updates from
-    # re-notifying for the (now installed) release
+    # the update was applied: retire the app's pending verdict. Dropping
+    # the entry is what makes the pending state settle, and it keeps the
+    # next --fetch-updates from re-notifying for the installed release
     _retire_update_verdict(el)
 
     return UpdateResult(
@@ -409,9 +370,8 @@ def cmd_update(args: list) -> int:
 
     if async_job:
         # `_cmd_update_async` is resolved through the cli facade at CALL
-        # time: it is the tests' patch seam
-        # (mock.patch.object(cli, '_cmd_update_async')), and the facade
-        # re-export must stay the name the verb dispatches to (ticket #56).
+        # time: it is the tests' patch seam, and the facade re-export must
+        # stay the name the verb dispatches to.
         from .. import cli
         return cli._cmd_update_async(positional[0], keep_both=keep_both,
                                  force=force, kill_running=kill_running,
@@ -419,19 +379,16 @@ def cmd_update(args: list) -> int:
                                  assume_yes=assume_yes)
 
     # `run_update` is resolved through the cli facade at CALL time: it is
-    # the tests' patch seam (mock.patch.object(cli, 'run_update')), and
-    # the facade re-export must stay the name the verb dispatches to
-    # (ticket #56).
+    # the tests' patch seam, and the facade re-export must stay the name
+    # the verb dispatches to.
     from .. import cli
     result = cli.run_update(positional[0], keep_both=keep_both, force=force,
                             kill_running=kill_running,
                             confirm_close=_running_app_prompt(json_output,
                                                               assume_yes))
 
-    # the record owns the pending verdict (issue #53): the document
-    # reports what it says about this app, so it never contradicts the
-    # listing (a successful update retired the entry, so it reads as no
-    # pending release)
+    # the record owns the pending verdict: the document reports what it
+    # says about this app, so it never contradicts the listing
     pending = settings.load_updates_state().get(
         _updates_state_key(result.el))
 

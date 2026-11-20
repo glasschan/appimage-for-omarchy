@@ -1,5 +1,5 @@
 # settings.py — the settings verbs and the update-source configuration
-# verbs (ticket #56): --settings, --set-setting, --set-update-source,
+# verbs: --settings, --set-setting, --set-update-source,
 # --get-update-source, --list-update-managers, and --pick-file (the native
 # file dialog backing the panel's settings/path field).
 #
@@ -16,10 +16,6 @@ from .envelope import (EXIT_ERROR, EXIT_OK, OperationError, UsageError,
                        _reject_unknown_options, _remove_flag_value,
                        _resolve_target)
 
-
-# ------------------------------------------------------------ not-yet-moved
-# (temporary: these travel to commands/integrate.py, commands/checks.py and
-# commands/settings.py in the following commits of ticket #56)
 
 # words accepted for boolean settings / update-manager config values
 TRUE_WORDS = ('1', 'true', 'yes', 'on')
@@ -140,8 +136,7 @@ def cmd_get_update_source(args: list) -> int:
     el = _resolve_target(positional[0])
 
     # The raw section contents: `manager` names the UpdateManager class,
-    # everything else is the stored key=value config (bools already
-    # normalized to "true"/"false" strings by set_app_update_config).
+    # everything else is the stored key=value config.
     cfg = Config.get_app_update_config(el)
     if not cfg:
         if json_output:
@@ -209,7 +204,7 @@ def cmd_pick_file(args: list) -> int:
 
     if result in ('cancelled', 'unavailable'):
         # not errors: cancelled is the user's choice, unavailable means
-        # the panel keeps today's path-field UX
+        # the panel keeps the path-field UX
         if json_output:
             _print_json(payload)
         else:
