@@ -9,154 +9,130 @@ import "lib/Backend.js" as Backend
 import "lib/JobDocs.js" as JobDocs
 
 // Main AppImage manager surface. The plugin declares both "bar-widget" and
-// "panel" kinds: this panel is mounted by the shell's panel loader (summon
-// path) as a standalone layer-shell surface; BarWidget.qml is just the bar
-// launcher button. The qs.Ui.Panel base supplies opened/open()/close()/
-// toggle(); open(payloadJson) below extends open() for the summon payload.
-// Every action runs backend/main.py (backend/CONTRACT.md) through dedicated
-// Process/Timer pairs: a shared short-call pair for refresh-style calls, a
-// dedicated pair for the --update --async spawn (refresh traffic can never
-// synthetically fail it) and the python probe pair. Integrate previews
-// first through the offline --preview-integrate verb and installs only on
-// explicit confirm; update runs per row as a detached background job whose
-// on-disk job document (reader lib/JobDocs.js) is the only row state; the
-// background service lives in Service.qml — this panel only edits what it
-// runs on.
+// "panel" kinds: this panel is mounted by the shell's panel loader as a
+// standalone layer-shell surface; BarWidget.qml is just the bar launcher.
+// The qs.Ui.Panel base supplies opened/open()/close()/toggle(); open(payloadJson)
+// below extends open() for the summon payload. Every action runs
+// backend/main.py through dedicated Process/Timer pairs: a shared short-call
+// pair for refresh-style calls, a dedicated pair for the --update --async
+// spawn (refresh traffic can never synthetically fail it) and the python
+// probe pair. Update runs per row as a detached background job whose
+// on-disk job document is the only row state; the background service lives
+// in Service.qml — this panel only edits what it runs on.
 Panel {
   id: root
   moduleName: "io.github.glasschan.appimage"
   ipcTarget: "io.github.glasschan.appimage"
   // Own IPC handler: extra verbs (refresh, list) ride alongside the
-  // standard lifecycle set; the base would install a second handler on
-  // the same target if left enabled.
+  // standard lifecycle set; the base would install a second handler on the
+  // same target if left enabled.
   manageIpc: false
 
-  // Injected by the shell's panel loader when summoned.
   property var shell: null
   property var manifest: null
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   readonly property string homeDir: Quickshell.env("HOME") || ""
-
-  // Cache policy: show the cached list immediately and rescan only when
-  // the cache is older than this. Refresh always forces one.
+  // Cache policy: show the cached list immediately and rescan only when the
+  // cache is older than this. Refresh always forces one.
   readonly property int staleAfterMs: 60000
   // Integrating means squashfs extraction + a file copy; give it room.
   readonly property int integrateTimeoutMs: 120000
   // A URL integrate downloads the whole AppImage inside this panel's
-  // process — the watchdog must outlast the transfer, not the UI.
+  // process — the watchdog must outlast the transfer.
   readonly property int integrateUrlTimeoutMs: 600000
   // Update sweeps walk every configured release source over the network.
   readonly property int checkTimeoutMs: 120000
-  // --pick-file: the backend bounds probe + portal dialog + zenity under
-  // one 600 s whole-operation deadline (CONTRACT.md); the watchdog matches
-  // it instead of undercutting it, so a slow portal is never reaped while
-  // the backend still considers the dialog alive.
+  // --pick-file: the backend bounds probe + portal dialog + zenity under one
+  // 600 s deadline; the watchdog matches it instead of undercutting it, so a
+  // slow portal is never reaped while the backend still considers the dialog
+  // alive.
   readonly property int pickTimeoutMs: 600000
   // How long the two-click remove confirmation stays armed.
   readonly property int confirmResetMs: 4000
   // Grace before the post-launch refresh so `ps` can see the new process.
   readonly property int launchSettleMs: 1500
-  // Launch-failure banner: the id of the app awaiting its post-launch
-  // settle verdict ("" when none) and the moment the launch was clicked.
-  // execDetached cannot report the AppImage runtime's own death, so the
-  // verdict comes from the first completed listing that STARTED after the
-  // click — a listing already in flight at click time has a pre-spawn ps
-  // snapshot and must never judge the launch. On a failed verdict the
-  // banner gets the fuse2 hint line only when that same listing's runtime
-  // block says "missing" (Model.launchFailureBanner). Status notices fade
-  // after this long (matching the backend's desktop-notification expire
-  // time); errors never auto-hide.
+  // Launch failure: execDetached cannot report the AppImage runtime's own
+  // death, so the verdict comes from the first listing that STARTED after
+  // the click (one already in flight has a pre-spawn ps snapshot). The
+  // fuse2 hint rides the banner only when that same listing says "missing".
+  // Status notices fade after this long (matching the backend's desktop
+  // notification expire time); errors never auto-hide.
   readonly property int statusTimeoutMs: 5000
 
   // ---- background update jobs ----------------------------------------------
-  // Row update state is derived from the backend's on-disk job documents
-  // (CONTRACT.md "Job documents", reader lib/JobDocs.js): every open and
-  // every poll tick re-reads the documents, so a reload mid-download
+  // Row update state is derived from the backend's on-disk job documents:
+  // every open and every poll tick re-reads them, so a reload mid-download
   // re-derives everything from disk and no spinner can outlive its doc.
   readonly property int jobPollMs: 3000
   // jobs.py's path rule; XDG_STATE_HOME defaults to ~/.local/state.
   readonly property string jobsDir: (Quickshell.env("XDG_STATE_HOME")
     || (homeDir + "/.local/state")) + "/io.github.glasschan.appimage/jobs"
-  // desktop_id → adopted decision (JobDocs shape); row bindings read
-  // jobStates[id]; jobsBusy gates the job polls.
   // The panel's OWN Model namespace, handed to the controllers
   // (PanelJobs/PanelUpdates/PanelIntegrate/PanelSourceEditor/PanelPython).
-  // This shell loads a QML *type* (a sibling .qml file instantiated by name)
-  // with its own copy of an imported `.pragma library` script: PanelJobs
-  // writing Model.adoptJobDecision landed in a store this panel never read,
-  // so no row ever showed an update's progress and no job banner ever
-  // appeared (reported 2026-10-29). Every controller therefore reaches the
-  // store THROUGH this reference, never through its own import.
+  // A QML *type* instantiated by name gets its own copy of an `.pragma
+  // library` script, so a controller writing through its own import lands in
+  // a store this panel never reads. Every controller therefore reaches the
+  // store THROUGH this reference.
   readonly property var modelApi: Model
+  // desktop_id → adopted decision (JobDocs shape); row bindings read
+  // jobStates[id]; jobsBusy gates the job polls.
   property var jobStates: ({})
   property bool jobsBusy: false
-  // Sequential single-document read state for jobFileView: at most one
-  // job document is being read at any time (a FileView repointed mid-read
-  // aborts the old load, so the queue never races on one instance).
+  // At most one job document is read at a time: a FileView repointed
+  // mid-read aborts the old load, so the queue never races on one instance.
   property var jobReadQueue: []
   property string jobReadingId: ""
-  // Click grace (per id): a "no document" read landing within
-  // jobStartGraceMs of a job-started reply is a race with the grandchild's
-  // FIRST write — during the grace it must not overwrite the provisional
-  // active decision. Past the grace an absent document means the job died
-  // before writing anything, and idle wins.
+  // Click grace (per id): a "no document" read within jobStartGraceMs of a
+  // job-started reply races the grandchild's FIRST write and must not
+  // overwrite the provisional active decision. Past the grace an absent
+  // document means the job died before writing anything.
   readonly property int jobStartGraceMs: 10000
   property var jobStartGraces: ({})
 
-  // Force-quit confirm card: Update on a row whose last --list-installed
-  // poll said the app runs opens this card first. The id, name and
-  // process count are pinned at click time (the row's model data may be
-  // replaced by the refresh that follows); nothing is spawned until
-  // confirmForceQuit, and cancel clears the trio with zero side effects.
-  // running_pids 0 means "not known" and the card falls back to its
-  // count-free sentence.
+  // Force-quit confirm card: Update on a running row opens this card first.
+  // The id, name and count are pinned at click time because the refresh that
+  // follows may replace the row's model data; nothing is spawned until
+  // confirmForceQuit. running_pids 0 means "not known" and the card falls
+  // back to its count-free sentence.
   property string forceQuitId: ""
   property string forceQuitName: ""
   property int forceQuitPids: 0
 
-  // "Update all" consent card: one action for every pending app. The
-  // click only OPENS this card — the batch is spawned after the user
-  // accepts it, and dismissing starts nothing. The apps are pinned at
-  // open time (id, name, running, running_pids), so a refresh cannot
-  // rewrite what the user is consenting to.
+  // "Update all" consent card: the click only OPENS it — the batch spawns
+  // after the user accepts, and dismissing starts nothing. The apps are
+  // pinned at open time, so a refresh cannot rewrite what is consented to.
   property bool updateAllOpen: false
   property var updateAllApps: []
-  // The card's wording, derived from the pinned app list.
   readonly property var updateAllSummary: Model.updateAllSummary(root.updateAllApps)
-  // The ids whose background job still has to be spawned; the spawn pair
-  // advances the queue when each spawn answers.
+  // The ids whose background job still has to be spawned.
   property var updateAllQueue: []
 
   // Current Backend.run context (null while idle); the Process and Timer
   // signal handlers feed it back into lib/Backend.js.
   property var runCtx: null
 
-  // Backend.run context for the --update --async spawn (null while idle).
-  // The spawn owns a dedicated Process/Timer pair: routing it through the
-  // shared short-call pair would let any in-flight re-list or update
-  // check synthetically fail the click via callBackend's single flight.
+  // Context for the --update --async spawn (null while idle). It needs its
+  // own Process/Timer pair: through the shared short-call pair, any in-flight
+  // re-list or update check would synthetically fail the click via
+  // callBackend's single flight.
   property var updateSpawnCtx: null
 
   // ---- python3 dependency (authorized install) ------------------------------
   // The probe settles python presence once per open (and every second while
   // an authorized install runs). A confirmed-missing python3 swaps the body
   // for the install card, whose button opens a visible floating terminal
-  // presenting `/usr/bin/omarchy pkg add python` — the terminal (and its
-  // sudo prompt) is the authorization; the marker files under
-  // XDG_RUNTIME_DIR are its report channel. The presented terminal command
-  // is a CONSTANT shell source: it reads XDG_RUNTIME_DIR itself via
-  // "${XDG_RUNTIME_DIR:?}" expansion, and the runtime dir the panel holds
-  // is validated (syntactically by Model.pythonRuntimeDirUsable(), then
-  // authoritatively by the prep step) and travels only as argv data, never
-  // inside a shell string.
+  // running `/usr/bin/omarchy pkg add python` — the terminal (and its sudo
+  // prompt) is the authorization; the marker files under XDG_RUNTIME_DIR are
+  // its report channel. The presented command is a CONSTANT shell source:
+  // the runtime dir the panel holds is validated and travels only as argv
+  // data, never inside a shell string.
   property bool pythonStateKnown: false
   property bool pythonMissing: false
   property bool installingPython: false
-  // Install-button verify gate (verify-then-start): set when the user
-  // presses Install and consumed by the next probe result, which alone
-  // decides whether the prep step + terminal may start. The verify probe
-  // runs with installingPython=false, so stale marker files from an old
-  // attempt cannot trigger a new terminal.
+  // Install-button verify gate: set when the user presses Install and
+  // consumed by the next probe result, which alone decides whether the prep
+  // step + terminal may start. The verify probe runs with
+  // installingPython=false, so stale marker files cannot trigger a terminal.
   property bool installVerifyPending: false
   // Backend.run context for the in-flight probe (null while idle).
   property var probeCtx: null
@@ -164,8 +140,8 @@ Panel {
   readonly property string pythonFailureMarker: Model.pythonMarkerPaths(runtimeDir).failure
   readonly property string pythonCompleteMarker: Model.pythonMarkerPaths(runtimeDir).complete
 
-  // Mirrored from the shared Model store (no property notifications in a
-  // JS library, so a subscription copies state into reactive properties).
+  // Mirrored from the shared Model store: a JS library has no property
+  // notifications, so a subscription copies state into reactive properties.
   property var items: []
   property bool busyList: false
   property bool busyIntegrate: false
@@ -175,9 +151,6 @@ Panel {
   property string lastError: ""
   property string statusText: ""
   property var unsubscribe: null
-  // The ids of the apps a batch update would touch: the "Update all"
-  // action is enabled exactly while at least one app has a pending
-  // release the backend would accept.
   property var pendingIds: []
 
   // Integrate picker: Quickshell ships no FileDialog, so the picker is a
@@ -187,33 +160,25 @@ Panel {
   property bool pickerOpen: false
   property string pickerPath: ""
 
-  // Confirm-before-integrate preview: pressing the integrate action first
-  // runs the offline, fast --preview-integrate and renders the preview
-  // card; Confirm then runs the integrate command and Esc/Cancel dismisses
-  // back to the picker with zero side effects. previewInput pins the exact
-  // input the shown document was computed from: editing the path dismisses
-  // the card, so Confirm can only ever install what the user actually saw
-  // previewed.
+  // Confirm-before-integrate preview: the integrate action first runs the
+  // offline --preview-integrate and renders the preview card; Confirm then
+  // installs. previewInput pins the exact input the shown document was
+  // computed from, so editing the path dismisses the card and Confirm can
+  // only install what the user actually saw.
   readonly property int previewTimeoutMs: 10000
   property bool previewOpen: false
   property bool busyPreview: false
   property string previewInput: ""
   property var previewDoc: null
 
-  // Single source of the picker-owning busy state — a browse dialog, a
-  // preview call or an integrate run in flight. Browse, Go and the
-  // Downloads quick-picks all disable on exactly this conjunction; sites
-  // whose guard intentionally differs keep their extra terms separate.
+  // Single source of the picker-owning busy state.
   readonly property bool pickerBusy: busyPick || busyIntegrate || busyPreview
 
-  // Drop-to-integrate: the bar widget converts its dropped URIs through
-  // Model.dropUriToPath and hands the usable path over in the summon
-  // payload; open() parks it here and tryConsumePendingDrop runs it once
-  // the store is idle (the panel's own DropArea path checks the same guard
-  // live and reports a busy drop with a status line). The panel window
-  // DropArea never queues — this pending pair is transport for a gesture
-  // that happened before the panel existed. Closing the panel cancels a
-  // still-pending drop (onOpenedChanged).
+  // Drop-to-integrate: the bar widget converts its dropped URIs and hands
+  // the usable path over in the summon payload; open() parks it here and
+  // tryConsumePendingDrop runs it once the store is idle. This pending pair
+  // is transport for a gesture that happened before the panel existed;
+  // closing cancels it (onOpenedChanged).
   property string pendingDropPath: ""
   property int pendingDropIgnored: 0
 
@@ -221,9 +186,8 @@ Panel {
   property string confirmRemoveId: ""
 
   // Settings card: opened by the header gear, mutually exclusive with the
-  // integrate picker. The edit* fields are working copies the card
-  // mutates; Save pushes them key by key through --set-setting and the
-  // store is re-read afterwards (loadSettingsCard).
+  // integrate picker. The edit* fields are working copies the card mutates;
+  // Save pushes them key by key through --set-setting and the store is re-read.
   property bool settingsOpen: false
   // Session-only window mode: pinned turns the full-screen overlay into a
   // compact floating window sized to the card (never persisted).
@@ -234,26 +198,25 @@ Panel {
   property int editDelay: 5
   property var pendingSettingKeys: []
 
-  // Per-app source editor (F9): one editor at a time, keyed by desktop_id.
-  // Field values live as strings ("true"/"false" for bools) so the Save
-  // argv can pass them straight through as key=value tokens.
+  // Per-app source editor: one editor at a time, keyed by desktop_id. Field
+  // values live as strings ("true"/"false" for bools) so the Save argv can
+  // pass them straight through as key=value tokens.
   property string sourceEditId: ""
   property string sourceEditName: ""
   property string sourceEditManager: ""
   property var sourceEditValues: ({})
   property bool sourceBusy: false
-  // Focus count over EVERY editable text field in the panel. PanelKeyCatcher
-  // must hand raw keys to whichever field is typing (see formEditing) and be
-  // blocked while one holds focus: its Keys handler CONSUMES every key it is
-  // handed, so an unblocked catcher silently eats typed characters.
+  // Focus count over EVERY editable text field. PanelKeyCatcher must hand
+  // raw keys to whichever field is typing and be blocked while one holds
+  // focus: its Keys handler CONSUMES every key it is handed, so an unblocked
+  // catcher silently eats typed characters.
   property int textFieldFocusCount: 0
-  // Mirrors the per-row manager Dropdown's popupOpen so formEditing can
-  // keep blocking the key catcher while the popup (outside this item
-  // tree) owns keys — see onPopupOpenChanged on the dropdown.
+  // Mirrors the manager Dropdown's popupOpen so formEditing keeps blocking
+  // the key catcher while the popup (outside this item tree) owns keys.
   property bool sourceDropdownOpen: false
 
-  // Manager choices for the source editor's dropdown, resolved through the
-  // strings table so display names stay central for i18n.
+  // Manager choices resolved through the strings table so display names
+  // stay central for i18n.
   readonly property var managerOptions: {
     var opts = []
     for (var i = 0; i < Model.MANAGERS.length; i++) {
@@ -304,10 +267,9 @@ Panel {
 
   // argv for the backend CLI. Priority: an explicit setting handed to
   // Model.configureBackend(), then python3 + <pluginDir>/backend/main.py
-  // derived from the manifest's source dir, then the canonical install
-  // location (the shell strips __sourceDir from third-party manifests —
-  // shell.qml publicPluginManifest() — so the manifest hint is usually
-  // absent and the PluginRegistry path is the real source of truth).
+  // from the manifest's source dir, then the canonical install location.
+  // The shell strips __sourceDir from third-party manifests, so the manifest
+  // hint is usually absent and the PluginRegistry path is the real source.
   readonly property var backendCommand: {
     var configured = Model.state.backendCommand
     if (configured && configured.length > 0) return configured
