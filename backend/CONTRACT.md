@@ -1138,7 +1138,7 @@ Other `result` values: `already-integrated` (exit 0, app unchanged).
 | `verification` | The matrix above; `note` is the exact sentence the panel may render verbatim |
 | `destination` | For a local file: folder + exact file name + full path, derived with the install-time naming helper (conflict suffixing included; `path` is the installed file itself when `already_integrated`). For a URL: only `folder` is known — `filename`/`path` are `null`, the final name comes from the artifact's embedded desktop entry at integrate time |
 | `app` | Local files only: `name`/`version` read in place from the embedded desktop entry; `null` when the entry cannot be read in place (the preview stays valid) or for URLs (nothing was downloaded) |
-| `already_integrated` | Content already matches an app a desktop entry backs (a bare managed-folder leftover does not count) |
+| `already_integrated` | Content already matches an app a desktop entry backs (a bare managed-folder leftover does not count); only files named `*.desktop` are entries, so backups and disabled copies never list |
 | `name_conflict` | Another version of the same app is installed |
 | `advisory` | Always `true`; the integrate command re-classifies/re-verifies at its own runtime |
 

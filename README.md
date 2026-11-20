@@ -384,8 +384,13 @@ published.
   leftover with no desktop entry behind it — an app whose `.desktop` file
   was removed, a stale `apps.ini` record, or the managed copy the user
   re-picked — matched itself and blocked the integrate with
-  "Already integrated". Only apps the installed listing reports count now;
+  "Already integrated". Only an AppImage a desktop entry backs counts now;
   everything else installs normally.
+- **One app is one row.** The installed listing parsed every file in the
+  applications directory, so a backup of a `.desktop` entry (`.bak-…`,
+  `.desktop.disabled`, an editor swap file) showed up as a second app
+  pointing at the same AppImage. Only file names ending in `.desktop` are
+  entries now, per the FreeDesktop spec.
 - **A normal quit no longer reads as a failed launch.** The launch verdict
   was armed on every click, but an unpinned click immediately closes the
   panel and destroys the 1.5 s settle timer, so nothing could judge the
