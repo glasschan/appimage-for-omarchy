@@ -70,6 +70,10 @@ class ListingMixin:
         for file_name in os.listdir(self.user_desktop_files_path):
             desktop_path = os.path.join(self.user_desktop_files_path,
                                         file_name)
+            # FreeDesktop spec: a desktop entry's file name ends in .desktop
+            # (backups, .desktop.disabled copies and caches are not entries).
+            if not file_name.endswith('.desktop'):
+                continue
 
             try:
                 if not os.path.isfile(desktop_path):
@@ -309,6 +313,9 @@ class ListingMixin:
         for file_name in os.listdir(self.user_desktop_files_path):
             desktop_path = os.path.join(self.user_desktop_files_path,
                                         file_name)
+            # FreeDesktop spec: a desktop entry's file name ends in .desktop.
+            if not file_name.endswith('.desktop'):
+                continue
             # A stale record's desktop file is gone, so it cannot be this
             # one.
             if not os.path.isfile(desktop_path) or desktop_path in dangling:

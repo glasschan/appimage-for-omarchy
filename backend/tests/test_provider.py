@@ -389,6 +389,28 @@ X-AppImage-Version=1.0
         self.assertEqual(listed[0].exec_arguments, '--no-sandbox %U')
 
 
+class DesktopSuffixTests(FakeXDGTestCase):
+    """FreeDesktop spec: only files whose name ends in .desktop are
+    desktop entries. A backup copy left in the applications dir (say, a
+    `.desktop.bak-...` from a hand edit) must not be listed as a second
+    app pointing at the same AppImage."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider = AppImageProvider()
+
+    def test_backup_copy_is_not_a_second_entry(self):
+        appimage, desktop, _icon = self.install_fake_app()
+        backup = desktop + '.bak-123'
+        shutil.copyfile(desktop, backup)
+
+        listed = self.provider.list_installed()
+
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0].desktop_file_path, desktop)
+        self.assertEqual(listed[0].file_path, appimage)
+
+
 class EntryPointDirRepairTests(FakeXDGTestCase):
     """Ticket #34: the desktop entry's Exec points at the plugin backend
     directory recorded at integrate time; when that directory stops
